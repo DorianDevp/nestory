@@ -207,8 +207,7 @@ func (gb *DB[T]) fillRelation() {
 			id := v.Elem().FieldByName("Id").Interface()
 
             f := v.Elem().FieldByName(fieldName)
-            tf, ok := t.FieldByName(fieldName)
-            if !ok {
+            if _, ok := t.FieldByName(fieldName); !ok {
                 log.Panicln("No field", fieldName)
             }
 
@@ -216,9 +215,7 @@ func (gb *DB[T]) fillRelation() {
                 log.Panic("All mapby fields must by a slice of pointers")
             }
 
-            if f.IsZero() {
-				log.Println("test", tf.Name, " - skipping")
-            }
+            // Empty slice is fine — we'll append matches below if any exist.
 
             relTypeName := f.Type().Elem().Elem().Name()
             relEntity, ok := entityRegistry[relTypeName]
@@ -249,8 +246,8 @@ func (gb *DB[T]) fillRelation() {
             }
 
 			if f.IsZero() {
-				log.Printf("MapBy Field value does not match to any of related field in the specified entity. Leaving value empty.\n MapBy field: %s \n; Entity fields value %i\n", mapby, id,
-				)
+				log.Printf("mapby: no children matched for field %q (parent.Id=%v) — leaving empty\n",
+					mapby, id)
 			}
         }
     }
@@ -420,68 +417,92 @@ func (gb *DB[T]) Flush() error {
 	return nil
 }
 
+// save writes the entity slice to disk atomically: it encodes to a sibling
+// .tmp file, fsyncs it, and only then renames into place. A crash mid-write
+// leaves the previous good file untouched.
 func (gb *DB[T]) save() error {
-    log.Println("Saving entity:", gb.TypeName())
+	log.Println("Saving entity:", gb.TypeName())
 
-	file, err := os.Create(gb.Filepath())
-	if err != nil {
-		fmt.Println("Error while creating/opening file:", err)
+	finalPath := gb.Filepath()
+	tmpPath := finalPath + ".tmp"
 
-		return err
+	entitySchemaStruct := gb.createSchemaStruct()
+	baseType := reflect.SliceOf(entitySchemaStruct.Type())
+	baseValue := reflect.MakeSlice(baseType, 0, 0)
+
+	for _, entity := range *gb.GoEntity {
+		abstractStruct := gb.NormalizeToSchema(entity)
+		baseValue = reflect.Append(baseValue, abstractStruct)
 	}
-	defer file.Close()
 
-    // @TODO: think why []any would not work
-
-    entitySchemaStruct := gb.createSchemaStruct()
-    baseType := reflect.SliceOf(entitySchemaStruct.Type())
-    baseValue := reflect.MakeSlice(baseType, 0, 0)
-
-    for _, entity := range *gb.GoEntity {
-        abstractStruct := gb.NormalizeToSchema(entity) // reflect.Value
-
-        baseValue = reflect.Append(baseValue, abstractStruct)
-    }
+	file, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("nestory: create %s: %w", tmpPath, err)
+	}
 
 	if err := gob.NewEncoder(file).Encode(baseValue.Interface()); err != nil {
-		fmt.Println("Error while encoding data to file:", err)
-
-		return err
+		file.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("nestory: encode %s: %w", tmpPath, err)
 	}
 
-    return nil
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("nestory: fsync %s: %w", tmpPath, err)
+	}
+
+	if err := file.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("nestory: close %s: %w", tmpPath, err)
+	}
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("nestory: rename %s -> %s: %w", tmpPath, finalPath, err)
+	}
+
+	return nil
 }
 
 func (gb *DB[T]) AddToPersistQueue(entity *T) error {
-	gb.persistQueue = append(gb.persistQueue, entity)
-
 	id := (*entity).GetId()
+
+	// Caller supplied an Id explicitly — accept it, but skip if it's already
+	// in the persisted set or already queued (deduplication).
 	if id != 0 {
-		fmt.Println("Duplicate")
-		e, _ := gb.FindOneBy("Id", id)
-		if e != nil {
+		if existing, _ := gb.FindOneBy("Id", id); existing != nil {
 			return nil
 		}
-	}
-
-	entityLen := len(*gb.GoEntity) 
-	if entityLen == 0 {
-		SetId(entity, entityLen+1)
-		gb.Index["Id"][(*entity).GetId()] = entity
-
+		for _, q := range gb.persistQueue {
+			if (*q).GetId() == id {
+				return nil
+			}
+		}
+		gb.persistQueue = append(gb.persistQueue, entity)
+		gb.Index["Id"][id] = entity
 		return nil
-	} 
-
-	lastEl := (*gb.GoEntity)[entityLen - 1]
-
-	if lastEl.GetId() > entityLen {
-		SetId(entity, lastEl.GetId() + 1)
-		gb.Index["Id"][(*entity).GetId()] = entity
-	} else {
-		SetId(entity, entityLen + 1)
-		gb.Index["Id"][(*entity).GetId()] = entity
 	}
 
+	// Auto-assign the next Id. Must consider both persisted entities AND the
+	// pending queue — otherwise batch-queueing multiple items before Flush()
+	// would hand each one the same Id.
+	nextId := 0
+	for _, e := range *gb.GoEntity {
+		if e.GetId() > nextId {
+			nextId = e.GetId()
+		}
+	}
+	for _, q := range gb.persistQueue {
+		if qid := (*q).GetId(); qid > nextId {
+			nextId = qid
+		}
+	}
+	nextId++
+
+	SetId(entity, nextId)
+	gb.persistQueue = append(gb.persistQueue, entity)
+	gb.Index["Id"][nextId] = entity
 	return nil
 }
 
