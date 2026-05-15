@@ -1,24 +1,29 @@
 package nestory
 
 import (
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"reflect"
-	"slices"
 	"sync"
 )
 
-type Entity interface{
-    GetId() int
+// Entity is the contract every nestory-persisted struct must satisfy.
+// The Id is the primary key; nestory auto-assigns one on AddToPersistQueue
+// if you leave it zero.
+type Entity interface {
+	GetId() int
 }
 
+// IndexMap is a two-level lookup: field name → field value → result.
+// DB exposes two of these: Indices for one-to-many, Index for one-to-one.
 type IndexMap[T any] map[string]map[any]T
 
+// GoEntity is a typed slice alias — currently unused externally, kept
+// for backwards compat. Will be removed in 1.0.
 type GoEntity[T Entity] []T
 
+// DB is the in-memory state for one entity type. Construct via [Open].
 type DB[T Entity] struct {
 	Name         string
 	Identifier   string
@@ -26,18 +31,74 @@ type DB[T Entity] struct {
 	GoEntity     *[]T
 	persistQueue []*T              `gob:"-"`
 	deleteQueue  []*T              `gob:"-"`
-	Indices 	 IndexMap[[]*T] `gob:"-"`
-	Index 	     IndexMap[*T] `gob:"-"`
+	Indices      IndexMap[[]*T]    `gob:"-"`
+	Index        IndexMap[*T]      `gob:"-"`
 	schemaFields [][2]string       `gob:"-"`
 	schemaStruct reflect.Value     `gob:"-"`
 	mu           sync.RWMutex      `gob:"-"`
 	creator      *goBaseCreator    `gob:"-"`
 }
 
+// DataDir is the folder where every base writes its .gob file. Override
+// before the first call to [Register].
 var DataDir = "./data"
 
+// ErrEmptyEntity is returned by FindOneBy when the base has no entries.
 var ErrEmptyEntity = errors.New("empty entity")
 
+var baseRegistry = make(map[string]any)
+var entityRegistry = make(map[string]any) // map[typeName]*[]T
+
+// GetEntityRegistry exposes the internal registry for debugging.
+// Not part of the stable API.
+func GetEntityRegistry() map[string]any { return entityRegistry }
+
+// Register loads (or creates) the on-disk file for T and inflates each row
+// into a *T entity. Must be called once per entity type, BEFORE any [Open]
+// call — fillRelation needs every type registered to wire pointers.
+func Register[T Entity]() {
+	instance := new(T)
+	name := reflect.TypeOf(instance).Elem().Name()
+
+	if _, ok := entityRegistry[name]; ok {
+		log.Panicln("Base for that type already exist", name)
+	}
+
+	creator := &goBaseCreator{}
+	baseSchema := creator.CreateDB(*new(T))
+	entity := readEntity[T](baseSchema)
+
+	entityRegistry[name] = &entity
+}
+
+// Open returns a typed [DB] over the entities previously loaded by [Register].
+// Call after every type used by relto / mapby tags has been registered.
+func Open[T Entity]() *DB[T] {
+	initBase := DB[T]{Identifier: "Id"}
+
+	initBase.Name = initBase.TypeName()
+	initBase.Indices = make(IndexMap[[]*T])
+	initBase.Index = make(IndexMap[*T])
+
+	initBase.schemaFields = initBase.createSchemaFields()
+
+	if entity, ok := entityRegistry[initBase.Name]; ok {
+		test := entity.(*[]T)
+		initBase.GoEntity = test
+	} else {
+		log.Panicln("You cannot create base without registering a one")
+	}
+
+	initBase.fillRelation()
+	initBase.initIndices()
+	initBase.syncIdIndex()
+
+	return &initBase
+}
+
+// SetId writes id into the entity's Id field via reflection.
+// Used internally by AddToPersistQueue; exported for callers that want to
+// pre-assign Ids.
 func SetId[T any](entity *T, id int) {
 	val := reflect.ValueOf(entity)
 
@@ -53,554 +114,24 @@ func SetId[T any](entity *T, id int) {
 	if idField.Kind() != reflect.Int {
 		panic("ID field is not of type int")
 	}
-	if idField.CanSet() {
-		idField.SetInt(int64(id))
-		return
+	if !idField.CanSet() {
+		panic("ID field is not settable")
 	}
-	panic("ID field is not settable")
+	idField.SetInt(int64(id))
 }
 
+// Filename returns "<TypeName>.gob".
 func (gb *DB[T]) Filename() string {
-	filename := fmt.Sprint(gb.Name, ".gob")
-
-	return filename
+	return fmt.Sprint(gb.Name, ".gob")
 }
 
+// Filepath returns "<DataDir>/<TypeName>.gob".
 func (gb *DB[T]) Filepath() string {
-	filePath := fmt.Sprintf("%s/%s", DataDir, gb.Filename())
-
-	return filePath
+	return fmt.Sprintf("%s/%s", DataDir, gb.Filename())
 }
 
+// TypeName returns the Go type name of T without package prefix.
 func (gb *DB[T]) TypeName() string {
 	var t T
-	typeOf := reflect.TypeOf(t).Name()
-
-	return typeOf
-}
-
-var baseRegistry = make(map[string]any)
-var entityRegistry = make(map[string]any) // []T
-
-func GetEntityRegistry() map[string]any {
-    return entityRegistry
-}
-
-func Register[T Entity]() {
-    instance := new(T)
-    name := reflect.TypeOf(instance).Elem().Name()
-
-    if _, ok := entityRegistry[name]; ok {
-        log.Panicln("Base for that type already exist", name)
-    }
-
-    creator := &goBaseCreator{}
-
-    baseSchema := creator.CreateDB(*new(T))
-    entity := readEntity[T](baseSchema)
-
-    entityRegistry[name] = &entity
-}
-
-func Open[T Entity]() *DB[T] {
-	initBase := DB[T]{Identifier: "Id"}
-
-	initBase.Name = initBase.TypeName()
-	initBase.Indices = make(IndexMap[[]*T])
-	initBase.Index = make(IndexMap[*T])
-
-	initBase.schemaFields = initBase.createSchemaFields()
-
-    if entity, ok := entityRegistry[initBase.Name]; ok {
-        test := entity.(*[]T)
-        initBase.GoEntity = test
-    } else {
-        log.Panicln("You cannot create base without registering a one")
-    }
-
-    initBase.fillRelation()
-	initBase.initIndices()
-	initBase.syncIdIndex()
-
-	return &initBase
-}
-
-func (gb *DB[T]) fillRelation() {
-    relFields := make(map[string]string)
-    mapFields := make(map[string]string)
-
-    t := reflect.TypeOf(*new(T))
-    for idx := range t.NumField() {
-        f := t.Field(idx)
-        relto := f.Tag.Get("relto")
-        if relto != "" {
-            relFields[f.Name] = relto
-        }
-
-        mapby := f.Tag.Get("mapby")
-        if mapby != "" {
-            mapFields[f.Name] = mapby 
-        }
-    }
-
-    for idx := range *gb.GoEntity {
-        el := &(*gb.GoEntity)[idx]
-        v :=  reflect.ValueOf(el)
-        t :=  reflect.TypeOf(*el)
-
-        for fieldName, relto := range relFields {
-            f := v.Elem().FieldByName(fieldName)
-            tf, ok := t.FieldByName(fieldName)
-            if !ok {
-                log.Panicln("No field", fieldName)
-            }
-
-            if f.Kind() != reflect.Pointer {
-                log.Panic("All relfields must by a pointer")
-            }
-
-            if f.IsZero() {
-                log.Println("No relation found for field", tf.Name, "with value", f.Interface(), "; ", " - skipping")
-
-                continue
-            }
-
-            relTypeName := f.Elem().Type().Name()
-            relEntity, ok := entityRegistry[relTypeName]
-            if !ok {
-                log.Panicln("Could not relate any instance with type of", relTypeName)
-            }
-
-            relEntityPtr := reflect.ValueOf(relEntity)
-            relEntityValue := relEntityPtr.Elem()
-            if relEntityValue.Kind() != reflect.Slice {
-                log.Panicln("Value of related entity is not a slice")
-            }
-
-            concreteField := f.Elem().FieldByName(relto)
-
-            for idx := range relEntityValue.Len() {
-                instance := relEntityValue.Index(idx)
-                if instance.Kind() != reflect.Ptr {
-                    instance = instance.Addr()
-                }
-
-                instanceRelField := instance.Elem().FieldByName(relto) 
-
-                if concreteField.Interface() != instanceRelField.Interface() {
-					continue
-                }
-
-                log.Println(instance)
-                f.Set(instance)
-            }
-
-			if f.IsZero() {
-				log.Panicf("Field's value does not match to any of related field in the specified entity\n Rel field: %s \n; Entity fields value %s\n", relto, f.Elem().FieldByName(relto),
-				)
-			}
-        }
-
-        for fieldName, mapby := range mapFields {
-			log.Printf("\n\n Many To One \n\n")
-
-			id := v.Elem().FieldByName("Id").Interface()
-
-            f := v.Elem().FieldByName(fieldName)
-            if _, ok := t.FieldByName(fieldName); !ok {
-                log.Panicln("No field", fieldName)
-            }
-
-            if f.Kind() != reflect.Slice && f.Type().Elem().Kind() != reflect.Pointer {
-                log.Panic("All mapby fields must by a slice of pointers")
-            }
-
-            // Empty slice is fine — we'll append matches below if any exist.
-
-            relTypeName := f.Type().Elem().Elem().Name()
-            relEntity, ok := entityRegistry[relTypeName]
-            if !ok {
-                log.Panicln("Could not relate any instance with type of", relTypeName)
-            }
-
-            relEntityPtr := reflect.ValueOf(relEntity)
-            relEntityValue := relEntityPtr.Elem()
-            if relEntityValue.Kind() != reflect.Slice {
-                log.Panicln("Value of related entity is not a slice")
-            }
-
-            for idx := range relEntityValue.Len() {
-                instance := relEntityValue.Index(idx)
-                if instance.Kind() != reflect.Ptr {
-                    instance = instance.Addr()
-                }
-
-                instanceRelField := instance.Elem().FieldByName(mapby) 
-
-                if instanceRelField.Interface() != id {
-					continue
-                }
-
-                log.Println(instance)
-				f.Set(reflect.Append(f, instance))
-            }
-
-			if f.IsZero() {
-				log.Printf("mapby: no children matched for field %q (parent.Id=%v) — leaving empty\n",
-					mapby, id)
-			}
-        }
-    }
-}
-
-func (gb *DB[T]) Add(entity *T) {
-	gb.mu.Lock()
-	defer gb.mu.Unlock()
-
-    _ent := *entity
-	*gb.GoEntity = append(*gb.GoEntity, _ent)
-}
-
-func (gb *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
-	if len(*gb.GoEntity) <= 0 {
-        fmt.Println("Entity is empty")
-
-		return nil, ErrEmptyEntity
-	}
-
-	var wg sync.WaitGroup
-	chResult := make(chan *T, 1)
-	chStop := make(chan struct{})
-
-	memberMatch := func(s *T) {
-		defer wg.Done()
-
-		val := reflect.ValueOf(s).Elem()
-
-		for {
-			if val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
-				if val.IsNil() {
-					fmt.Printf("Value is nil\n")
-					return
-				}
-				val = val.Elem()
-			} else {
-				break
-			}
-		}
-
-		if val.Kind() != reflect.Struct {
-			fmt.Printf("Expected struct, got %v\n", val.Kind())
-			return
-		}
-
-		for idx := range val.NumField() {
-			k := val.Type().Field(idx).Name
-			v := val.Field(idx).Interface()
-
-			if k == key && v == withValue {
-				select {
-				case chResult <- s:
-					return
-				case <-chStop:
-					return
-				}
-			}
-		}
-	}
-
-	for i := range *gb.GoEntity {
-		wg.Add(1)
-        entity := *gb.GoEntity
-		go memberMatch(&entity[i])
-	}
-
-	var result *T
-
-	go func() {
-		wg.Wait()
-		close(chResult)
-	}()
-
-	select {
-	case result = <-chResult:
-		close(chStop)
-	case <-chStop:
-	}
-
-	if result == nil {
-		return nil, nil
-	}
-
-	return result, nil
-}
-
-func (gb *DB[T]) QueueDelete(id any)  (error) {
-	if instance, ok := gb.Index["Id"][id]; !ok {
-		return fmt.Errorf("There is no item with given Id %d\n", id)
-	} else {
-        for _, q := range gb.deleteQueue {
-            if (*q).GetId() == id {
-                return nil
-            }
-        }
-
-        gb.deleteQueue = append(gb.deleteQueue, instance)
-
-        return nil
-    }
-}
-
-func (gb *DB[T]) PatchById(id any, item T) (*T, error) {
-	baseInstance, ok := gb.Index["Id"][id]
-	if !ok {
-		return nil, fmt.Errorf("There is no item with given Id %d\n", id)
-	}
-
-	err := merge(baseInstance, item)
-	if err != nil {
-		return nil, err
-	}
-
-	return baseInstance, nil
-}
-
-func (gb *DB[T]) resetDeleteQueue() {
-    gb.deleteQueue = []*T{}
-}
-
-func (gb *DB[T]) Flush() error {
-	for _, ent := range gb.persistQueue {
-		entity := *ent
-		id := entity.GetId()
-
-		if _ent, err := gb.FindOneBy("Id", id); _ent != nil{
-			gb.PatchById(id, entity)
-			continue
-		} else if err != nil && err != ErrEmptyEntity {
-			log.Panicln(err)
-		}
-
-		gb.Add(ent)
-	}
-
-	gb.ResetpersistQueue()
-	gb.syncIdIndex()
-
-    _ent := gb.GoEntity
-    for _, instance := range gb.deleteQueue {
-        i := *instance
-        for idx, _instance := range *_ent {
-            if _instance.GetId() == i.GetId() {
-                *_ent = slices.Delete(*_ent, idx, idx+1)
-                break
-            }
-        }
-    }
-
-    gb.resetDeleteQueue()
-
-    // End of rewrite
-    gb.GoEntity = _ent    
-
-    log.Println("Saved entity", gb.TypeName(), *gb.GoEntity)
-
-	fmt.Printf("PERSIST QUEUE (should be empty): %+v\n", gb.persistQueue)
-
-    err := gb.save()
-    if err != nil {
-        log.Panicln("Panic during saving a base", gb.TypeName(), err)
-    }
-
-	fmt.Println("Data successfully written to file:", gb.Filepath())
-
-	return nil
-}
-
-// save writes the entity slice to disk atomically: it encodes to a sibling
-// .tmp file, fsyncs it, and only then renames into place. A crash mid-write
-// leaves the previous good file untouched.
-func (gb *DB[T]) save() error {
-	log.Println("Saving entity:", gb.TypeName())
-
-	finalPath := gb.Filepath()
-	tmpPath := finalPath + ".tmp"
-
-	entitySchemaStruct := gb.createSchemaStruct()
-	baseType := reflect.SliceOf(entitySchemaStruct.Type())
-	baseValue := reflect.MakeSlice(baseType, 0, 0)
-
-	for _, entity := range *gb.GoEntity {
-		abstractStruct := gb.NormalizeToSchema(entity)
-		baseValue = reflect.Append(baseValue, abstractStruct)
-	}
-
-	file, err := os.Create(tmpPath)
-	if err != nil {
-		return fmt.Errorf("nestory: create %s: %w", tmpPath, err)
-	}
-
-	if err := gob.NewEncoder(file).Encode(baseValue.Interface()); err != nil {
-		file.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("nestory: encode %s: %w", tmpPath, err)
-	}
-
-	if err := file.Sync(); err != nil {
-		file.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("nestory: fsync %s: %w", tmpPath, err)
-	}
-
-	if err := file.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("nestory: close %s: %w", tmpPath, err)
-	}
-
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("nestory: rename %s -> %s: %w", tmpPath, finalPath, err)
-	}
-
-	return nil
-}
-
-func (gb *DB[T]) AddToPersistQueue(entity *T) error {
-	id := (*entity).GetId()
-
-	// Caller supplied an Id explicitly — accept it, but skip if it's already
-	// in the persisted set or already queued (deduplication).
-	if id != 0 {
-		if existing, _ := gb.FindOneBy("Id", id); existing != nil {
-			return nil
-		}
-		for _, q := range gb.persistQueue {
-			if (*q).GetId() == id {
-				return nil
-			}
-		}
-		gb.persistQueue = append(gb.persistQueue, entity)
-		gb.Index["Id"][id] = entity
-		return nil
-	}
-
-	// Auto-assign the next Id. Must consider both persisted entities AND the
-	// pending queue — otherwise batch-queueing multiple items before Flush()
-	// would hand each one the same Id.
-	nextId := 0
-	for _, e := range *gb.GoEntity {
-		if e.GetId() > nextId {
-			nextId = e.GetId()
-		}
-	}
-	for _, q := range gb.persistQueue {
-		if qid := (*q).GetId(); qid > nextId {
-			nextId = qid
-		}
-	}
-	nextId++
-
-	SetId(entity, nextId)
-	gb.persistQueue = append(gb.persistQueue, entity)
-	gb.Index["Id"][nextId] = entity
-	return nil
-}
-
-func (gb *DB[T]) ResetpersistQueue() {
-	gb.persistQueue = []*T{}
-}
-
-func (gb *DB[T]) Filter(filterFn func(T) bool) []T {
-	var filteredSlice []T
-
-	for _, item := range *gb.GoEntity {
-		if filterFn(item) {
-			filteredSlice = append(filteredSlice, item)
-		}
-	}
-
-	return filteredSlice
-}
-
-func (gb *DB[T]) FilterPtr(filterFn func(*T) bool) ([]*T, error) {
-	var filteredSlice []*T
-
-	for _, item := range *gb.GoEntity {
-		if filterFn(&item) {
-			filteredSlice = append(filteredSlice, &item)
-		}
-	}
-
-    if len(filteredSlice) == 0 {
-        return filteredSlice, fmt.Errorf("Empty array\n")
-    }
-
-	return filteredSlice, nil
-}
-
-func (gb *DB[T]) initIndices() {
-	baseType := reflect.TypeOf(*gb.GoEntity).Elem()
-	if baseType.Kind() == reflect.Ptr {
-		baseType = baseType.Elem()
-	}
-
-    for i := range baseType.NumField() {
-		fieldName := baseType.Field(i).Name
-		gb.Index[fieldName] = make(map[any]*T)
-	}
-}
-
-func (gb *DB[T]) syncIdIndex() {
-	for idx, el := range *gb.GoEntity {
-		if _, ok := gb.Index["Id"][el.GetId()]; !ok {
-			gb.Index["Id"][el.GetId()] = &(*gb.GoEntity)[idx]
-
-			continue
-		}
-	}	
-
-	for key, val := range gb.Index["Id"]  {
-		if val == nil {
-			delete(gb.Index["Id"], key)
-		}
-	}
-}
-
-// merger passed value to mergee
-func merge[T any](target *T, merger T) error {
-    targetVal := reflect.ValueOf(target).Elem()
-
-    mergerVal := reflect.ValueOf(merger)
-    mergerType  := reflect.TypeOf(merger)
-
-    if targetVal.Kind() != reflect.Struct || mergerVal.Kind() != reflect.Struct {
-        return fmt.Errorf("merge: target and merger must be structs")
-    }
-
-    for i := range mergerVal.NumField() {
-        mergerField := mergerVal.Field(i)
-		log.Println("Fieldname:", mergerType.Field(i).Name)
-        targetField := targetVal.FieldByName(mergerType.Field(i).Name)
-
-		mergerFieldType := mergerType.Field(i)
-		fieldKeyType := mergerFieldType.Tag.Get("key") 
-
-		if fieldKeyType == "primary" || !targetField.CanSet() {
-			log.Println("Cannot merge field", mergerFieldType.Name, "because it is primary or not settable")
-			continue
-		}
-
-        if (targetField.Kind() == reflect.Ptr && !mergerField.IsNil()) {
-			log.Println("Merged field with name:", mergerType.Field(i).Name)
-			targetField.Set(mergerField)
-			continue
-        } 
-
-        if (!mergerField.IsZero()) {
-			log.Println("Merged field with name:", targetField.Type().Name())
-			targetField.Set(mergerField)
-        } 
-    }
-
-    return nil
+	return reflect.TypeOf(t).Name()
 }
