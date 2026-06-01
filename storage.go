@@ -78,9 +78,9 @@ func (gb *DB[T]) save() error {
 	baseType := reflect.SliceOf(entitySchemaStruct.Type())
 	baseValue := reflect.MakeSlice(baseType, 0, 0)
 
-	for _, entity := range *gb.GoEntity {
-		baseValue = reflect.Append(baseValue, gb.NormalizeToSchema(entity))
-	}
+	gb.store.Range(func(p *T) {
+		baseValue = reflect.Append(baseValue, gb.NormalizeToSchema(*p))
+	})
 
 	file, err := os.Create(tmpPath)
 	if err != nil {

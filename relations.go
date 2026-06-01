@@ -28,8 +28,7 @@ func (gb *DB[T]) fillRelation() {
 		}
 	}
 
-	for idx := range *gb.GoEntity {
-		el := &(*gb.GoEntity)[idx]
+	gb.store.Range(func(el *T) {
 		v := reflect.ValueOf(el)
 		t := reflect.TypeOf(*el)
 
@@ -50,31 +49,21 @@ func (gb *DB[T]) fillRelation() {
 			}
 
 			relTypeName := f.Elem().Type().Name()
-			relEntity, ok := entityRegistry[relTypeName]
+			relSlice, ok := relLivePointers(relTypeName)
 			if !ok {
 				log.Panicln("Could not relate any instance with type of", relTypeName)
 			}
 
-			relEntityPtr := reflect.ValueOf(relEntity)
-			relEntityValue := relEntityPtr.Elem()
-			if relEntityValue.Kind() != reflect.Slice {
-				log.Panicln("Value of related entity is not a slice")
-			}
-
 			concreteField := f.Elem().FieldByName(relto)
 
-			for idx := range relEntityValue.Len() {
-				instance := relEntityValue.Index(idx)
-				if instance.Kind() != reflect.Ptr {
-					instance = instance.Addr()
-				}
+			for idx := 0; idx < relSlice.Len(); idx++ {
+				instance := relSlice.Index(idx)
 
 				instanceRelField := instance.Elem().FieldByName(relto)
 				if concreteField.Interface() != instanceRelField.Interface() {
 					continue
 				}
 
-				log.Println(instance)
 				f.Set(instance)
 			}
 
@@ -101,29 +90,19 @@ func (gb *DB[T]) fillRelation() {
 			// Empty slice is fine — we'll append matches below if any exist.
 
 			relTypeName := f.Type().Elem().Elem().Name()
-			relEntity, ok := entityRegistry[relTypeName]
+			relSlice, ok := relLivePointers(relTypeName)
 			if !ok {
 				log.Panicln("Could not relate any instance with type of", relTypeName)
 			}
 
-			relEntityPtr := reflect.ValueOf(relEntity)
-			relEntityValue := relEntityPtr.Elem()
-			if relEntityValue.Kind() != reflect.Slice {
-				log.Panicln("Value of related entity is not a slice")
-			}
-
-			for idx := range relEntityValue.Len() {
-				instance := relEntityValue.Index(idx)
-				if instance.Kind() != reflect.Ptr {
-					instance = instance.Addr()
-				}
+			for idx := 0; idx < relSlice.Len(); idx++ {
+				instance := relSlice.Index(idx)
 
 				instanceRelField := instance.Elem().FieldByName(mapby)
 				if instanceRelField.Interface() != id {
 					continue
 				}
 
-				log.Println(instance)
 				f.Set(reflect.Append(f, instance))
 			}
 
@@ -132,5 +111,20 @@ func (gb *DB[T]) fillRelation() {
 					mapby, id)
 			}
 		}
+	})
+}
+
+// relLivePointers returns a reflect.Value wrapping the []*T of live entities
+// in the base registered under typeName. The slice elements are stable
+// pointers into that base's chunk store — ready to assign to relation fields.
+func relLivePointers(typeName string) (reflect.Value, bool) {
+	e, ok := entityRegistry[typeName]
+	if !ok {
+		return reflect.Value{}, false
 	}
+	lister, ok := e.(pointerLister)
+	if !ok {
+		return reflect.Value{}, false
+	}
+	return reflect.ValueOf(lister.livePointers()), true
 }

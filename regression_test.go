@@ -69,7 +69,7 @@ func TestRegression_BatchQueueAssignsDistinctIds(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	if got := len(*db.GoEntity); got != 4 {
+	if got := db.Len(); got != 4 {
 		t.Errorf("expected 4 entities persisted, got %d", got)
 	}
 }
@@ -100,6 +100,56 @@ func TestRegression_QueueRespectsExistingMaxId(t *testing.T) {
 	_ = db.AddToPersistQueue(second)
 	if second.Id != 4 {
 		t.Errorf("second batch first Id: got %d, want 4", second.Id)
+	}
+}
+
+// ============================================================
+// Bug: the auto-id counter started at 0 on every Open, so the first insert
+// after a RELOAD reused id=1 and silently patched the existing entity #1
+// instead of appending. The counter must be seeded from the max persisted id.
+// ============================================================
+
+func TestRegression_CounterSeededAfterReload(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalDir := DataDir
+	DataDir = tmpDir
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	// Phase 1: persist ids 1, 2, 3.
+	resetRegistries()
+	Register[bqItem]()
+	db := Open[bqItem]()
+	for i := 0; i < 3; i++ {
+		if err := db.AddToPersistQueue(&bqItem{Name: "seed"}); err != nil {
+			t.Fatalf("seed queue: %v", err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatalf("seed flush: %v", err)
+	}
+
+	// Phase 2: reload a fresh base from disk and insert one more.
+	resetRegistries()
+	Register[bqItem]()
+	db2 := Open[bqItem]()
+
+	fresh := &bqItem{Name: "after-reload"}
+	if err := db2.AddToPersistQueue(fresh); err != nil {
+		t.Fatalf("post-reload queue: %v", err)
+	}
+	if fresh.Id != 4 {
+		t.Fatalf("after reload, next id = %d, want 4 (counter must seed from max persisted id)", fresh.Id)
+	}
+	if err := db2.Flush(); err != nil {
+		t.Fatalf("post-reload flush: %v", err)
+	}
+
+	// The new entity must be appended, not overwrite id 1.
+	if got := db2.Len(); got != 4 {
+		t.Errorf("expected 4 entities after reload+insert, got %d", got)
 	}
 }
 

@@ -5,7 +5,7 @@ import "reflect"
 // initIndices creates an empty inner map for every field of T, so the
 // outer Index map is ready for direct subscript writes.
 func (gb *DB[T]) initIndices() {
-	baseType := reflect.TypeOf(*gb.GoEntity).Elem()
+	baseType := reflect.TypeOf(*new(T))
 	if baseType.Kind() == reflect.Ptr {
 		baseType = baseType.Elem()
 	}
@@ -16,14 +16,14 @@ func (gb *DB[T]) initIndices() {
 	}
 }
 
-// syncIdIndex ensures Index["Id"] contains a pointer to every entity in
-// the slice, and drops any stale nil entries.
+// syncIdIndex ensures Index["Id"] points at the backing store's stable slot
+// for every live entity, and drops any stale nil entries.
 func (gb *DB[T]) syncIdIndex() {
-	for idx, el := range *gb.GoEntity {
-		if _, ok := gb.Index["Id"][el.GetId()]; !ok {
-			gb.Index["Id"][el.GetId()] = &(*gb.GoEntity)[idx]
+	gb.store.Range(func(p *T) {
+		if _, ok := gb.Index["Id"][(*p).GetId()]; !ok {
+			gb.Index["Id"][(*p).GetId()] = p
 		}
-	}
+	})
 
 	for key, val := range gb.Index["Id"] {
 		if val == nil {
