@@ -6,6 +6,19 @@ import (
 	"reflect"
 )
 
+// isScalarKey reports whether a foreign-key column type is an acceptable
+// primitive: a string or any integer width (the primary key is int, but a
+// relto target may legitimately be any integer kind).
+func isScalarKey(k reflect.Kind) bool {
+	switch k {
+	case reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
+}
+
 // goBaseCreator is the untyped sibling of [DB], used during initial file
 // load before the concrete generic parameter T is bound. It only works
 // through reflection — no generic methods.
@@ -15,12 +28,12 @@ type goBaseCreator struct{}
 // row into a concrete T. relto fields become hollow pointers carrying only
 // the foreign Id; [DB.fillRelation] rewires them to real instances once
 // every type has been registered.
-func readEntity[T Entity](base any) []T {
+func readEntity[T Entity](base any) *chunkStore[T] {
 	creator := &goBaseCreator{}
 
-	concreteEntity := make([]T, 0)
+	store := newChunkStore[T](chunkLimit)
 	if base == nil {
-		return concreteEntity
+		return store
 	}
 
 	bv := reflect.ValueOf(base)
@@ -85,10 +98,10 @@ func readEntity[T Entity](base any) []T {
 			zeroField.Set(schemaField)
 		}
 
-		concreteEntity = append(concreteEntity, *zero)
+		store.Append(*zero)
 	}
 
-	return concreteEntity
+	return store
 }
 
 // NormalizeToSchema produces a flat schema row from a typed entity. relto
@@ -134,7 +147,7 @@ func (gb *DB[T]) NormalizeToSchema(instance T) reflect.Value {
 			}
 
 			relField := currValue.FieldByName(relFieldName)
-			if relField.Kind() != reflect.String && relField.Kind() != reflect.Int {
+			if !isScalarKey(relField.Kind()) {
 				panic("Field attached to foreign field must be primitive type")
 			}
 

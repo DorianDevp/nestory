@@ -19,25 +19,29 @@ type Entity interface {
 // DB exposes two of these: Indices for one-to-many, Index for one-to-one.
 type IndexMap[T any] map[string]map[any]T
 
-// GoEntity is a typed slice alias — currently unused externally, kept
-// for backwards compat. Will be removed in 1.0.
-type GoEntity[T Entity] []T
-
 // DB is the in-memory state for one entity type. Construct via [Open].
 type DB[T Entity] struct {
 	Name         string
 	Identifier   string
 	Type         string
-	GoEntity     *[]T
-	persistQueue []*T              `gob:"-"`
-	deleteQueue  []*T              `gob:"-"`
-	Indices      IndexMap[[]*T]    `gob:"-"`
-	Index        IndexMap[*T]      `gob:"-"`
-	schemaFields [][2]string       `gob:"-"`
-	schemaStruct reflect.Value     `gob:"-"`
-	mu           sync.RWMutex      `gob:"-"`
-	creator      *goBaseCreator    `gob:"-"`
+	counter      int
+	store        *chunkStore[T] `gob:"-"`
+	persistQueue []*T           `gob:"-"`
+	deleteQueue  []*T           `gob:"-"`
+	Indices      IndexMap[[]*T] `gob:"-"`
+	Index        IndexMap[*T]   `gob:"-"`
+	schemaFields [][2]string    `gob:"-"`
+	schemaStruct reflect.Value  `gob:"-"`
+	mu           sync.RWMutex   `gob:"-"`
+	creator      *goBaseCreator `gob:"-"`
 }
+
+// Len returns the number of live (non-deleted) entities in the base.
+func (gb *DB[T]) Len() int { return gb.store.Len() }
+
+// All returns stable pointers to every live entity. The pointers remain
+// valid for the life of the base (relations point at these same slots).
+func (gb *DB[T]) All() []*T { return gb.store.Live() }
 
 // DataDir is the folder where every base writes its .gob file. Override
 // before the first call to [Register].
@@ -47,7 +51,7 @@ var DataDir = "./data"
 var ErrEmptyEntity = errors.New("empty entity")
 
 var baseRegistry = make(map[string]any)
-var entityRegistry = make(map[string]any) // map[typeName]*[]T
+var entityRegistry = make(map[string]any) // map[typeName]*chunkStore[T]
 
 // GetEntityRegistry exposes the internal registry for debugging.
 // Not part of the stable API.
@@ -57,8 +61,7 @@ func GetEntityRegistry() map[string]any { return entityRegistry }
 // into a *T entity. Must be called once per entity type, BEFORE any [Open]
 // call — fillRelation needs every type registered to wire pointers.
 func Register[T Entity]() {
-	instance := new(T)
-	name := reflect.TypeOf(instance).Elem().Name()
+	name := reflect.TypeFor[T]().Name()
 
 	if _, ok := entityRegistry[name]; ok {
 		log.Panicln("Base for that type already exist", name)
@@ -66,9 +69,8 @@ func Register[T Entity]() {
 
 	creator := &goBaseCreator{}
 	baseSchema := creator.CreateDB(*new(T))
-	entity := readEntity[T](baseSchema)
 
-	entityRegistry[name] = &entity
+	entityRegistry[name] = readEntity[T](baseSchema)
 }
 
 // Open returns a typed [DB] over the entities previously loaded by [Register].
@@ -83,8 +85,7 @@ func Open[T Entity]() *DB[T] {
 	initBase.schemaFields = initBase.createSchemaFields()
 
 	if entity, ok := entityRegistry[initBase.Name]; ok {
-		test := entity.(*[]T)
-		initBase.GoEntity = test
+		initBase.store = entity.(*chunkStore[T])
 	} else {
 		log.Panicln("You cannot create base without registering a one")
 	}
@@ -92,8 +93,23 @@ func Open[T Entity]() *DB[T] {
 	initBase.fillRelation()
 	initBase.initIndices()
 	initBase.syncIdIndex()
+	initBase.seedCounter()
 
 	return &initBase
+}
+
+// seedCounter sets the auto-id counter to the largest id currently in the
+// store, so inserts after a reload continue past the persisted ids instead of
+// restarting at 1 (which would collide with — and silently patch — existing
+// entities). One O(n) scan at load; inserts stay O(1) thereafter.
+func (gb *DB[T]) seedCounter() {
+	var maxId int
+	gb.store.Range(func(p *T) {
+		if id := (*p).GetId(); id > maxId {
+			maxId = id
+		}
+	})
+	gb.counter = maxId
 }
 
 // SetId writes id into the entity's Id field via reflection.
@@ -111,13 +127,17 @@ func SetId[T any](entity *T, id int) {
 	if !idField.IsValid() {
 		panic("ID field not found")
 	}
-	if idField.Kind() != reflect.Int {
-		panic("ID field is not of type int")
-	}
 	if !idField.CanSet() {
 		panic("ID field is not settable")
 	}
-	idField.SetInt(int64(id))
+	switch idField.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		idField.SetInt(int64(id))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		idField.SetUint(uint64(id))
+	default:
+		panic("ID field must be an integer type")
+	}
 }
 
 // Filename returns "<TypeName>.gob".

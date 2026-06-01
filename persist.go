@@ -4,18 +4,17 @@ import (
 	"fmt"
 	"log"
 	"reflect"
-	"slices"
 )
 
-// Add appends entity to the in-memory slice without queueing it for save.
-// Used internally by Flush; rarely needed by callers — prefer
-// [DB.AddToPersistQueue] + [DB.Flush].
+// Add appends entity to the backing store and points the Id index at the
+// store's stable slot (NOT the caller's pointer). Used internally by Flush;
+// rarely needed by callers — prefer [DB.AddToPersistQueue] + [DB.Flush].
 func (gb *DB[T]) Add(entity *T) {
 	gb.mu.Lock()
 	defer gb.mu.Unlock()
 
-	_ent := *entity
-	*gb.GoEntity = append(*gb.GoEntity, _ent)
+	slot := gb.store.Append(*entity)
+	gb.Index["Id"][(*slot).GetId()] = slot
 }
 
 // AddToPersistQueue stages entity for the next Flush. If entity.Id is zero,
@@ -24,41 +23,31 @@ func (gb *DB[T]) Add(entity *T) {
 // or the queue, the call is a no-op.
 func (gb *DB[T]) AddToPersistQueue(entity *T) error {
 	id := (*entity).GetId()
+	dbIdentifier := gb.Identifier
 
 	// Caller supplied an Id explicitly — accept it, but dedupe.
 	if id != 0 {
-		if existing, _ := gb.FindOneBy("Id", id); existing != nil {
+		if existing := gb.Index[dbIdentifier][id]; existing != nil {
 			return nil
 		}
+
 		for _, q := range gb.persistQueue {
 			if (*q).GetId() == id {
 				return nil
 			}
 		}
+
 		gb.persistQueue = append(gb.persistQueue, entity)
-		gb.Index["Id"][id] = entity
+
 		return nil
 	}
 
-	// Auto-assign the next Id. Must consider both persisted entities AND
-	// the pending queue — otherwise batch-queueing multiple items before
-	// Flush() would hand each one the same Id.
-	nextId := 0
-	for _, e := range *gb.GoEntity {
-		if e.GetId() > nextId {
-			nextId = e.GetId()
-		}
-	}
-	for _, q := range gb.persistQueue {
-		if qid := (*q).GetId(); qid > nextId {
-			nextId = qid
-		}
-	}
-	nextId++
+	gb.counter += 1
+	nextId := gb.counter
 
 	SetId(entity, nextId)
 	gb.persistQueue = append(gb.persistQueue, entity)
-	gb.Index["Id"][nextId] = entity
+
 	return nil
 }
 
@@ -106,39 +95,37 @@ func (gb *DB[T]) PatchById(id any, item T) (*T, error) {
 // Flush applies the persist queue (inserts or patches), then the delete
 // queue, then writes the resulting slice atomically to disk.
 func (gb *DB[T]) Flush() error {
+	// Build the set of already-persisted ids once (O(n)) so the per-item
+	// insert-vs-patch decision is O(1), instead of a full scan per queued
+	// item (which, via the old goroutine-spawning FindOneBy, made Flush
+	// O(items x rows)).
+	existing := make(map[int]bool, gb.store.Len())
+	gb.store.Range(func(p *T) { existing[(*p).GetId()] = true })
+
 	for _, ent := range gb.persistQueue {
-		entity := *ent
-		id := entity.GetId()
-
-		if existing, err := gb.FindOneBy("Id", id); existing != nil {
-			gb.PatchById(id, entity)
+		id := (*ent).GetId()
+		if existing[id] {
+			gb.PatchById(id, *ent)
 			continue
-		} else if err != nil && err != ErrEmptyEntity {
-			log.Panicln(err)
 		}
-
 		gb.Add(ent)
+		existing[id] = true
 	}
 
 	gb.ResetpersistQueue()
 	gb.syncIdIndex()
 
-	_ent := gb.GoEntity
+	// Deletes are tombstones in the backing store (no in-place shift, which
+	// would move elements and dangle pointers). Drop the Id index entry too.
 	for _, instance := range gb.deleteQueue {
-		i := *instance
-		for idx, _instance := range *_ent {
-			if _instance.GetId() == i.GetId() {
-				*_ent = slices.Delete(*_ent, idx, idx+1)
-				break
-			}
-		}
+		delId := (*instance).GetId()
+		gb.store.DeleteFunc(func(p *T) bool { return (*p).GetId() == delId })
+		delete(gb.Index["Id"], delId)
 	}
 
 	gb.resetDeleteQueue()
-	gb.GoEntity = _ent
 
-	log.Println("Saved entity", gb.TypeName(), *gb.GoEntity)
-	fmt.Printf("PERSIST QUEUE (should be empty): %+v\n", gb.persistQueue)
+	log.Println("Saved entity", gb.TypeName())
 
 	if err := gb.save(); err != nil {
 		log.Panicln("Panic during saving a base", gb.TypeName(), err)

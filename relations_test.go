@@ -27,7 +27,7 @@ type tSettings struct {
 func (s tSettings) GetId() int { return s.Id }
 
 type tProfile struct {
-	Id       int        `key:"primary"`
+	Id       int `key:"primary"`
 	Nickname string
 	Settings *tSettings `relto:"Id"` // O2O
 }
@@ -43,7 +43,7 @@ type tPost struct {
 func (p tPost) GetId() int { return p.Id }
 
 type tComment struct {
-	Id     int    `key:"primary"`
+	Id     int `key:"primary"`
 	Body   string
 	Author *tUser `relto:"Id"` // M2O — no back-mapby from tUser
 }
@@ -59,7 +59,7 @@ type tUserTag struct {
 func (ut tUserTag) GetId() int { return ut.Id }
 
 type tTag struct {
-	Id       int         `key:"primary"`
+	Id       int `key:"primary"`
 	Label    string
 	UserTags []*tUserTag `mapby:"TagId"` // M2M side B
 }
@@ -67,7 +67,7 @@ type tTag struct {
 func (t tTag) GetId() int { return t.Id }
 
 type tUser struct {
-	Id       int         `key:"primary"`
+	Id       int `key:"primary"`
 	Name     string
 	Profile  *tProfile   `relto:"Id"`     // O2O
 	Posts    []*tPost    `mapby:"UserId"` // O2M
@@ -173,10 +173,10 @@ func TestRelationsRoundTrip(t *testing.T) {
 	reloadedTagBase := Open[tTag]()
 	reloadedUserBase := Open[tUser]()
 
-	if got := len(*reloadedUserBase.GoEntity); got != 1 {
+	if got := reloadedUserBase.Len(); got != 1 {
 		t.Fatalf("expected 1 user after reload, got %d", got)
 	}
-	reloadedUser := (*reloadedUserBase.GoEntity)[0]
+	reloadedUser := *reloadedUserBase.All()[0]
 	if reloadedUser.Id != savedUserId {
 		t.Errorf("user.Id mismatch: got %d, want %d", reloadedUser.Id, savedUserId)
 	}
@@ -223,10 +223,10 @@ func TestRelationsRoundTrip(t *testing.T) {
 	})
 
 	t.Run("M2O comment.Author via relto", func(t *testing.T) {
-		if got := len(*reloadedCommentBase.GoEntity); got != 1 {
+		if got := reloadedCommentBase.Len(); got != 1 {
 			t.Fatalf("expected 1 comment, got %d", got)
 		}
-		c := (*reloadedCommentBase.GoEntity)[0]
+		c := *reloadedCommentBase.All()[0]
 		if c.Author == nil {
 			t.Fatalf("comment.Author is nil")
 		}
@@ -255,8 +255,7 @@ func TestRelationsRoundTrip(t *testing.T) {
 		}
 
 		tagsById := map[int]*tTag{}
-		for i := range *reloadedTagBase.GoEntity {
-			ptr := &(*reloadedTagBase.GoEntity)[i]
+		for _, ptr := range reloadedTagBase.All() {
 			tagsById[ptr.Id] = ptr
 		}
 		for _, id := range []int{savedTagGoId, savedTagTestId} {
