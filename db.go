@@ -19,6 +19,12 @@ type Entity interface {
 // DB exposes two of these: Indices for one-to-many, Index for one-to-one.
 type IndexMap[T any] map[string]map[any]T
 
+type Tx[T any] struct {
+	pre map[int]*Resource[T]
+	work map[int]*T
+	n int
+}
+
 // DB is the in-memory state for one entity type. Construct via [Open].
 type DB[T Entity] struct {
 	Name         string
@@ -33,7 +39,8 @@ type DB[T Entity] struct {
 	schemaFields [][2]string    `gob:"-"`
 	schemaStruct reflect.Value  `gob:"-"`
 	mu           sync.RWMutex   `gob:"-"`
-	creator      *goBaseCreator `gob:"-"`
+	tx			 Tx[T] 			`gob:"-"`
+	creator      *dbCreator 	`gob:"-"`
 }
 
 // Len returns the number of live (non-deleted) entities in the base.
@@ -60,31 +67,47 @@ func GetEntityRegistry() map[string]any { return entityRegistry }
 // Register loads (or creates) the on-disk file for T and inflates each row
 // into a *T entity. Must be called once per entity type, BEFORE any [Open]
 // call — fillRelation needs every type registered to wire pointers.
-func Register[T Entity]() {
+func Register[T Entity]() error {
 	name := reflect.TypeFor[T]().Name()
 
 	if _, ok := entityRegistry[name]; ok {
-		log.Panicln("Base for that type already exist", name)
+		return fmt.Errorf("Base for that type already exist")
 	}
 
-	creator := &goBaseCreator{}
+	creator := &dbCreator{}
 	baseSchema := creator.CreateDB(*new(T))
 
-	entityRegistry[name] = readEntity[T](baseSchema)
+	res, err := readEntity[T](baseSchema)
+
+	if err != nil {
+		return err
+	}
+
+	entityRegistry[name] = res
+
+	return nil
 }
 
 // Open returns a typed [DB] over the entities previously loaded by [Register].
 // Call after every type used by relto / mapby tags has been registered.
 func Open[T Entity]() *DB[T] {
-	initBase := DB[T]{Identifier: "Id"}
+	name := reflect.TypeFor[T]().Name()
 
-	initBase.Name = initBase.TypeName()
+	// One canonical DB per type: the first Open builds and registers it, later
+	// calls hand back the same pointer. The engine reaches a type's metadata
+	// and store by name through baseRegistry, so identity must be stable.
+	if existing, ok := baseRegistry[name]; ok {
+		return existing.(*DB[T])
+	}
+
+	initBase := &DB[T]{Identifier: "Id"}
+
+	initBase.Name = name
 	initBase.Indices = make(IndexMap[[]*T])
 	initBase.Index = make(IndexMap[*T])
-
 	initBase.schemaFields = initBase.createSchemaFields()
 
-	if entity, ok := entityRegistry[initBase.Name]; ok {
+	if entity, ok := entityRegistry[name]; ok {
 		initBase.store = entity.(*chunkStore[T])
 	} else {
 		log.Panicln("You cannot create base without registering a one")
@@ -95,7 +118,9 @@ func Open[T Entity]() *DB[T] {
 	initBase.syncIdIndex()
 	initBase.seedCounter()
 
-	return &initBase
+	baseRegistry[name] = initBase
+
+	return initBase
 }
 
 // seedCounter sets the auto-id counter to the largest id currently in the

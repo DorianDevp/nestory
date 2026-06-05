@@ -11,7 +11,7 @@ import (
 // CreateDB opens the on-disk file for `entity` and decodes its content
 // into a slice of flat schema rows. If the file does not exist, the file
 // (and [DataDir] if needed) is created and an empty slice is returned.
-func (gbc *goBaseCreator) CreateDB(entity any) any {
+func (gbc *dbCreator) CreateDB(entity any) any {
 	schemaStruct := gbc.createSchemaStruct(entity)
 	typeName := reflect.TypeOf(entity).Name()
 

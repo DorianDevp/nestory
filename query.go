@@ -3,61 +3,83 @@ package nestory
 import (
 	"fmt"
 	"reflect"
+	"sync"
 )
 
-// FindOneBy returns the first entity where field `key` equals `withValue`.
-// Returns [ErrEmptyEntity] if the base has no rows. Returns (nil, nil) if
-// the base is non-empty but no row matches.
-//
-// Primary-key lookups (key == gb.Identifier) hit the Id index directly and
-// are O(1). Any other key is a linear scan comparing the requested field.
+// Look by indices: exists && empty -> nil
+// routines through chunks
 func (gb *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
 	if gb.store.Len() == 0 {
 		return nil, ErrEmptyEntity
 	}
 
-	// Fast path: the primary key is indexed, so skip the scan entirely.
-	if key == gb.Identifier {
-		if ptr, ok := gb.Index[key][withValue]; ok {
-			return ptr, nil
+	indexMap := gb.Index[key]
+	if indexMap != nil {
+		if val, ok := indexMap[withValue]; ok {
+			return val, nil
+		} else {
+			return nil, nil
 		}
-
-		return nil, nil
 	}
 
 	chunks := gb.store.Chunks()
 	tombs := gb.store.Tombs()
 
+	needle := make(chan *Resource[T], 1);
+
+	var wg sync.WaitGroup
+
+	wg.Add(len(chunks))
+
 	for chunkIdx := range chunks {
-		chunk := chunks[chunkIdx]
-		tomb := tombs[chunkIdx]
+		go func(chunkIdx int) {
+			defer wg.Done()
 
-		for i := range chunk {
-			if tomb[i] {
-				continue
-			}
-			s := &chunk[i]
+			chunk := chunks[chunkIdx]
+			tomb := tombs[chunkIdx]
 
-			val := reflect.ValueOf(s).Elem()
-			for val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
-				if val.IsNil() {
-					break
+			for i := range chunk.n {
+				if tomb.data[i] {
+					continue
 				}
-				val = val.Elem()
-			}
+				s := &chunk.data[i]
 
-			if val.Kind() != reflect.Struct {
-				continue
-			}
+				val := reflect.ValueOf(s).Elem()
+				for val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+					if val.IsNil() {
+						break
+					}
+					val = val.Elem()
+				}
 
-			f := val.FieldByName(key)
-			if f.IsValid() && f.Interface() == withValue {
-				return s, nil
+				if val.Kind() != reflect.Struct {
+					continue
+				}
+
+				f := val.FieldByName(key)
+				if f.IsValid() && f.Interface() == withValue {
+					s.mu.RLock()
+					needle <- s
+
+					return;
+				}
 			}
-		}
+		}(chunkIdx) 
 	}
 
-	return nil, nil
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case item := <-needle:
+		item.mu.RUnlock()
+		return item.item, nil
+	case <-done:
+		return nil, nil
+	}
 }
 
 // Filter returns every live entity for which filterFn returns true (by value).
