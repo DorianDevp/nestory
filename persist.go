@@ -25,27 +25,27 @@ func (gb *DB[T]) AddToPersistQueue(entity *T) error {
 	id := (*entity).GetId()
 	dbIdentifier := gb.Identifier
 
-	// Caller supplied an Id explicitly — accept it, but dedupe.
-	if id != 0 {
-		if existing := gb.Index[dbIdentifier][id]; existing != nil {
-			return nil
-		}
+	if id == 0 {
+		gb.counter += 1
+		nextId := gb.counter
 
-		for _, q := range gb.persistQueue {
-			if (*q).GetId() == id {
-				return nil
-			}
-		}
-
+		SetId(entity, nextId)
 		gb.persistQueue = append(gb.persistQueue, entity)
 
 		return nil
 	}
 
-	gb.counter += 1
-	nextId := gb.counter
+	// Caller supplied an Id explicitly — accept it, but dedupe.
+	if existing := gb.Index[dbIdentifier][id]; existing != nil {
+		return nil
+	}
 
-	SetId(entity, nextId)
+	for _, q := range gb.persistQueue {
+		if (*q).GetId() == id {
+			return nil
+		}
+	}
+
 	gb.persistQueue = append(gb.persistQueue, entity)
 
 	return nil
@@ -125,13 +125,10 @@ func (gb *DB[T]) Flush() error {
 
 	gb.resetDeleteQueue()
 
-	log.Println("Saved entity", gb.TypeName())
-
 	if err := gb.save(); err != nil {
 		log.Panicln("Panic during saving a base", gb.TypeName(), err)
 	}
 
-	fmt.Println("Data successfully written to file:", gb.Filepath())
 	return nil
 }
 
@@ -149,24 +146,20 @@ func merge[T any](target *T, merger T) error {
 	for i := range mergerVal.NumField() {
 		mergerField := mergerVal.Field(i)
 		mergerFieldType := mergerType.Field(i)
-		log.Println("Fieldname:", mergerFieldType.Name)
 
 		targetField := targetVal.FieldByName(mergerFieldType.Name)
 		fieldKeyType := mergerFieldType.Tag.Get("key")
 
 		if fieldKeyType == "primary" || !targetField.CanSet() {
-			log.Println("Cannot merge field", mergerFieldType.Name, "because it is primary or not settable")
 			continue
 		}
 
 		if targetField.Kind() == reflect.Ptr && !mergerField.IsNil() {
-			log.Println("Merged field with name:", mergerFieldType.Name)
 			targetField.Set(mergerField)
 			continue
 		}
 
 		if !mergerField.IsZero() {
-			log.Println("Merged field with name:", targetField.Type().Name())
 			targetField.Set(mergerField)
 		}
 	}

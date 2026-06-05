@@ -19,26 +19,26 @@ func isScalarKey(k reflect.Kind) bool {
 	return false
 }
 
-// goBaseCreator is the untyped sibling of [DB], used during initial file
+// dbCreator is the untyped sibling of [DB], used during initial file
 // load before the concrete generic parameter T is bound. It only works
 // through reflection — no generic methods.
-type goBaseCreator struct{}
+type dbCreator struct{}
 
 // readEntity reads a slice of flat schema rows from disk and inflates each
-// row into a concrete T. relto fields become hollow pointers carrying only
+// row into a concrete T. Relation fields become hollow pointers carrying only
 // the foreign Id; [DB.fillRelation] rewires them to real instances once
 // every type has been registered.
-func readEntity[T Entity](base any) *chunkStore[T] {
-	creator := &goBaseCreator{}
+func readEntity[T Entity](base any) (*chunkStore[T], error) {
+	creator := &dbCreator{}
 
-	store := newChunkStore[T](chunkLimit)
+	store := newChunkStore[T]()
 	if base == nil {
-		return store
+		return store, nil
 	}
 
 	bv := reflect.ValueOf(base)
 	if bv.Kind() != reflect.Slice {
-		log.Panic("Provided entity can only be a slice")
+		return nil, fmt.Errorf("Provided entity can only be a slice")
 	}
 
 	for idx := range bv.Len() {
@@ -55,20 +55,18 @@ func readEntity[T Entity](base any) *chunkStore[T] {
 
 			schemaField := schemaStruct.FieldByName(schemaFieldName)
 			if !schemaField.IsValid() {
-				log.Panic("ReadingEntityError: ",
-					fmt.Sprintf("Interface instance field: '%s' is not valid", schemaFieldName))
+				return nil, 
+					fmt.Errorf("ReadingEntityError: Interface instance field: '%s' is not valid", schemaFieldName)
 			}
 
 			zeroField := zeroStruct.FieldByName(fieldName)
 			if !zeroField.IsValid() {
-				log.Panic("ReadingEntityError: ",
-					fmt.Sprintf("Entity 'zero' instance field: '%s' is not valid", fieldName))
+				return nil, fmt.Errorf("ReadingEntityError: Entity 'zero' instance field: '%s' is not valid", fieldName)
 			}
 
 			zeroFieldType, ok := zeroStruct.Type().FieldByName(fieldName)
 			if !ok {
-				log.Panic("ReadingEntityError: ",
-					fmt.Sprintf("'Zero' instance field name type reflection failed"))
+				return nil, fmt.Errorf("ReadingEntityError: 'Zero' instance field name type reflection failed")
 			}
 
 			relFieldName := zeroFieldType.Tag.Get("relto")
@@ -79,7 +77,7 @@ func readEntity[T Entity](base any) *chunkStore[T] {
 				}
 
 				if zeroField.Type().Kind() != reflect.Pointer {
-					log.Panic("In concrete instance of an entity, rel field must a pointer")
+					return nil, fmt.Errorf("In concrete instance of an entity, rel field must a pointer")
 				}
 
 				hollowRel := reflect.New(zeroFieldType.Type.Elem())
@@ -101,7 +99,7 @@ func readEntity[T Entity](base any) *chunkStore[T] {
 		store.Append(*zero)
 	}
 
-	return store
+	return store, nil
 }
 
 // NormalizeToSchema produces a flat schema row from a typed entity. relto
@@ -274,7 +272,7 @@ func (gb *DB[T]) isInterfaceSchemaCompliant(instance any) bool {
 
 // --- untyped twins, used during initial file load ---------------------
 
-func (gbc *goBaseCreator) createSchemaStruct(entity any) reflect.Value {
+func (gbc *dbCreator) createSchemaStruct(entity any) reflect.Value {
 	fields := gbc.getSchemaFields(entity)
 
 	f := []reflect.StructField{}
@@ -333,7 +331,7 @@ func (gbc *goBaseCreator) createSchemaStruct(entity any) reflect.Value {
 	return reflect.New(refStruct).Elem()
 }
 
-func (gbc *goBaseCreator) getSchemaFields(entity any) [][2]string {
+func (gbc *dbCreator) getSchemaFields(entity any) [][2]string {
 	t := reflect.TypeOf(entity)
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
