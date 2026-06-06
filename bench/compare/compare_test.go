@@ -1,18 +1,8 @@
-// Package compare benchmarks nestory's competitors on the SAME machine and the
-// SAME record shape as nestory's in-package bench_test.go (benchItem), so the
-// two result sets can be put side by side.
-//
-// nestory's own numbers come from `go test -bench` in the parent package
-// (it needs the unexported resetRegistries between iterations). These are the
-// competitors only:
-//   - modernc.org/sqlite  : pure-Go SQLite, durable (synchronous=FULL)
-//   - go.etcd.io/bbolt     : pure-Go B+tree KV, durable (fsync per commit)
-//   - hashicorp/go-memdb   : pure-Go in-memory MVCC, NOT durable
-//
-// Workloads, matched to nestory:
-//   - BulkInsert : insert n rows in ONE durable commit  (≈ queue n + 1 Flush)
-//   - PointRead  : look up one row by primary key        (≈ FindOneBy("Id"))
-//   - Scan       : full scan, filter Age==42             (≈ Filter)
+// Package compare benchmarks nestory's competitors on the same machine and
+// record shape (Rec ≈ benchItem). nestory's own numbers come from the parent
+// package's bench_test.go. Competitors: modernc.org/sqlite (durable),
+// go.etcd.io/bbolt (durable), hashicorp/go-memdb (in-memory).
+// Workloads: BulkInsert, PointRead, Scan, PointWrite.
 package compare
 
 import (
@@ -72,7 +62,7 @@ func dec(b []byte) Rec {
 	return r
 }
 
-// ============================ SQLite (modernc, durable) ============================
+// SQLite (modernc, durable)
 
 func openSQLite(tb testing.TB, dir string) *sql.DB {
 	tb.Helper()
@@ -161,7 +151,7 @@ func BenchmarkSQLite_Scan(b *testing.B) {
 	}
 }
 
-// ================================ bbolt (durable) ================================
+// bbolt (durable)
 
 var bucket = []byte("rec")
 
@@ -252,7 +242,7 @@ func BenchmarkBolt_Scan(b *testing.B) {
 	}
 }
 
-// ============================ go-memdb (in-memory, NOT durable) ============================
+// go-memdb (in-memory, not durable)
 
 func memSchema() *memdb.DBSchema {
 	return &memdb.DBSchema{
@@ -308,6 +298,68 @@ func BenchmarkMemdb_PointRead(b *testing.B) {
 					sink += int64(raw.(*Rec).Age)
 				}
 				txn.Abort()
+			}
+		})
+	}
+}
+
+// PointWrite: durable single-row update
+
+func BenchmarkSQLite_PointWrite(b *testing.B) {
+	for _, n := range sizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			db := openSQLite(b, b.TempDir())
+			seedSQLite(b, db, n)
+			defer db.Close()
+			target := n / 2
+			stmt, _ := db.Prepare(`UPDATE rec SET age=? WHERE id=?`)
+			defer stmt.Close()
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := stmt.Exec(i%90, target); err != nil {
+					b.Fatalf("update: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkBolt_PointWrite(b *testing.B) {
+	for _, n := range sizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			db := openBolt(b, b.TempDir())
+			seedBolt(b, db, n)
+			defer db.Close()
+			target := n / 2
+			key := itob(target)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_ = db.Update(func(tx *bolt.Tx) error {
+					r := mkRec(target)
+					r.Age = i % 90
+					return tx.Bucket(bucket).Put(key, enc(r))
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkMemdb_PointWrite(b *testing.B) {
+	for _, n := range sizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			db, _ := memdb.NewMemDB(memSchema())
+			seedMemdb(b, db, n)
+			target := n / 2
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				txn := db.Txn(true)
+				r := mkRec(target)
+				r.Age = i % 90
+				_ = txn.Insert("rec", &r)
+				txn.Commit()
 			}
 		})
 	}

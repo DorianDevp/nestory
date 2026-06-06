@@ -8,12 +8,12 @@ import (
 
 // Look by indices: exists && empty -> nil
 // routines through chunks
-func (gb *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
-	if gb.store.Len() == 0 {
+func (db *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
+	if db.store.Len() == 0 {
 		return nil, ErrEmptyEntity
 	}
 
-	indexMap := gb.Index[key]
+	indexMap := db.index[key]
 	if indexMap != nil {
 		if val, ok := indexMap[withValue]; ok {
 			return val, nil
@@ -22,10 +22,10 @@ func (gb *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
 		}
 	}
 
-	chunks := gb.store.Chunks()
-	tombs := gb.store.Tombs()
+	chunks := db.store.Chunks()
+	tombs := db.store.Tombs()
 
-	needle := make(chan *Resource[T], 1);
+	needle := make(chan *Resource[T], 1)
 
 	var wg sync.WaitGroup
 
@@ -61,10 +61,10 @@ func (gb *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
 					s.mu.RLock()
 					needle <- s
 
-					return;
+					return
 				}
 			}
-		}(chunkIdx) 
+		}(chunkIdx)
 	}
 
 	done := make(chan struct{})
@@ -83,9 +83,9 @@ func (gb *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
 }
 
 // Filter returns every live entity for which filterFn returns true (by value).
-func (gb *DB[T]) Filter(filterFn func(T) bool) []T {
+func (db *DB[T]) Filter(filterFn func(T) bool) []T {
 	var filteredSlice []T
-	gb.store.Range(func(p *T) {
+	db.store.Range(func(p *T) {
 		if filterFn(*p) {
 			filteredSlice = append(filteredSlice, *p)
 		}
@@ -96,9 +96,9 @@ func (gb *DB[T]) Filter(filterFn func(T) bool) []T {
 // FilterPtr is like Filter but returns stable *T pointers into the backing
 // store. Returns an error if the result is empty — callers depend on this for
 // "no rows" detection.
-func (gb *DB[T]) FilterPtr(filterFn func(*T) bool) ([]*T, error) {
+func (db *DB[T]) FilterPtr(filterFn func(*T) bool) ([]*T, error) {
 	var filteredSlice []*T
-	gb.store.Range(func(p *T) {
+	db.store.Range(func(p *T) {
 		if filterFn(p) {
 			filteredSlice = append(filteredSlice, p)
 		}
@@ -107,5 +107,58 @@ func (gb *DB[T]) FilterPtr(filterFn func(*T) bool) ([]*T, error) {
 	if len(filteredSlice) == 0 {
 		return filteredSlice, fmt.Errorf("empty array")
 	}
+
 	return filteredSlice, nil
+}
+
+// These open and commit transactions through the Engine; the machinery they
+// drive lives in tx.go and engine.go.
+
+// Get returns a detached snapshot of id and opens a contract around it. Mutate
+// the returned *T (it's a copy), then hand it to Update.
+//
+// The snapshot is a shallow value copy: relation pointer fields still alias the
+// live store, so mutate only scalar fields until the cascade layer lands.
+func (db *DB[T]) Get(id int) (*T, error) {
+	r, ok := db.resource(id)
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	r.mu.RLock()
+	cp := *r.item
+	ver := r.version
+	r.mu.RUnlock()
+
+	work := &cp
+	tx := engine.begin()
+	engine.record(tx, touchedResource{typ: db.name, id: id, ver: ver, work: work})
+
+	return work, nil
+}
+
+// Update commits the transaction that produced work. On conflict it returns
+// ErrConflict and refreshes work in place to live state, so the caller can
+// re-apply and call Update again.
+func (db *DB[T]) Update(work *T) error {
+	return engine.commitByPtr(work)
+}
+
+// UpdateWithin runs fn against a fresh snapshot of id and commits, retrying on
+// conflict. fn must express intent (c.N++), not absolute values from a stale
+// read — it re-runs against the refreshed snapshot on each retry.
+func (db *DB[T]) UpdateWithin(id int, fn func(*T)) error {
+	work, err := db.Get(id)
+	if err != nil {
+		return err
+	}
+
+	for {
+		fn(work)
+
+		err := db.Update(work)
+		if err != ErrConflict {
+			return err
+		}
+	}
 }

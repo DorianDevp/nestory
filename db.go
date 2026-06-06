@@ -4,118 +4,101 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"reflect"
 	"sync"
 )
 
-// Entity is the contract every nestory-persisted struct must satisfy.
-// The Id is the primary key; nestory auto-assigns one on AddToPersistQueue
-// if you leave it zero.
+// Entity is the contract every persisted struct must satisfy. Id is the primary
+// key; auto-assigned on AddToPersistQueue if left zero.
 type Entity interface {
 	GetId() int
 }
 
-// IndexMap is a two-level lookup: field name → field value → result.
-// DB exposes two of these: Indices for one-to-many, Index for one-to-one.
+// IndexMap: field name → field value → result. Indices for o2m, Index for o2o.
 type IndexMap[T any] map[string]map[any]T
-
-type Tx[T any] struct {
-	pre map[int]*Resource[T]
-	work map[int]*T
-	n int
-}
 
 // DB is the in-memory state for one entity type. Construct via [Open].
 type DB[T Entity] struct {
-	Name         string
-	Identifier   string
-	Type         string
+	name         string
+	identifier   string
 	counter      int
-	store        *chunkStore[T] `gob:"-"`
-	persistQueue []*T           `gob:"-"`
-	deleteQueue  []*T           `gob:"-"`
-	Indices      IndexMap[[]*T] `gob:"-"`
-	Index        IndexMap[*T]   `gob:"-"`
-	schemaFields [][2]string    `gob:"-"`
-	schemaStruct reflect.Value  `gob:"-"`
-	mu           sync.RWMutex   `gob:"-"`
-	tx			 Tx[T] 			`gob:"-"`
-	creator      *dbCreator 	`gob:"-"`
+	store        *chunkStore[T]
+	persistQueue []*T
+	deleteQueue  []*T
+	indices      IndexMap[[]*T] // o2m index (not populated yet)
+	index        IndexMap[*T]   // o2o index, keyed by field then value
+	schemaFields [][2]string
+	mu           sync.RWMutex
+	resById      map[int]*Resource[T] // id → stable Resource slot
+	wal          *wal                 // durability log for commits
 }
 
-// Len returns the number of live (non-deleted) entities in the base.
-func (gb *DB[T]) Len() int { return gb.store.Len() }
+// Len returns the number of live entities.
+func (db *DB[T]) Len() int { return db.store.Len() }
 
-// All returns stable pointers to every live entity. The pointers remain
-// valid for the life of the base (relations point at these same slots).
-func (gb *DB[T]) All() []*T { return gb.store.Live() }
+// AllEntities returns stable pointers to every live entity, valid for the base's life.
+func (db *DB[T]) AllEntities() []*T { return db.store.Live() }
 
-// DataDir is the folder where every base writes its .gob file. Override
-// before the first call to [Register].
+// DataDir is where every base writes its files. Override before [Register].
 var DataDir = "./data"
 
-// ErrEmptyEntity is returned by FindOneBy when the base has no entries.
 var ErrEmptyEntity = errors.New("empty entity")
 
 var baseRegistry = make(map[string]any)
-var entityRegistry = make(map[string]any) // map[typeName]*chunkStore[T]
+var storeRegistry = make(map[string]any) // typeName → *chunkStore[T]
 
-// GetEntityRegistry exposes the internal registry for debugging.
-// Not part of the stable API.
-func GetEntityRegistry() map[string]any { return entityRegistry }
-
-// Register loads (or creates) the on-disk file for T and inflates each row
-// into a *T entity. Must be called once per entity type, BEFORE any [Open]
-// call — fillRelation needs every type registered to wire pointers.
+// Register loads T's chunk files and inflates each row into a *T. Call once per
+// type, before any [Open] — fillRelation needs every type registered to wire
+// pointers.
 func Register[T Entity]() error {
 	name := reflect.TypeFor[T]().Name()
 
-	if _, ok := entityRegistry[name]; ok {
+	if _, ok := storeRegistry[name]; ok {
 		return fmt.Errorf("Base for that type already exist")
 	}
 
-	creator := &dbCreator{}
-	baseSchema := creator.CreateDB(*new(T))
-
-	res, err := readEntity[T](baseSchema)
-
+	store, err := loadStore[T]()
 	if err != nil {
 		return err
 	}
 
-	entityRegistry[name] = res
+	storeRegistry[name] = store
 
 	return nil
 }
 
-// Open returns a typed [DB] over the entities previously loaded by [Register].
-// Call after every type used by relto / mapby tags has been registered.
+// Open returns a typed [DB] over the entities loaded by [Register]. Call after
+// every type used by relto / mapby has been registered.
 func Open[T Entity]() *DB[T] {
 	name := reflect.TypeFor[T]().Name()
 
-	// One canonical DB per type: the first Open builds and registers it, later
-	// calls hand back the same pointer. The engine reaches a type's metadata
-	// and store by name through baseRegistry, so identity must be stable.
+	// One canonical DB per type — the engine reaches a type by name through
+	// baseRegistry, so identity must be stable.
 	if existing, ok := baseRegistry[name]; ok {
 		return existing.(*DB[T])
 	}
 
-	initBase := &DB[T]{Identifier: "Id"}
+	initBase := &DB[T]{identifier: "Id"}
 
-	initBase.Name = name
-	initBase.Indices = make(IndexMap[[]*T])
-	initBase.Index = make(IndexMap[*T])
+	initBase.name = name
+	initBase.indices = make(IndexMap[[]*T])
+	initBase.index = make(IndexMap[*T])
+	initBase.resById = make(map[int]*Resource[T])
 	initBase.schemaFields = initBase.createSchemaFields()
 
-	if entity, ok := entityRegistry[name]; ok {
+	if entity, ok := storeRegistry[name]; ok {
 		initBase.store = entity.(*chunkStore[T])
 	} else {
 		log.Panicln("You cannot create base without registering a one")
 	}
 
+	initBase.wal = openWAL(filepath.Join(initBase.chunkDir(), "wal.log"))
+
 	initBase.fillRelation()
 	initBase.initIndices()
 	initBase.syncIdIndex()
+	initBase.syncResById()
 	initBase.seedCounter()
 
 	baseRegistry[name] = initBase
@@ -123,23 +106,29 @@ func Open[T Entity]() *DB[T] {
 	return initBase
 }
 
-// seedCounter sets the auto-id counter to the largest id currently in the
-// store, so inserts after a reload continue past the persisted ids instead of
-// restarting at 1 (which would collide with — and silently patch — existing
-// entities). One O(n) scan at load; inserts stay O(1) thereafter.
-func (gb *DB[T]) seedCounter() {
+// syncResById rebuilds resById from the store. Called once from [Open]; [Add]
+// keeps it in step thereafter and [Flush] drops deleted ids.
+func (db *DB[T]) syncResById() {
+	db.store.rangeResources(func(r *Resource[T]) {
+		db.resById[(*r.item).GetId()] = r
+	})
+}
+
+// seedCounter sets the auto-id counter to the largest persisted id, so inserts
+// after a reload continue past it instead of colliding from 1. One O(n) scan.
+func (db *DB[T]) seedCounter() {
 	var maxId int
-	gb.store.Range(func(p *T) {
+	db.store.Range(func(p *T) {
 		if id := (*p).GetId(); id > maxId {
 			maxId = id
 		}
 	})
-	gb.counter = maxId
+
+	db.counter = maxId
 }
 
-// SetId writes id into the entity's Id field via reflection.
-// Used internally by AddToPersistQueue; exported for callers that want to
-// pre-assign Ids.
+// SetId writes id into the entity's Id field. Used by AddToPersistQueue;
+// exported for callers that pre-assign Ids.
 func SetId[T any](entity *T, id int) {
 	val := reflect.ValueOf(entity)
 
@@ -165,18 +154,8 @@ func SetId[T any](entity *T, id int) {
 	}
 }
 
-// Filename returns "<TypeName>.gob".
-func (gb *DB[T]) Filename() string {
-	return fmt.Sprint(gb.Name, ".gob")
-}
-
-// Filepath returns "<DataDir>/<TypeName>.gob".
-func (gb *DB[T]) Filepath() string {
-	return fmt.Sprintf("%s/%s", DataDir, gb.Filename())
-}
-
 // TypeName returns the Go type name of T without package prefix.
-func (gb *DB[T]) TypeName() string {
+func (db *DB[T]) TypeName() string {
 	var t T
 	return reflect.TypeOf(t).Name()
 }

@@ -5,15 +5,10 @@ import (
 	"reflect"
 )
 
-// fillRelation rebuilds the pointer graph on every entity in this base.
-// Called once from [Open]. For each relto field it locates the matching
-// instance in the target base's slice and assigns it. For each mapby field
-// it scans the target base and appends every child whose mapby field
-// equals this entity's Id.
-//
-// All target bases must be present in entityRegistry — that's why
-// [Register] for every type must run before any [Open].
-func (gb *DB[T]) fillRelation() {
+// fillRelation rebuilds the pointer graph for this base. relto fields get the
+// matching target instance; mapby fields get every child whose mapby field
+// equals this entity's Id. Every target must already be in entityRegistry.
+func (db *DB[T]) fillRelation() {
 	relFields := make(map[string]string)
 	mapFields := make(map[string]string)
 
@@ -28,43 +23,46 @@ func (gb *DB[T]) fillRelation() {
 		}
 	}
 
-	gb.store.Range(func(el *T) {
+	db.store.Range(func(el *T) {
 		v := reflect.ValueOf(el)
 		t := reflect.TypeOf(*el)
 
 		for fieldName, relto := range relFields {
 			f := v.Elem().FieldByName(fieldName)
-			tf, ok := t.FieldByName(fieldName)
+			_, ok := t.FieldByName(fieldName)
 			if !ok {
 				log.Panicln("No field", fieldName)
 			}
 
 			if f.Kind() != reflect.Pointer {
-				log.Panic("All relfields must by a pointer")
+				log.Panic("Relation field must be a pointer")
 			}
 
 			if f.IsZero() {
-				log.Println("No relation found for field", tf.Name, "with value", f.Interface(), ";  - skipping")
 				continue
 			}
 
 			relTypeName := f.Elem().Type().Name()
-			relSlice, ok := relLivePointers(relTypeName)
+
+			foreignStore, ok := getForeignStoreByType(relTypeName)
+
 			if !ok {
 				log.Panicln("Could not relate any instance with type of", relTypeName)
 			}
 
-			concreteField := f.Elem().FieldByName(relto)
+			relFieldVal := f.Elem().FieldByName(relto)
 
-			for idx := 0; idx < relSlice.Len(); idx++ {
-				instance := relSlice.Index(idx)
+			for idx := 0; idx < foreignStore.Len(); idx++ {
+				instance := foreignStore.Index(idx)
 
 				instanceRelField := instance.Elem().FieldByName(relto)
-				if concreteField.Interface() != instanceRelField.Interface() {
+				if relFieldVal.Interface() != instanceRelField.Interface() {
 					continue
 				}
 
 				f.Set(instance)
+
+				break
 			}
 
 			if f.IsZero() {
@@ -74,8 +72,6 @@ func (gb *DB[T]) fillRelation() {
 		}
 
 		for fieldName, mapby := range mapFields {
-			log.Printf("\n\n Many To One \n\n")
-
 			id := v.Elem().FieldByName("Id").Interface()
 
 			f := v.Elem().FieldByName(fieldName)
@@ -87,16 +83,14 @@ func (gb *DB[T]) fillRelation() {
 				log.Panic("All mapby fields must by a slice of pointers")
 			}
 
-			// Empty slice is fine — we'll append matches below if any exist.
-
 			relTypeName := f.Type().Elem().Elem().Name()
-			relSlice, ok := relLivePointers(relTypeName)
+			foreignStore, ok := getForeignStoreByType(relTypeName)
 			if !ok {
 				log.Panicln("Could not relate any instance with type of", relTypeName)
 			}
 
-			for idx := 0; idx < relSlice.Len(); idx++ {
-				instance := relSlice.Index(idx)
+			for idx := 0; idx < foreignStore.Len(); idx++ {
+				instance := foreignStore.Index(idx)
 
 				instanceRelField := instance.Elem().FieldByName(mapby)
 				if instanceRelField.Interface() != id {
@@ -105,26 +99,22 @@ func (gb *DB[T]) fillRelation() {
 
 				f.Set(reflect.Append(f, instance))
 			}
-
-			if f.IsZero() {
-				log.Printf("mapby: no children matched for field %q (parent.Id=%v) — leaving empty\n",
-					mapby, id)
-			}
 		}
 	})
 }
 
-// relLivePointers returns a reflect.Value wrapping the []*T of live entities
-// in the base registered under typeName. The slice elements are stable
-// pointers into that base's chunk store — ready to assign to relation fields.
-func relLivePointers(typeName string) (reflect.Value, bool) {
-	e, ok := entityRegistry[typeName]
+// getForeignStoreByType returns the []*T of live entities for typeName, wrapped in a
+// reflect.Value. Elements are stable store pointers, ready to assign.
+func getForeignStoreByType(typeName string) (reflect.Value, bool) {
+	e, ok := storeRegistry[typeName]
 	if !ok {
 		return reflect.Value{}, false
 	}
-	lister, ok := e.(pointerLister)
+
+	iter, ok := e.(pointerStoreIterator)
 	if !ok {
 		return reflect.Value{}, false
 	}
-	return reflect.ValueOf(lister.livePointers()), true
+
+	return reflect.ValueOf(iter.iterateStorePointers()), true
 }

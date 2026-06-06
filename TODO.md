@@ -1,93 +1,71 @@
-# nestory — hardening backlog
+# TODO
 
-Known gaps and follow-ups, roughly in priority order. Data-safety items first.
-This is the "don't lose track of it" list; the README's Roadmap is the
-public-facing summary.
+Stuff I still want to do, roughly most-important first. Data safety before nice-to-haves.
 
-## ✅ Recently done
+## Done
 
-- [x] Atomic save — tmp + fsync + rename (`storage.go`).
-- [x] Chunked-arena backing store — stable `*T` addresses across growth, so
-      relations never dangle on insert (`chunkstore.go`). Regression-locked by
-      `TestPointerStableAcrossInserts`.
-- [x] O(1) auto-id via monotonic counter, seeded from disk on `Open`
-      (`db.go: seedCounter`). No reuse across restarts. Locked by
-      `TestRegression_CounterSeededAfterReload`.
-- [x] `FindOneBy("Id", …)` uses the index (O(1)); the per-item goroutine scan in
-      the old write path is gone.
-- [x] Tombstone deletes — no in-place shift, surviving pointers stay valid.
+- [x] Atomic save (tmp + fsync + rename), now per chunk.
+- [x] Chunked arena so `*T` addresses stay stable as the dataset grows — relations never dangle.
+- [x] Auto-id counter seeded from disk on Open (no id reuse after reload).
+- [x] `FindOneBy("Id", …)` hits the index, O(1).
+- [x] Tombstone deletes (no shifting, pointers stay valid).
+- [x] Per-chunk save in parallel — only dirty chunks get rewritten.
+- [x] Optimistic transactions: Get / Update / UpdateWithin, per-row version + mutex,
+      first writer wins, ErrConflict + snapshot refresh. Race-tested.
+- [x] Write-ahead log per type — a commit is durable without a full Flush.
+- [x] Idempotent Open (one DB per type, shared by the engine).
+- [x] Benchmarks against SQLite, bbolt, go-memdb, buntdb, badger.
 
-## P0 — correctness & data safety
+## Data safety — do these first
 
-- [ ] **Goroutine safety.** `gb.mu` is only taken in `Add`; `Flush`,
-      `AddToPersistQueue`, `FindOneBy`, `Filter`, `PatchById`, `QueueDelete` and
-      the `chunkStore` are all unsynchronized. Either wire `mu` through every
-      read/write path (RLock for reads) or document the store as single-
-      goroutine. Add a `-race` test once done.
-- [ ] **Dangling FK on delete.** `QueueDelete` removes a parent without touching
-      children that `relto` it. On the next `Open`, `fillRelation` (`relations.go`)
-      `log.Panicf`s on the unresolved FK → the DB becomes unopenable. Need a
-      policy: cascade-delete, null-the-FK, or skip-with-warning (and make
-      `fillRelation` tolerant rather than panicking).
-- [ ] **Cross-base atomicity.** Each `DB.Flush` writes its own file; a crash
-      between flushing two related bases leaves a half-committed graph. No way to
-      roll back. Needs a multi-file commit (e.g. write all tmp files, fsync,
-      then rename together) or an explicit transaction boundary.
-- [ ] **Directory fsync.** `save()` fsyncs the file and renames, but does not
-      fsync the parent directory — after a crash the rename can be lost even
-      though the bytes were durable. Open + `Sync()` the dir after rename.
+- [ ] The non-transactional paths (Flush, FindOneBy, Filter, PatchById, the persist/delete
+      queues) don't take `mu`. Either lock them or write down that they're single-goroutine.
+- [ ] Flush + a running transaction is a data race — compaction reads `item` without the
+      per-row lock. For now it's "don't run them at once"; make that real or coordinate the locks.
+- [ ] Per-chunk save isn't atomic across chunks. A crash mid-Flush can leave some chunks new,
+      some old. Need a generation marker, or stage everything then rename.
+- [ ] The WAL is per type, so a transaction touching two types writes two logs, fsynced
+      separately — half of it can survive a crash. Need one shared log or a 2-phase marker.
+      (Blocks cascade.)
+- [ ] Deleting a parent that something points to → next Open panics on the dangling FK.
+      Need a policy: cascade delete, null the FK, or skip with a warning.
+- [ ] Nobody fsyncs the directory after rename/create, so a crash can lose the rename even
+      though the bytes are on disk. Open the dir and Sync it.
 
-## P1 — robustness & error handling
+## Should fix
 
-- [ ] **Stop panicking in library paths.** `CreateDB` (`storage.go`),
-      `fillRelation`/`NormalizeToSchema`/`createSchemaStruct` (`schema.go`),
-      `Register`/`Open` (`db.go`), and especially `Flush`'s `log.Panicln` on a
-      save error (`persist.go`) all kill the host process on ordinary runtime
-      failures. Return errors instead; reserve panic for true programmer errors.
-- [ ] **`merge` can't write zero values.** It skips zero-valued fields
-      (`persist.go`), so you can never patch a field back to `0`/`""`/`false`.
-      Consider a field mask or pointer-field semantics for partial updates.
-- [ ] **`FindOneBy` on a non-comparable field panics.** `f.Interface() == withValue`
-      (`query.go`) panics if the keyed field is a slice/map. Guard with a
-      comparability check.
-- [ ] **Error-string conventions.** `QueueDelete`/`PatchById` return capitalized,
-      newline-terminated errors (`persist.go`). Lowercase, no trailing newline.
+- [ ] Stop panicking in the library. fillRelation, schema building, Register/Open, and Flush
+      all kill the process on ordinary errors. Return errors instead.
+- [ ] `merge` skips zero values, so you can't patch a field back to 0 / "" / false.
+- [ ] `FindOneBy` on a slice/map field panics (== on non-comparable). Guard it.
+- [ ] A couple of returned errors are capitalized and end in `\n`. Lowercase, no newline.
 
-## P2 — API surface & cleanup
+## Transactions — still open
 
-- [ ] **Shrink the public surface.** `Index`, `Indices`, `Name`, `Identifier`,
-      `Type` are exported and mutable; callers can corrupt internal state.
-      Unexport what isn't part of the contract; expose behavior via methods.
-- [ ] **Dead code.** `GetEntityRegistry`, `baseRegistry`, `isInterfaceSchemaCompliant`,
-      the unused `Type`/`schemaStruct`/`creator` fields — remove before 1.0.
-- [ ] **Quiet by default.** `log.*`/`fmt.Print*` on every Flush/merge/relation
-      (`persist.go`, `relations.go`, `storage.go`). Inject a `*slog.Logger` or
-      drop the chatter; a library shouldn't write to stdout.
-- [ ] **`AddToPersistQueue` always returns `nil` error** — either make it
-      meaningful or drop the return.
+- [ ] Snapshot is a shallow copy, so only scalar fields are safe to mutate. Relations need a
+      cascade-bounded deep copy (the graph is cyclic), with each node tracked by (type, id).
+- [ ] apply rewrites the whole row + bumps version; a field diff would only touch what changed.
+- [ ] Updating an indexed field doesn't update the index yet.
+- [ ] Two separate Gets can't share one transaction (no explicit Begin), and a read-only Get
+      never gets cleaned up if Update never comes (timeout? explicit close?).
 
-## P2 — performance
+## Performance
 
-- [ ] **Whole-file rewrite on every `Flush`** (write amplification: cost scales
-      with dataset size, not change size). Acceptable for the < 100 MB target;
-      revisit only if a profile demands incremental/segmented snapshots.
-- [ ] **In-memory tombstone reclamation.** Deleted slots stay resident until the
-      next `Open` (disk is already compacted, since `save` skips tombstones). Add
-      an explicit `Compact()` for long-running processes that delete a lot
-      (note: it invalidates pointers, so only at a safe rebuild point).
+- [ ] Empty Flush still scans the whole store to build the insert-vs-patch set. Skip it when
+      the queue is empty.
+- [ ] Every commit does a NormalizeToSchema + gob encode under the WAL lock. Cache the row type,
+      reuse buffers, maybe batch fsyncs under load.
+- [ ] Deleted slots stay in memory until the next Open. A Compact() for long-running processes.
 
-## P3 — features (roadmap)
+## Later
 
-- [ ] Secondary indexes (only `Id` is indexed today).
-- [ ] Schema migration (add/remove/rename fields without losing the gob file).
-- [ ] Versioned snapshots + event-offset metadata; `Apply(event, handler)` /
-      `AutoSnapshot` for event-sourced read models.
+- [ ] Secondary indexes (only Id is indexed today).
+- [ ] Schema migration (add/remove/rename fields without losing the files).
+- [ ] Event-sourcing bits: versioned snapshots, Apply(event, handler), AutoSnapshot.
 
-## Testing gaps
+## Tests I'm missing
 
-- [ ] `-race` test once locking lands.
-- [ ] Delete path (`QueueDelete` + Flush tombstone), including delete-then-reload.
-- [ ] `PatchById` partial-update semantics (incl. the zero-value limitation).
-- [ ] Error paths (currently they panic, so they're untestable until P1 lands).
-- [ ] Real same-machine comparison harness under `bench/` vs SQLite / bbolt /
-      go-memdb (web figures are in `bench/COMPARISON.md` as placeholders).
+- [ ] Delete + reload (tombstone, index/resById eviction).
+- [ ] PatchById partial updates, including the zero-value limit.
+- [ ] WAL torn-tail recovery (truncated last frame dropped, earlier ones replayed).
+- [ ] Crash between chunk renames, once cross-chunk atomicity lands.

@@ -2,83 +2,145 @@ package nestory
 
 import "sync"
 
-// chunkStore is nestory's backing store: entities live in a sequence of
-// fixed-capacity []T blocks that are never grown past their reserved
-// capacity, so every element's address is stable for the life of the store.
-// This is what lets relations be real *T pointers (the nestory headline)
-// without dangling when the dataset grows.
-//
-// Deletes are tombstones — values are never shifted in place (a shift would
-// move elements and dangle pointers). Live elements are surfaced via Live()
-// for relation wiring, and via Chunks()/Tombs() for tight, contiguous scans.
-//
-// See bench/chunkstore for the prototype + benchmarks this is derived from:
-// at chunkLimit count scans match a flat []T to within noise, while appends
-// avoid the grow-and-recopy tax of a growing slice.
+// chunkStore is the backing store: entities live in fixed-capacity blocks that
+// never grow, so every element address is stable for the store's life. That's
+// what lets relations be real *T pointers without dangling as the set grows.
+// Deletes are tombstones — values are never shifted in place.
 
-// chunkLimit is the per-block element count, baked into chArray's array type
-// (so it MUST be a compile-time constant). 512 is the sweet spot in the sweep:
-// vs 128 it cuts append allocations ~3.5x and scans ~10% faster, while keeping
-// the per-base memory waste (one partial trailing block) modest.
+// chunkLimit is the per-block count, baked into chunkBlock's array type so it must
+// be a compile-time constant. 512 is the sweet spot in the sweep.
 const chunkLimit = 512
 
-// pointerLister is implemented by every chunkStore[T]; it lets generic,
-// cross-type code (fillRelation) obtain a base's live []*T as `any`.
-type pointerLister interface {
-	livePointers() any
+// pointerStoreIterator lets fillRelation get a base's live []*T as `any`.
+type pointerStoreIterator interface {
+	iterateStorePointers() any
 }
 
 type Resource[T any] struct {
-	item *T
+	item    *T
 	version int
-	mu sync.RWMutex
+	chunk   int // owning block index; drives per-chunk dirty marking
+	mu      sync.RWMutex
 }
 
-type chArray[T any] struct {
+type chunkBlock[T any] struct {
 	data [chunkLimit]T
-	n int
+	n    int
 }
 
-func (arr *chArray[T]) Push(v T) bool {
-      if arr.n >= len(arr.data) {
-          return false
-      }
+func (arr *chunkBlock[T]) Push(v T) bool {
+	if arr.n >= len(arr.data) {
+		return false
+	}
 
-      arr.data[arr.n] = v
-      arr.n++
+	arr.data[arr.n] = v
+	arr.n++
 
-      return true
+	return true
 }
 
-func (arr *chArray[T]) Len() int {
+func (arr *chunkBlock[T]) Len() int {
 	return arr.n
 }
 
 type chunkStore[T any] struct {
-	chunks []*chArray[Resource[T]]    // each block is heap-allocated; the block's address never moves
-	tomb   []*chArray[bool] // parallel tombstone flags, same shape as chunks
-	n      int              // total slots appended (including tombstoned)
-	dead   int              // count of tombstoned slots
+	chunks []*chunkBlock[Resource[T]] // each block is heap-allocated, never moves
+	tomb   []*chunkBlock[bool]        // tombstone flags, same shape as chunks
+	n      int                        // total slots appended (incl. tombstoned)
+	dead   int                        // tombstoned slots
+
+	// dirty[i]: chunk i changed since last save. Guarded by dirtyMu because
+	// commits mark dirty under per-row locks, not db.mu, so two could race.
+	dirty   []bool
+	dirtyMu sync.Mutex
+}
+
+func (s *chunkStore[T]) markDirty(ci int) {
+	s.dirtyMu.Lock()
+	if ci >= 0 && ci < len(s.dirty) {
+		s.dirty[ci] = true
+	}
+	s.dirtyMu.Unlock()
+}
+
+func (s *chunkStore[T]) dirtyIndices() []int {
+	s.dirtyMu.Lock()
+	defer s.dirtyMu.Unlock()
+
+	var out []int
+	for i, d := range s.dirty {
+		if d {
+			out = append(out, i)
+		}
+	}
+
+	return out
+}
+
+func (s *chunkStore[T]) clearDirty(idxs []int) {
+	s.dirtyMu.Lock()
+	for _, i := range idxs {
+		if i >= 0 && i < len(s.dirty) {
+			s.dirty[i] = false
+		}
+	}
+	s.dirtyMu.Unlock()
+}
+
+// chunkLive calls fn for every live element of chunk ci.
+func (s *chunkStore[T]) chunkLive(ci int, fn func(*T)) {
+	ch := s.chunks[ci]
+	tb := s.tomb[ci]
+	for o := range ch.n {
+		if !tb.data[o] {
+			fn(ch.data[o].item)
+		}
+	}
+}
+
+// loadChunk appends a freshly read block, keeping file ↔ chunk index alignment.
+// The block is clean — it already matches disk.
+func (s *chunkStore[T]) loadChunk(vals []T) {
+	ch := &chunkBlock[Resource[T]]{}
+	tb := &chunkBlock[bool]{}
+	ci := len(s.chunks)
+	for i := range vals {
+		v := vals[i]
+		ch.data[ch.n] = Resource[T]{item: &v, chunk: ci}
+		ch.n++
+		tb.data[tb.n] = false
+		tb.n++
+	}
+	s.chunks = append(s.chunks, ch)
+	s.tomb = append(s.tomb, tb)
+	s.dirty = append(s.dirty, false)
+	s.n += len(vals)
 }
 
 func newChunkStore[T any]() *chunkStore[T] {
 	return &chunkStore[T]{}
 }
 
-// Append stores v and returns a stable pointer to its slot.
-func (s *chunkStore[T]) Append(v T) *T {
+// Append stores v and returns a stable pointer to its Resource slot — safe to
+// index by id elsewhere, since neither the Resource nor its item ever moves.
+func (s *chunkStore[T]) Append(v T) *Resource[T] {
 	if len(s.chunks) == 0 || s.chunks[len(s.chunks)-1].Len() == chunkLimit {
-		s.chunks = append(s.chunks, &chArray[Resource[T]]{})
-		s.tomb = append(s.tomb, &chArray[bool]{})
+		s.chunks = append(s.chunks, &chunkBlock[Resource[T]]{})
+		s.tomb = append(s.tomb, &chunkBlock[bool]{})
+		s.dirtyMu.Lock()
+		s.dirty = append(s.dirty, false)
+		s.dirtyMu.Unlock()
 	}
 
-	last := s.chunks[len(s.chunks)-1]
-	last.Push(Resource[T]{ item: &v })
-	s.tomb[len(s.tomb)-1].Push(false)
+	ci := len(s.chunks) - 1
+	last := s.chunks[ci]
+	last.Push(Resource[T]{item: &v, chunk: ci})
+	s.tomb[ci].Push(false)
 
 	s.n++
+	s.markDirty(ci)
 
-	return last.data[last.Len()-1].item
+	return &last.data[last.Len()-1]
 }
 
 // Len returns the number of live (non-tombstoned) elements.
@@ -88,11 +150,11 @@ func (s *chunkStore[T]) Len() int {
 
 // Chunks/Tombs expose the raw blocks for contiguous iteration. Callers must
 // not append to the returned inner slices.
-func (s *chunkStore[T]) Chunks() []*chArray[Resource[T]] {
+func (s *chunkStore[T]) Chunks() []*chunkBlock[Resource[T]] {
 	return s.chunks
 }
 
-func (s *chunkStore[T]) Tombs() []*chArray[bool] {
+func (s *chunkStore[T]) Tombs() []*chunkBlock[bool] {
 	return s.tomb
 }
 
@@ -114,28 +176,40 @@ func (s *chunkStore[T]) Range(fn func(p *T)) {
 	}
 }
 
-// Live returns stable pointers to every live element.
-func (s *chunkStore[T]) Live() []*T {
+// rangeResources calls fn for every live Resource slot. Used to rebuild
+// resById after a load.
+func (s *chunkStore[T]) rangeResources(fn func(*Resource[T])) {
+	for c := range s.chunks {
+		ch := s.chunks[c]
+		tb := s.tomb[c]
+
+		for o := range ch.n {
+			if !tb.data[o] {
+				fn(&ch.data[o])
+			}
+		}
+	}
+}
+
+// StorePointers returns stable pointers to every live element.
+func (s *chunkStore[T]) StorePointers() []*T {
 	out := make([]*T, 0, s.Len())
 
-	s.Range(func(p *T) { 
-		out = append(out, p) 
+	s.Range(func(p *T) {
+		out = append(out, p)
 	})
 
 	return out
 }
 
-// livePointers is the type-erased view used by fillRelation to walk another
-// base's elements reflectively without touching this type's unexported
-// fields. It returns a []*T boxed in an interface, which is fully
-// reflection-friendly (unlike the chunkStore's own private fields).
-func (s *chunkStore[T]) livePointers() any { 
-	return s.Live() 
+// iterateStorePointers returns a []*T boxed in an interface, for fillRelation to walk
+// reflectively without touching this type's unexported fields.
+func (s *chunkStore[T]) iterateStorePointers() any {
+	return s.StorePointers()
 }
 
-// DeleteFunc tombstones every live element matching pred and returns the
-// pointers that were tombstoned (so callers can clean up indexes). Values are
-// left in place; existing pointers to them stay valid.
+// DeleteFunc tombstones every live element matching pred and returns them (so
+// callers can clean up indexes). Values stay in place; pointers stay valid.
 func (s *chunkStore[T]) DeleteFunc(pred func(*T) bool) []*T {
 	var removed []*T
 
@@ -149,6 +223,7 @@ func (s *chunkStore[T]) DeleteFunc(pred func(*T) bool) []*T {
 
 			s.tomb[c].data[o] = true
 			s.dead++
+			s.markDirty(c)
 			removed = append(removed, ch.data[o].item)
 		}
 	}

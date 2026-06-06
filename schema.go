@@ -2,13 +2,10 @@ package nestory
 
 import (
 	"fmt"
-	"log"
 	"reflect"
 )
 
-// isScalarKey reports whether a foreign-key column type is an acceptable
-// primitive: a string or any integer width (the primary key is int, but a
-// relto target may legitimately be any integer kind).
+// isScalarKey reports whether a foreign-key column type is a string or any int.
 func isScalarKey(k reflect.Kind) bool {
 	switch k {
 	case reflect.String,
@@ -19,27 +16,19 @@ func isScalarKey(k reflect.Kind) bool {
 	return false
 }
 
-// dbCreator is the untyped sibling of [DB], used during initial file
-// load before the concrete generic parameter T is bound. It only works
-// through reflection — no generic methods.
+// dbCreator is the untyped sibling of [DB], used during load before T is bound.
+// Reflection only — no generic methods.
 type dbCreator struct{}
 
-// readEntity reads a slice of flat schema rows from disk and inflates each
-// row into a concrete T. Relation fields become hollow pointers carrying only
-// the foreign Id; [DB.fillRelation] rewires them to real instances once
-// every type has been registered.
-func readEntity[T Entity](base any) (*chunkStore[T], error) {
-	creator := &dbCreator{}
-
-	store := newChunkStore[T]()
-	if base == nil {
-		return store, nil
-	}
-
-	bv := reflect.ValueOf(base)
+// inflateSlice turns decoded flat schema rows into []T. Relation fields become
+// hollow pointers carrying only the foreign Id; fillRelation rewires them once
+// every type is registered. One slice = one chunk.
+func inflateSlice[T Entity](creator *dbCreator, bv reflect.Value) ([]T, error) {
 	if bv.Kind() != reflect.Slice {
 		return nil, fmt.Errorf("Provided entity can only be a slice")
 	}
+
+	out := make([]T, 0, bv.Len())
 
 	for idx := range bv.Len() {
 		zero := new(T)
@@ -49,13 +38,13 @@ func readEntity[T Entity](base any) (*chunkStore[T], error) {
 
 		fields := creator.getSchemaFields(zero)
 
-		for idx := range fields {
-			fieldName := fields[idx][0]
-			schemaFieldName := fields[idx][1]
+		for fi := range fields {
+			fieldName := fields[fi][0]
+			schemaFieldName := fields[fi][1]
 
 			schemaField := schemaStruct.FieldByName(schemaFieldName)
 			if !schemaField.IsValid() {
-				return nil, 
+				return nil,
 					fmt.Errorf("ReadingEntityError: Interface instance field: '%s' is not valid", schemaFieldName)
 			}
 
@@ -72,7 +61,6 @@ func readEntity[T Entity](base any) (*chunkStore[T], error) {
 			relFieldName := zeroFieldType.Tag.Get("relto")
 			if relFieldName != "" {
 				if schemaField.IsZero() {
-					log.Println(schemaFieldName, "is empty, cannot proceed with creating a field")
 					continue
 				}
 
@@ -96,20 +84,20 @@ func readEntity[T Entity](base any) (*chunkStore[T], error) {
 			zeroField.Set(schemaField)
 		}
 
-		store.Append(*zero)
+		out = append(out, *zero)
 	}
 
-	return store, nil
+	return out, nil
 }
 
-// NormalizeToSchema produces a flat schema row from a typed entity. relto
-// pointer fields are flattened to their target's primary-key value.
-func (gb *DB[T]) NormalizeToSchema(instance T) reflect.Value {
+// NormalizeToSchema flattens a typed entity to a schema row — relto pointers
+// become their target's primary-key value.
+func (db *DB[T]) NormalizeToSchema(instance T) reflect.Value {
 	v := reflect.ValueOf(instance)
 	t := v.Type()
 
-	fields := gb.schemaFields
-	schemaStruct := gb.createSchemaStruct()
+	fields := db.schemaFields
+	schemaStruct := db.createSchemaStruct()
 
 	for idx := range fields {
 		fieldName := fields[idx][0]
@@ -118,13 +106,11 @@ func (gb *DB[T]) NormalizeToSchema(instance T) reflect.Value {
 		fieldVal := v.FieldByName(fieldName)
 		fieldType, ok := t.FieldByName(fieldName)
 		if !ok {
-			log.Println("Error while getting field name:", fieldName)
 			continue
 		}
 
 		schemaField := schemaStruct.FieldByName(schemaFieldName)
 		if !schemaField.IsValid() {
-			log.Printf("schemaStruct: %+v\n, schemaStruct type : %s\n", schemaStruct, schemaStruct.Type())
 			panic(fmt.Sprintf("Schema field %s not found\n", schemaFieldName))
 		}
 
@@ -134,12 +120,10 @@ func (gb *DB[T]) NormalizeToSchema(instance T) reflect.Value {
 		if currType.Kind() == reflect.Pointer {
 			currValue = currValue.Elem()
 			if !currValue.IsValid() {
-				log.Printf("probably nil pointer derefference %s, %+v\n", currValue.Kind(), currValue)
 				continue
 			}
 
 			relFieldName := fieldType.Tag.Get("relto")
-			log.Println("RelVal:", relFieldName)
 			if relFieldName == "" {
 				panic("You cannot define field with pointer to struct type unless it is a relational field (look on relto tag)")
 			}
@@ -162,10 +146,9 @@ func (gb *DB[T]) NormalizeToSchema(instance T) reflect.Value {
 	return schemaStruct
 }
 
-// createSchemaFields lists (entityFieldName, schemaColumnName) pairs for T.
-// relto fields produce a "<fieldName><tagValue>" schema column.
-// mapby fields are skipped entirely — they live only in memory.
-func (gb *DB[T]) createSchemaFields() [][2]string {
+// createSchemaFields lists (entityField, schemaColumn) pairs for T. relto fields
+// become "<field><tag>"; mapby fields are skipped (memory only).
+func (db *DB[T]) createSchemaFields() [][2]string {
 	zero := new(T)
 
 	t := reflect.TypeOf(zero).Elem()
@@ -195,10 +178,10 @@ func (gb *DB[T]) createSchemaFields() [][2]string {
 	return fields
 }
 
-// createSchemaStruct builds the dynamic struct used as a "row" of T.
-// relto pointer fields collapse to their primary-key field's type.
-func (gb *DB[T]) createSchemaStruct() reflect.Value {
-	fields := gb.schemaFields
+// createSchemaStruct builds the dynamic row struct for T. relto pointers
+// collapse to their primary-key type.
+func (db *DB[T]) createSchemaStruct() reflect.Value {
+	fields := db.schemaFields
 
 	zero := new(T)
 	f := []reflect.StructField{}
@@ -224,7 +207,6 @@ func (gb *DB[T]) createSchemaStruct() reflect.Value {
 
 			relFieldName := fieldType.Tag.Get("relto")
 			if relFieldName == "" {
-				log.Print("Error while getting relto in ", currType.Name())
 				panic("You cannot define field with pointer to struct type unless it is a relational field (look on relto tag)")
 			}
 
@@ -254,26 +236,10 @@ func (gb *DB[T]) createSchemaStruct() reflect.Value {
 	return reflect.New(refStruct).Elem()
 }
 
-func (gb *DB[T]) isInterfaceSchemaCompliant(instance any) bool {
-	t := reflect.TypeOf(instance)
+// untyped twins, used during load
 
-	interfaceFields := make(map[string]bool)
-	for i := range t.NumField() {
-		interfaceFields[t.Field(i).Name] = true
-	}
-
-	for _, pair := range gb.schemaFields {
-		if _, ok := interfaceFields[pair[1]]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// --- untyped twins, used during initial file load ---------------------
-
-func (gbc *dbCreator) createSchemaStruct(entity any) reflect.Value {
-	fields := gbc.getSchemaFields(entity)
+func (c *dbCreator) createSchemaStruct(entity any) reflect.Value {
+	fields := c.getSchemaFields(entity)
 
 	f := []reflect.StructField{}
 
@@ -301,7 +267,6 @@ func (gbc *dbCreator) createSchemaStruct(entity any) reflect.Value {
 
 			relFieldName := fieldType.Tag.Get("relto")
 			if relFieldName == "" {
-				log.Print("Error while getting relto in ", currType.Name())
 				panic("You cannot define field with pointer to struct type unless it is a relational field (look on relto tag)")
 			}
 
@@ -331,7 +296,7 @@ func (gbc *dbCreator) createSchemaStruct(entity any) reflect.Value {
 	return reflect.New(refStruct).Elem()
 }
 
-func (gbc *dbCreator) getSchemaFields(entity any) [][2]string {
+func (c *dbCreator) getSchemaFields(entity any) [][2]string {
 	t := reflect.TypeOf(entity)
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
