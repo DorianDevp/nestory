@@ -20,9 +20,7 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 	db := Open[bqItem]()
 
 	first := &bqItem{Name: "first"}
-	if err := db.AddToPersistQueue(first); err != nil {
-		t.Fatalf("queue: %v", err)
-	}
+	db.AddToPersistQueue(first)
 	if err := db.Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -37,9 +35,7 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 	// Insert well past a chunk boundary — this is what used to reallocate the
 	// backing slice and invalidate p.
 	for i := 0; i < chunkLimit+50; i++ {
-		if err := db.AddToPersistQueue(&bqItem{Name: "filler"}); err != nil {
-			t.Fatalf("queue filler: %v", err)
-		}
+		db.AddToPersistQueue(&bqItem{Name: "filler"})
 	}
 	if err := db.Flush(); err != nil {
 		t.Fatalf("flush 2: %v", err)

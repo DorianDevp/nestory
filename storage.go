@@ -3,91 +3,232 @@ package nestory
 import (
 	"encoding/gob"
 	"fmt"
-	"log"
 	"os"
+	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 )
 
-// CreateDB opens the on-disk file for `entity` and decodes its content
-// into a slice of flat schema rows. If the file does not exist, the file
-// (and [DataDir] if needed) is created and an empty slice is returned.
-func (gbc *dbCreator) CreateDB(entity any) any {
-	schemaStruct := gbc.createSchemaStruct(entity)
-	typeName := reflect.TypeOf(entity).Name()
+// Each type persists as a dir of per-chunk gob files: <DataDir>/<Type>/<n>.gob,
+// one file per in-memory chunk. Only dirty chunks are rewritten, each in its
+// own goroutine; load decodes + inflates every file concurrently and reassembles
+// in index order so file ↔ chunk alignment holds.
 
-	initBaseType := reflect.SliceOf(schemaStruct.Type())
-	initBaseValue := reflect.MakeSlice(initBaseType, 0, 0)
-
-	gob.Register(initBaseType)
-
-	fileName := typeName + ".gob"
-	filePath := fmt.Sprintf("%s/%s", DataDir, fileName)
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		fmt.Println("Error while opening a ", fileName, " with Error: ", err)
-
-		if _, sErr := os.Stat(DataDir); os.IsNotExist(sErr) {
-			os.MkdirAll(DataDir, 0700)
-			fmt.Println("Created dir: ", DataDir)
-		}
-
-		if file, createErr := os.Create(filePath); createErr != nil {
-			file.Close()
-			fmt.Println("Error while creating", fileName, " with Error: ", createErr)
-			panic("CreatingBaseError")
-		}
-
-		fmt.Println("Successfully Created DB named: ", fileName)
-		return initBaseValue.Interface()
-	}
-	defer file.Close()
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		fmt.Println("Error getting file info:", err)
-		panic("FileStatError")
-	}
-
-	if fileInfo.Size() == 0 {
-		fmt.Println("DB file is empty. No data to decode.")
-		return initBaseValue.Interface()
-	}
-
-	decoder := gob.NewDecoder(file)
-	slicePtr := reflect.New(initBaseType)
-
-	if derr := decoder.DecodeValue(slicePtr); derr != nil {
-		log.Panicln("Decoding failed during", initBaseType, "Error: ", derr)
-	}
-
-	return slicePtr.Elem().Interface()
+func chunkDirFor(typeName string) string {
+	return filepath.Join(DataDir, typeName)
 }
 
-// save writes the entity slice to disk atomically. The entire encoded
-// payload goes to "<filepath>.tmp"; only after a successful fsync + close
-// is the temp file renamed onto the target path. A crash mid-encode
-// leaves the previous good file untouched.
-func (gb *DB[T]) save() error {
-	log.Println("Saving entity:", gb.TypeName())
+func (db *DB[T]) chunkDir() string { return chunkDirFor(db.name) }
 
-	finalPath := gb.Filepath()
-	tmpPath := finalPath + ".tmp"
+// loadStore reads every chunk file for T and rebuilds the store. Decode +
+// inflate run in parallel; assembly is sequential to keep file index == chunk index.
+func loadStore[T Entity]() (*chunkStore[T], error) {
+	creator := &dbCreator{}
+	store := newChunkStore[T]()
 
-	entitySchemaStruct := gb.createSchemaStruct()
-	baseType := reflect.SliceOf(entitySchemaStruct.Type())
-	baseValue := reflect.MakeSlice(baseType, 0, 0)
+	rowType := creator.createSchemaStruct(*new(T)).Type()
+	sliceType := reflect.SliceOf(rowType)
 
-	gb.store.Range(func(p *T) {
-		baseValue = reflect.Append(baseValue, gb.NormalizeToSchema(*p))
+	dir := chunkDirFor(reflect.TypeFor[T]().Name())
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("nestory: mkdir %s: %w", dir, err)
+	}
+
+	paths, err := sortedChunkFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(paths) == 0 {
+		return store, nil
+	}
+
+	results := make([][]T, len(paths))
+	errs := make([]error, len(paths))
+
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		wg.Add(1)
+		go func(i int, p string) {
+			defer wg.Done()
+			slice, derr := decodeSlice(p, sliceType)
+			if derr != nil {
+				errs[i] = derr
+				return
+			}
+
+			vals, ierr := inflateSlice[T](creator, slice)
+			if ierr != nil {
+				errs[i] = ierr
+				return
+			}
+
+			results[i] = vals
+		}(i, p)
+	}
+	wg.Wait()
+
+	for _, e := range errs {
+		if e != nil {
+			return nil, e
+		}
+	}
+
+	for i := range results {
+		store.loadChunk(results[i])
+	}
+
+	// WAL rows are newer than the snapshot (committed since last compaction), so
+	// they win.
+	walRows, werr := replayWAL(filepath.Join(dir, "wal.log"), rowType)
+	if werr != nil {
+		return nil, werr
+	}
+	if len(walRows) > 0 {
+		rows := reflect.MakeSlice(sliceType, 0, len(walRows))
+		ids := make([]int, len(walRows))
+		for i, wr := range walRows {
+			rows = reflect.Append(rows, wr.row)
+			ids[i] = wr.id
+		}
+		vals, ierr := inflateSlice[T](creator, rows)
+		if ierr != nil {
+			return nil, ierr
+		}
+
+		byId := make(map[int]*Resource[T], store.Len())
+		store.rangeResources(func(r *Resource[T]) { byId[(*r.item).GetId()] = r })
+		for i := range vals {
+			if r, ok := byId[ids[i]]; ok {
+				*r.item = vals[i]
+			}
+		}
+	}
+
+	return store, nil
+}
+
+// sortedChunkFiles lists "<n>.gob" files in dir, ordered by n.
+func sortedChunkFiles(dir string) ([]string, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("nestory: read dir %s: %w", dir, err)
+	}
+
+	type chunkFile struct {
+		idx  int
+		path string
+	}
+	var cfs []chunkFile
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".gob") {
+			continue
+		}
+		idx, err := strconv.Atoi(strings.TrimSuffix(name, ".gob"))
+		if err != nil {
+			continue // ignore stray files (e.g. leftover .tmp, old single-file format)
+		}
+		cfs = append(cfs, chunkFile{idx, filepath.Join(dir, name)})
+	}
+
+	sort.Slice(cfs, func(a, b int) bool { return cfs[a].idx < cfs[b].idx })
+
+	paths := make([]string, len(cfs))
+	for k, c := range cfs {
+		paths[k] = c.path
+	}
+
+	return paths, nil
+}
+
+// decodeSlice gob-decodes one chunk file into a sliceType value. Empty file →
+// empty slice.
+func decodeSlice(path string, sliceType reflect.Type) (reflect.Value, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return reflect.Value{}, fmt.Errorf("nestory: open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return reflect.Value{}, fmt.Errorf("nestory: stat %s: %w", path, err)
+	}
+
+	slicePtr := reflect.New(sliceType)
+	if info.Size() == 0 {
+		return slicePtr.Elem(), nil
+	}
+
+	if err := gob.NewDecoder(f).DecodeValue(slicePtr); err != nil {
+		return reflect.Value{}, fmt.Errorf("nestory: decode %s: %w", path, err)
+	}
+
+	return slicePtr.Elem(), nil
+}
+
+// save writes every dirty chunk in parallel, then marks them clean. Clean chunks
+// are skipped — the win over a whole-file rewrite. Assumes no commit is running
+// concurrently (admin-only, like Flush).
+func (db *DB[T]) save() error {
+	idxs := db.store.dirtyIndices()
+	if len(idxs) == 0 {
+		return nil
+	}
+
+	dir := db.chunkDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("nestory: mkdir %s: %w", dir, err)
+	}
+
+	sliceType := reflect.SliceOf(db.createSchemaStruct().Type())
+
+	errs := make([]error, len(idxs))
+	var wg sync.WaitGroup
+	for k, ci := range idxs {
+		wg.Add(1)
+		go func(k, ci int) {
+			defer wg.Done()
+			errs[k] = db.saveChunk(dir, ci, sliceType)
+		}(k, ci)
+	}
+	wg.Wait()
+
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+
+	db.store.clearDirty(idxs)
+
+	return nil
+}
+
+// saveChunk writes one chunk atomically: encode to "<ci>.gob.tmp", fsync, rename
+// onto "<ci>.gob". A crash mid-encode leaves the previous good file untouched.
+func (db *DB[T]) saveChunk(dir string, ci int, sliceType reflect.Type) error {
+	slice := reflect.MakeSlice(sliceType, 0, 0)
+	db.store.chunkLive(ci, func(p *T) {
+		slice = reflect.Append(slice, db.NormalizeToSchema(*p))
 	})
+
+	finalPath := filepath.Join(dir, fmt.Sprintf("%d.gob", ci))
+	tmpPath := finalPath + ".tmp"
 
 	file, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("nestory: create %s: %w", tmpPath, err)
 	}
 
-	if err := gob.NewEncoder(file).Encode(baseValue.Interface()); err != nil {
+	if err := gob.NewEncoder(file).Encode(slice.Interface()); err != nil {
 		file.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("nestory: encode %s: %w", tmpPath, err)
