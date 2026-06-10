@@ -132,7 +132,7 @@ func (db *DB[T]) Get(id int) (*T, error) {
 
 	work := &cp
 	tx := engine.begin()
-	engine.record(tx, touchedResource{typ: db.name, id: id, ver: ver, work: work})
+	engine.record(tx, touchedResource{dbName: db.name, id: id, ver: ver, work: work})
 
 	return work, nil
 }

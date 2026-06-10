@@ -52,6 +52,7 @@ func (db *DB[T]) fillRelation() {
 
 			relFieldVal := f.Elem().FieldByName(relto)
 
+			matched := false
 			for idx := 0; idx < foreignStore.Len(); idx++ {
 				instance := foreignStore.Index(idx)
 
@@ -61,13 +62,15 @@ func (db *DB[T]) fillRelation() {
 				}
 
 				f.Set(instance)
+				matched = true
 
 				break
 			}
 
-			if f.IsZero() {
-				log.Panicf("Field's value does not match to any of related field in the specified entity\n Rel field: %s \n; Entity fields value %s\n",
-					relto, f.Elem().FieldByName(relto))
+			// FK points at a deleted (or never-loaded) target: drop to nil rather
+			// than keep the hollow {Id} pointer inflateSlice built.
+			if !matched {
+				f.Set(reflect.Zero(f.Type()))
 			}
 		}
 

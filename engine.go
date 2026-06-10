@@ -22,7 +22,7 @@ type txId uint64
 // data. The live Resource and the typed write-back resolve at commit via
 // baseRegistry[typ].
 type touchedResource struct {
-	typ  string
+	dbName  string
 	id   int
 	ver  int // version observed at snapshot time
 	work any // *T, the client's detached copy
@@ -45,8 +45,8 @@ type pendingWrite struct {
 	work any
 }
 
-func committerFor(typ string) committer {
-	return baseRegistry[typ].(committer)
+func committerFor(dbName string) committer {
+	return baseRegistry[dbName].(committer)
 }
 
 // Engine sits above every DB, owns the live contracts and serialises commits.
@@ -108,36 +108,41 @@ func (en *Engine) discardByPtr(work any) {
 	}
 }
 
-func (en *Engine) commit(tx txId) error {
+func (en *Engine) commit(transactionId txId) error {
 	en.mu.Lock()
-	es := append([]touchedResource(nil), en.txs[tx]...)
+	touchedResources := append([]touchedResource(nil), en.txs[transactionId]...)
 	en.mu.Unlock()
 
-	if es == nil {
+	if touchedResources == nil {
 		return ErrExpiredSnapshot
 	}
 
-	// Global (typ,id) lock order: overlapping commits can't form a wait cycle.
-	sort.Slice(es, func(i, j int) bool {
-		if es[i].typ != es[j].typ {
-			return es[i].typ < es[j].typ
+	// Global (dbName,id) lock order: overlapping commits can't form a wait cycle.
+	sort.Slice(touchedResources, func(i, j int) bool {
+		resA := touchedResources[i]
+		resB := touchedResources[j]
+
+		if resA.dbName != resB.dbName {
+			return resA.dbName < resB.dbName
 		}
-		return es[i].id < es[j].id
+
+		return resA.id < resB.id
 	})
 
-	for _, e := range es {
-		committerFor(e.typ).lockResource(e.id)
+	for _, resource := range touchedResources {
+		committerFor(resource.dbName).lockResource(resource.id)
 	}
+
 	defer func() {
-		for i := len(es) - 1; i >= 0; i-- {
-			committerFor(es[i].typ).unlockResource(es[i].id)
+		for i := len(touchedResources) - 1; i >= 0; i-- {
+			committerFor(touchedResources[i].dbName).unlockResource(touchedResources[i].id)
 		}
 	}()
 
-	for _, e := range es {
-		v, ok := committerFor(e.typ).resourceVersion(e.id)
+	for _, e := range touchedResources {
+		v, ok := committerFor(e.dbName).resourceVersion(e.id)
 		if !ok || v != e.ver {
-			en.refresh(tx)
+			en.refresh(transactionId)
 
 			return ErrConflict
 		}
@@ -145,25 +150,27 @@ func (en *Engine) commit(tx txId) error {
 
 	// Log before mutating memory: a crash replays the whole tx or none of it.
 	// One fsync per type.
-	byTyp := map[string][]pendingWrite{}
+	byDbName := map[string][]pendingWrite{}
 	order := make([]string, 0)
-	for _, e := range es {
-		if _, seen := byTyp[e.typ]; !seen {
-			order = append(order, e.typ)
+
+	for _, e := range touchedResources {
+		if _, seen := byDbName[e.dbName]; !seen {
+			order = append(order, e.dbName)
 		}
-		byTyp[e.typ] = append(byTyp[e.typ], pendingWrite{id: e.id, work: e.work})
+		byDbName[e.dbName] = append(byDbName[e.dbName], pendingWrite{id: e.id, work: e.work})
 	}
-	for _, typ := range order {
-		if err := committerFor(typ).logWrites(byTyp[typ]); err != nil {
+
+	for _, dbName := range order {
+		if err := committerFor(dbName).logWrites(byDbName[dbName]); err != nil {
 			return err
 		}
 	}
 
-	for _, e := range es {
-		committerFor(e.typ).applyWrite(e.id, e.work)
+	for _, e := range touchedResources {
+		committerFor(e.dbName).applyWrite(e.id, e.work)
 	}
 
-	en.evict(tx)
+	en.evict(transactionId)
 
 	return nil
 }
@@ -177,7 +184,7 @@ func (en *Engine) refresh(tx txId) {
 
 	for i := range en.txs[tx] {
 		e := &en.txs[tx][i]
-		c := committerFor(e.typ)
+		c := committerFor(e.dbName)
 
 		v, ok := c.resourceVersion(e.id)
 		if !ok {
