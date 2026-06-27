@@ -103,6 +103,7 @@ func (db *DB[T]) Flush() error {
 			db.PatchById(id, *ent)
 			continue
 		}
+
 		db.Add(ent)
 		existing[id] = true
 	}
@@ -155,7 +156,7 @@ func merge[T any](target *T, merger T) error {
 			continue
 		}
 
-		if targetField.Kind() == reflect.Ptr && !mergerField.IsNil() {
+		if targetField.Kind() == reflect.Pointer && !mergerField.IsNil() {
 			targetField.Set(mergerField)
 			continue
 		}

@@ -40,7 +40,7 @@ func (w *wal) appendFrame(rec walFrame) error {
 	defer w.mu.Unlock()
 
 	if w.f == nil {
-		f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			return err
 		}
@@ -59,6 +59,7 @@ func (w *wal) appendFrame(rec walFrame) error {
 	if _, err := w.f.Write(hdr[:]); err != nil {
 		return err
 	}
+
 	if _, err := w.f.Write(buf.Bytes()); err != nil {
 		return err
 	}

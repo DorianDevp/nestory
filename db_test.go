@@ -28,6 +28,7 @@ func TestWAL_CommitSurvivesReloadWithoutFlush(t *testing.T) {
 	if err := Register[tCounter](); err != nil {
 		t.Fatal(err)
 	}
+
 	db := Open[tCounter]()
 
 	c := &tCounter{N: 10}
@@ -35,6 +36,7 @@ func TestWAL_CommitSurvivesReloadWithoutFlush(t *testing.T) {
 	if err := db.Flush(); err != nil { // snapshot N=10, WAL empty
 		t.Fatal(err)
 	}
+
 	id := c.Id
 
 	// no Flush — durability must come from the WAL alone
@@ -47,11 +49,13 @@ func TestWAL_CommitSurvivesReloadWithoutFlush(t *testing.T) {
 	if err := Register[tCounter](); err != nil {
 		t.Fatal(err)
 	}
+
 	db2 := Open[tCounter]()
 	got, err := db2.Get(id)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	db2.DiscardSnapshot(got)
 
 	if got.N != 99 {
@@ -74,6 +78,7 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 	if err := Register[tCounter](); err != nil {
 		t.Fatal(err)
 	}
+
 	db := Open[tCounter]()
 
 	c := &tCounter{}
@@ -81,6 +86,7 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 	if err := db.Flush(); err != nil {
 		t.Fatal(err)
 	}
+
 	id := c.Id
 
 	const goroutines = 8
@@ -99,12 +105,14 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 			}
 		}()
 	}
+
 	wg.Wait()
 
 	got, err := db.Get(id)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	db.DiscardSnapshot(got)
 
 	if want := goroutines * perG; got.N != want {

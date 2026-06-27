@@ -6,10 +6,10 @@ import (
 )
 
 const (
-	Own string = "own"
+	Own     string = "own"
 	OwnedBy string = "ownedby"
-	Borrow string = "borrow"
-	Option string = "option"
+	Borrow  string = "borrow"
+	Option  string = "option"
 )
 
 // fillRelation rebuilds the pointer graph for this base. relto fields get the

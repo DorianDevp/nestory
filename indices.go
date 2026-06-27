@@ -5,7 +5,7 @@ import "reflect"
 // initIndices creates an empty inner map for every field of T.
 func (db *DB[T]) initIndices() {
 	baseType := reflect.TypeOf(*new(T))
-	if baseType.Kind() == reflect.Ptr {
+	if baseType.Kind() == reflect.Pointer {
 		baseType = baseType.Elem()
 	}
 

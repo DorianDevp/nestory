@@ -60,6 +60,7 @@ func (s *chunkStore[T]) markDirty(ci int) {
 	if ci >= 0 && ci < len(s.dirty) {
 		s.dirty[ci] = true
 	}
+
 	s.dirtyMu.Unlock()
 }
 
@@ -84,6 +85,7 @@ func (s *chunkStore[T]) clearDirty(idxs []int) {
 			s.dirty[i] = false
 		}
 	}
+
 	s.dirtyMu.Unlock()
 }
 
@@ -111,6 +113,7 @@ func (s *chunkStore[T]) loadChunk(vals []T) {
 		tb.data[tb.n] = false
 		tb.n++
 	}
+
 	s.chunks = append(s.chunks, ch)
 	s.tomb = append(s.tomb, tb)
 	s.dirty = append(s.dirty, false)

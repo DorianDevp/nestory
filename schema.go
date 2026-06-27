@@ -13,6 +13,7 @@ func isScalarKey(k reflect.Kind) bool {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return true
 	}
+
 	return false
 }
 
@@ -247,6 +248,7 @@ func (c *dbCreator) createSchemaStruct(entity any) reflect.Value {
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
+
 	t := v.Type()
 
 	for idx := range fields {

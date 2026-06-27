@@ -42,13 +42,15 @@ func (db *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
 				if tomb.data[i] {
 					continue
 				}
+
 				s := &chunk.data[i]
 
 				val := reflect.ValueOf(s).Elem()
-				for val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+				for val.Kind() == reflect.Pointer || val.Kind() == reflect.Interface {
 					if val.IsNil() {
 						break
 					}
+
 					val = val.Elem()
 				}
 
