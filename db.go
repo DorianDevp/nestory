@@ -47,8 +47,10 @@ var DataDir = "./data"
 
 var ErrEmptyEntity = errors.New("empty entity")
 
-var baseRegistry = make(map[string]any)
-var storeRegistry = make(map[string]any) // typeName → *chunkStore[T]
+var (
+	baseRegistry  = make(map[string]any)
+	storeRegistry = make(map[string]any) // typeName → *chunkStore[T]
+)
 
 // Register loads T's chunk files and inflates each row into a *T. Call once per
 // type, before any [Open] — fillRelation needs every type registered to wire
@@ -134,7 +136,7 @@ func (db *DB[T]) seedCounter() {
 func SetId[T any](entity *T, id int) {
 	val := reflect.ValueOf(entity)
 
-	if val.Kind() != reflect.Ptr || val.IsNil() {
+	if val.Kind() != reflect.Pointer || val.IsNil() {
 		panic("expected a non-nil pointer")
 	}
 
@@ -143,9 +145,11 @@ func SetId[T any](entity *T, id int) {
 	if !idField.IsValid() {
 		panic("ID field not found")
 	}
+
 	if !idField.CanSet() {
 		panic("ID field is not settable")
 	}
+
 	switch idField.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		idField.SetInt(int64(id))

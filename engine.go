@@ -22,10 +22,10 @@ type txId uint64
 // data. The live Resource and the typed write-back resolve at commit via
 // baseRegistry[typ].
 type touchedResource struct {
-	dbName  string
-	id   int
-	ver  int // version observed at snapshot time
-	work any // *T, the client's detached copy
+	dbName string
+	id     int
+	ver    int // version observed at snapshot time
+	work   any // *T, the client's detached copy
 }
 
 // committer is the type-erased view the Engine drives at commit. *DB[T]
@@ -157,6 +157,7 @@ func (en *Engine) commit(transactionId txId) error {
 		if _, seen := byDbName[e.dbName]; !seen {
 			order = append(order, e.dbName)
 		}
+
 		byDbName[e.dbName] = append(byDbName[e.dbName], pendingWrite{id: e.id, work: e.work})
 	}
 

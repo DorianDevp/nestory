@@ -138,7 +138,6 @@ func del[T Entity](t *testing.T, db *DB[T], label string, e *T) {
 
 func TestRelations(t *testing.T) {
 	// General relation behaviour
-
 	runIsolated(t, "Owner throws error on empty relation", func(t *testing.T) {
 	})
 
@@ -176,5 +175,4 @@ func TestRelations(t *testing.T) {
 
 	runIsolated(t, "Ownedby can only have own or option relations", func(t *testing.T) {
 	})
-	
 }

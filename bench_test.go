@@ -25,6 +25,7 @@ func quiet(tb testing.TB) {
 	if err != nil {
 		tb.Fatalf("open devnull: %v", err)
 	}
+
 	os.Stdout = devnull
 	log.SetOutput(io.Discard)
 	tb.Cleanup(func() {
@@ -48,9 +49,11 @@ func newBenchDB(tb testing.TB, n int) *DB[benchItem] {
 			Age:   i % 90,
 		})
 	}
+
 	if err := db.Flush(); err != nil {
 		tb.Fatalf("seed flush: %v", err)
 	}
+
 	return db
 }
 
@@ -76,11 +79,13 @@ func BenchmarkBatchInsertFlush(b *testing.B) {
 						Age:   j % 90,
 					}
 				}
+
 				b.StartTimer()
 
 				for _, it := range items {
 					db.AddToPersistQueue(it)
 				}
+
 				_ = db.Flush()
 			}
 		})

@@ -46,9 +46,11 @@ func TestRegression_BatchQueueAssignsDistinctIds(t *testing.T) {
 			t.Errorf("item %q has Id=0 after queueing", it.Name)
 			continue
 		}
+
 		if seen[it.Id] {
 			t.Errorf("duplicate Id %d assigned to %q", it.Id, it.Name)
 		}
+
 		seen[it.Id] = true
 	}
 
@@ -81,6 +83,7 @@ func TestRegression_QueueRespectsExistingMaxId(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		db.AddToPersistQueue(&bqItem{Name: "batch1"})
 	}
+
 	if err := db.Flush(); err != nil {
 		t.Fatalf("first Flush: %v", err)
 	}
@@ -111,6 +114,7 @@ func TestRegression_CounterSeededAfterReload(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		db.AddToPersistQueue(&bqItem{Name: "seed"})
 	}
+
 	if err := db.Flush(); err != nil {
 		t.Fatalf("seed flush: %v", err)
 	}
@@ -125,6 +129,7 @@ func TestRegression_CounterSeededAfterReload(t *testing.T) {
 	if fresh.Id != 4 {
 		t.Fatalf("after reload, next id = %d, want 4 (counter must seed from max persisted id)", fresh.Id)
 	}
+
 	if err := db2.Flush(); err != nil {
 		t.Fatalf("post-reload flush: %v", err)
 	}
@@ -160,6 +165,7 @@ func TestRegression_SaveIsAtomic_NoLeftoverTmp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
+
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) == ".tmp" {
 			t.Errorf("leftover tmp file after successful save: %s", e.Name())
@@ -189,6 +195,7 @@ func TestRegression_SaveOverwritePreservesPrevOnNewWrite(t *testing.T) {
 	if err := db.Flush(); err != nil {
 		t.Fatalf("first Flush: %v", err)
 	}
+
 	typeDir := filepath.Join(tmpDir, "bqItem")
 	finalPath := filepath.Join(typeDir, "0.gob")
 	infoV1, err := os.Stat(finalPath)
@@ -209,6 +216,7 @@ func TestRegression_SaveOverwritePreservesPrevOnNewWrite(t *testing.T) {
 			tmpCount++
 		}
 	}
+
 	if tmpCount != 0 {
 		t.Errorf("expected 0 .tmp files after v2 save, got %d", tmpCount)
 	}

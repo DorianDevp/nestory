@@ -33,7 +33,7 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 	sliceType := reflect.SliceOf(rowType)
 
 	dir := chunkDirFor(reflect.TypeFor[T]().Name())
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("nestory: mkdir %s: %w", dir, err)
 	}
 
@@ -69,6 +69,7 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 			results[i] = vals
 		}(i, p)
 	}
+
 	wg.Wait()
 
 	for _, e := range errs {
@@ -87,6 +88,7 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 	if werr != nil {
 		return nil, werr
 	}
+
 	if len(walRows) > 0 {
 		rows := reflect.MakeSlice(sliceType, 0, len(walRows))
 		ids := make([]int, len(walRows))
@@ -94,6 +96,7 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 			rows = reflect.Append(rows, wr.row)
 			ids[i] = wr.id
 		}
+
 		vals, ierr := inflateSlice[T](creator, rows)
 		if ierr != nil {
 			return nil, ierr
@@ -127,14 +130,17 @@ func sortedChunkFiles(dir string) ([]string, error) {
 		if e.IsDir() {
 			continue
 		}
+
 		name := e.Name()
 		if !strings.HasSuffix(name, ".gob") {
 			continue
 		}
+
 		idx, err := strconv.Atoi(strings.TrimSuffix(name, ".gob"))
 		if err != nil {
 			continue // ignore stray files (e.g. leftover .tmp, old single-file format)
 		}
+
 		cfs = append(cfs, chunkFile{idx, filepath.Join(dir, name)})
 	}
 
@@ -184,7 +190,7 @@ func (db *DB[T]) save() error {
 	}
 
 	dir := db.chunkDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("nestory: mkdir %s: %w", dir, err)
 	}
 
@@ -199,6 +205,7 @@ func (db *DB[T]) save() error {
 			errs[k] = db.saveChunk(dir, ci, sliceType)
 		}(k, ci)
 	}
+
 	wg.Wait()
 
 	for _, e := range errs {

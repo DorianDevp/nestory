@@ -37,6 +37,7 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 	for i := 0; i < chunkLimit+50; i++ {
 		db.AddToPersistQueue(&bqItem{Name: "filler"})
 	}
+
 	if err := db.Flush(); err != nil {
 		t.Fatalf("flush 2: %v", err)
 	}
@@ -52,6 +53,7 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 	if _, err := db.PatchById(1, bqItem{Name: "updated"}); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
+
 	if p.Name != "updated" {
 		t.Errorf("stale pointer: p.Name = %q, want %q", p.Name, "updated")
 	}
