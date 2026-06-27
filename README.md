@@ -8,7 +8,7 @@ No queries, no joins — you walk the graph.
 type User struct {
     Id      int      `key:"primary"`
     Name    string
-    Profile *Profile `relto:"Id"`     // o2o / m2o
+    Profile *Profile `own:"Id"`     // o2o / m2o
     Posts   []*Post  `mapby:"UserId"` // o2m
 }
 
@@ -56,7 +56,7 @@ The dataset is one object graph — any entity can reach any other through a rea
   is the lifecycle backbone: it answers "what dies when this dies." Being a forest
   is precisely what lets a cascade delete be a plain walk down a subtree — no
   shared node, no double-free, no bookkeeping.
-- A **free reference graph** laid over it — the `borrow`/`weak`/`inverse` edges.
+- A **free reference graph** laid over it — the `borrow`/`option`/`inverse` edges.
   They own nothing, so they're unconstrained: shared, any direction, cyclic — a
   borrow cycle is just a group of nodes deletable only together. They navigate
   the data; they don't own it.
@@ -64,7 +64,7 @@ The dataset is one object graph — any entity can reach any other through a rea
 Pinning lifecycle to a strict forest is also why there's no orphan sweep: an
 entity's lifetime is structural — its place in the forest — not something you
 discover by counting or chasing references. A reference that outlives its target
-is resolved by its role: `weak` goes nil, `borrow` blocks the delete.
+is resolved by its role: `option` goes nil, `borrow` blocks the delete.
 
 ## Ownership & cascade (planned)
 
@@ -74,17 +74,17 @@ whom, who must outlive whom, and what a delete does — is what the tag declares
 written `rel:"role,field"`. The role names are Rust-inspired *lifetime
 descriptors* (not Rust semantics — there's no compile-time borrow checker here).
 
-The five roles are not five peers. Three of them — `own`, `borrow`, `weak` — sit
+The five roles are not five peers. Three of them — `own`, `borrow`, `option` — sit
 on one axis: **how much power you hold over the target's lifetime**, full / veto /
 none. `ownedby` is `own`'s *named complement* — the same edge seen from the owned
 side. `inverse` is a *computed* mirror for the two bonds that have no named
-complement (`borrow`, `weak`); it is never stored and never authoritative.
+complement (`borrow`, `option`); it is never stored and never authoritative.
 
 - `own`     — full power: I create and destroy the target (to-one or to-many).
 - `ownedby` — `own` from the owned side: I die no later than my owner.
 - `borrow`  — veto: I don't own it, but it may not be deleted while I hold it.
-- `weak`    — no power: it may vanish; my reference just goes nil.
-- `inverse` — computed `[]*T` view of everyone pointing at me via `borrow`/`weak`.
+- `option`    — no power: it may vanish; my reference just goes nil.
+- `inverse` — computed `[]*T` view of everyone pointing at me via `borrow`/`option`.
 
 A `*T` field always declares its own bond — there is no neutral pointer, because
 a pointer must say what happens when its target dies. A `[]*T` is either an
@@ -143,7 +143,7 @@ child field to put it on.
 ### Tag signatures — every one, with its side effects
 
 `field` means two things depending on cardinality. On a to-one bond
-(`own`/`ownedby`/`borrow`/`weak`) it names the **target field to match**
+(`own`/`ownedby`/`borrow`/`option`) it names the **target field to match**
 (usually `Id`). On a `[]*T` (`own` to-many, `inverse`) it names the **field on
 the element type** that points back.
 
@@ -153,15 +153,15 @@ the element type** that points back.
 | `rel:"own,F"` (to-many) | `[]*T` | child delete allowed; the slice shrinks | deletes every child | — (slice) |
 | `rel:"ownedby,Id"` | `*T` only | deletes me | owner's `own []*T` shrinks; under a to-one `own` forbidden alone — delete the owner or swap | no |
 | `rel:"borrow,Id"` | `*T` / `[]*T` | **blocked** while I hold it (checked at commit) | target unaffected | no |
-| `rel:"weak,Id"` | `*T` / `[]*T` | my pointer → nil (slice: element dropped) | target unaffected | yes |
-| `rel:"inverse,F"` | `[]*T` only | element deleted → drops out of the view | per `F`'s bond: `borrow` elements block my delete, `weak` elements go nil | — (computed) |
+| `rel:"option,Id"` | `*T` / `[]*T` | my pointer → nil (slice: element dropped) | target unaffected | yes |
+| `rel:"inverse,F"` | `[]*T` only | element deleted → drops out of the view | per `F`'s bond: `borrow` elements block my delete, `option` elements go nil | — (computed) |
 
 Notes that bite:
 
 - **`[]*T` + `ownedby` is an error.** `ownedby` means "the target owns me"; a
   slice would mean many owners of one node, which breaks ≤1-owner. `ownedby` is
   always to-one.
-- **`inverse` is `[]*T` only, and `F` must carry `borrow` or `weak`.** An
+- **`inverse` is `[]*T` only, and `F` must carry `borrow` or `option`.** An
   `inverse` naming an `own`/`ownedby` field is a schema error — the mirror of
   `own` already has a name: `ownedby`. `F`'s own target type must be the type
   declaring the `inverse` (`User.Logs rel:"inverse,User"` requires `Log.User`
@@ -192,8 +192,8 @@ errors:
 | 7 | `P []*T rel:"ownedby,…"` | **error** | Register (I2): would mean many owners of one node. |
 | 8 | `P *T rel:"borrow,Id"` | legal | Commit: nil on a survivor. Self-type is satisfiable (mutual pairs, self-borrow). |
 | 9 | `P []*T rel:"borrow,Id"` | legal | Never at field level; an empty slice is fine. |
-| 10 | `P *T rel:"weak,Id"` | legal | Never. The one role that cannot block a commit. |
-| 11 | `P []*T rel:"weak,Id"` | legal | Never; elements drop when their target dies. |
+| 10 | `P *T rel:"option,Id"` | legal | Never. The one role that cannot block a commit. |
+| 11 | `P []*T rel:"option,Id"` | legal | Never; elements drop when their target dies. |
 | 12 | `P *T rel:"inverse,F"` | **error** | Register (I2): a mirror is a collection; a backward `*T` must declare its own bond. |
 | 13 | `P []*T rel:"inverse,F"` | conditional | Register: `F` missing; `F` carries `own`/`ownedby` (the mirror of own is named `ownedby`); `F` has no role; `F` targets a type other than mine. |
 | 14 | `rel:"…"` on a non-pointer field | **error** | Register: roles go on `*T`/`[]*T` only; an embedded value is embedding, not a relation. |
@@ -209,7 +209,7 @@ order. Both spellings state the same edge — `ownedby` is `own` read from below
 the target cannot be deleted while a **surviving** holder points at it. The veto
 ends when the holder repoints, when the slice element is removed, or when the
 holder itself dies — in particular, a holder that dies in the same commit vetoes
-nothing. `weak` claims nothing in either direction; `inverse` is a computed view.
+nothing. `option` claims nothing in either direction; `inverse` is a computed view.
 
 Because the veto is operational, borrow edges may form cycles, and a cycle is
 not a contradiction — it is a *co-death group*, nodes deletable only together
@@ -225,7 +225,7 @@ The commit semantics come first; every check is defined against them. A commit
 computes `D` = the explicitly deleted nodes plus everything they transitively
 own (the *cascade closure* — it walks only ownership edges), `S` = everything
 else (the *survivors*), and then validates the **final state**: no survivor may
-borrow a node in `D`, survivors' `weak` pointers into `D` go nil, and every
+borrow a node in `D`, survivors' `option` pointers into `D` go nil, and every
 survivor's `own`/`ownedby`/`borrow` is non-nil. Deferring everything to commit
 means operation order *inside* a transaction never matters: moving a subtree
 briefly shows two owners and is fine; deleting a playlist together with the
@@ -236,8 +236,8 @@ Three invariants are schema properties, checked once at `Register`:
 
 - **I1 — one role per field.** A field declares exactly one role.
 - **I2 — shape.** `ownedby` is `*T` only. `inverse` is `[]*T` only, and its `F`
-  must name a `borrow`/`weak` field on the element type whose target is the
-  declaring type. `own`/`borrow`/`weak` go either way.
+  must name a `borrow`/`option` field on the element type whose target is the
+  declaring type. `own`/`borrow`/`option` go either way.
 - **I3 — satisfiability.** A schema that can never have instances is rejected
   outright. Declaring `ownedby` makes ownership *mandatory*, so: at most one
   `ownedby` field per type (two would demand two owners on every instance,
@@ -259,7 +259,7 @@ I3 in full — what `Register` rejects as unsatisfiable, and what it lets throug
 | `Node{ Children []*Node own }` | legal | The empty slice stops the regress — the canonical tree. |
 | `A{ Buddy *A rel:"borrow,Id" }` | legal | Satisfiable: mutually pinning pairs, or a self-borrow. |
 | mixed own/borrow type cycles | legal | Satisfying instance layouts exist, so the commit decides, not the schema. |
-| any `weak` layout | legal | Nullable demands nothing. |
+| any `option` layout | legal | Nullable demands nothing. |
 
 Three are instance properties, checked at the end of every transaction:
 
@@ -285,8 +285,8 @@ a type with an `ownedby` field must always have an owner (I3's mandatoriness);
 a type without one may sit outside any owning edge — a `Node` with
 `ParentId == 0` is just an unowned row, not an error and not a special case.
 
-One practical note on `weak`: ids are never reused (the auto-id counter is
-seeded from disk), so a nil'd weak pointer can never silently rebind to a
+One practical note on `option`: ids are never reused (the auto-id counter is
+seeded from disk), so a nil'd option pointer can never silently rebind to a
 stranger that inherited the id.
 
 ### Compositions — combining roles
@@ -302,16 +302,16 @@ matrix — every way two edges can meet between nodes A and B. `own→` reads
 | 3 | `own→` + `ownedby←` | legal | Not a pair — one edge spelled from both ends; I6 keeps the two ends equal. |
 | 4 | `own→` + `bor→` | legal | **Protected member**: the child can't be deleted by accident while the owner lives, yet dies with the owner — the veto dies with its holder. `Playlist.Current`. |
 | 5 | `own→` + `bor←` | legal, inert | The owned pins its owner: every cascade reaching A collects B, so B never survives to veto. Wakes if B is reparented out. "My owner" is spelled `ownedby`. |
-| 6 | `own→` + `weak→` | legal | **Distinguished member**: the owner singles out its own child; deleting the child shrinks the slice and nils the pointer. `Playlist.LastHit`. |
-| 7 | `own→` + `weak←` | legal, inert | As #5: the setnull is never observable while B sits in A's subtree. |
+| 6 | `own→` + `option→` | legal | **Distinguished member**: the owner singles out its own child; deleting the child shrinks the slice and nils the pointer. `Playlist.LastHit`. |
+| 7 | `own→` + `option←` | legal, inert | As #5: the setnull is never observable while B sits in A's subtree. |
 | 8 | `bor→` + `bor→` | legal | A duplicate veto, idempotent. |
 | 9 | `bor→` + `bor←` | legal | **Atomic pair**: neither dies alone (the survivor vetoes), both die in one transaction (both in `D`, vetoes vacuous). A debit and its credit. |
-| 10 | `bor→` + `weak→` | legal | The weak is dominated: while the borrow holds, the target can't die, so the nil never happens; wakes after the borrow repoints. |
-| 11 | `bor→` + `weak←` | legal | Both fire cleanly: deleting A nils B's weak; deleting B is vetoed by A. |
-| 12 | `weak→` + `weak→` | legal | Two views, nothing more. |
-| 13 | `weak→` + `weak←` | legal | Mutual acquaintance; the free layer is legally cyclic. |
+| 10 | `bor→` + `option→` | legal | The option is dominated: while the borrow holds, the target can't die, so the nil never happens; wakes after the borrow repoints. |
+| 11 | `bor→` + `option←` | legal | Both fire cleanly: deleting A nils B's option; deleting B is vetoed by A. |
+| 12 | `option→` + `option→` | legal | Two views, nothing more. |
+| 13 | `option→` + `option←` | legal | Mutual acquaintance; the free layer is legally cyclic. |
 | 14 | `own` self-loop | **error I5** (commit) | A cycle of length one — the walk meets the adoptee immediately. |
-| 15 | `borrow`/`weak` self-loop | legal, inert | The holder is in `D` whenever the target is, so veto/setnull are vacuous. A self-borrow even has a use: the bottom-up tree root, below. |
+| 15 | `borrow`/`option` self-loop | legal, inert | The holder is in `D` whenever the target is, so veto/setnull are vacuous. A self-borrow even has a use: the bottom-up tree root, below. |
 
 The distinguished and the protected member, on one playlist:
 
@@ -325,7 +325,7 @@ type Playlist struct {
     Id      int      `key:"primary"`
     Entries []*Entry `rel:"own,Playlist"`
     Current *Entry   `rel:"borrow,Id"` // protected: no accidental delete
-    LastHit *Entry   `rel:"weak,Id"`   // distinguished: may vanish, then nils
+    LastHit *Entry   `rel:"option,Id"`   // distinguished: may vanish, then nils
 }
 ```
 
@@ -344,16 +344,16 @@ Beyond one pair:
 | `borrow` cycle of any length | legal | A co-death group: none dies alone, all die together in one transaction. |
 | mixed own/borrow cycle | legal | As long as ownership alone stays acyclic; the borrow fragments may be inert (pair #5). |
 | outsider borrows a child: `A own B`, `C bor B` | legal | `delete(B)` is vetoed by C — and so is `delete(A)`: the cascade can't take B while C survives. A borrow pins every ancestor of its target; the error names the pinned node and the borrower. |
-| outsider weak at a child: `C weak B` | legal | The cascade through A nils C's pointer. Never blocks. |
+| outsider option at a child: `C option B` | legal | The cascade through A nils C's pointer. Never blocks. |
 | child borrows an outsider: `A own B`, `B bor C` | legal | `delete(C)` is blocked while A's subtree lives; `delete(A)` releases the veto automatically. |
-| borrow/weak at a grandparent and beyond | legal, inert | Same mechanics as pair #5, by a longer path; deliberately not caught pairwise — wakes after reparenting. |
+| borrow/option at a grandparent and beyond | legal, inert | Same mechanics as pair #5, by a longer path; deliberately not caught pairwise — wakes after reparenting. |
 
 The whole error surface, in one paragraph: at `Register`, only I1 (two roles on
 one field), I2 (shapes and `inverse` well-formedness) and I3 (satisfiability)
 can reject. At commit, only: a nil `own`/`ownedby`/`borrow` on a survivor, the
 borrow veto (a survivor borrowing a node in `D`, directly or through a deep
 cascade), deleting the target of a to-one `own` without a swap, I4, I5 and I6.
-Nothing else ever errors — `weak` and `inverse` are structurally incapable of
+Nothing else ever errors — `option` and `inverse` are structurally incapable of
 blocking a commit.
 
 ### Patterns
@@ -408,12 +408,12 @@ type Book struct {
 }
 ```
 
-**A self-sufficient holder is `weak` + `inverse` — the canonical log:**
+**A self-sufficient holder is `option` + `inverse` — the canonical log:**
 
 ```go
 type Log struct {
     Id   int   `key:"primary"`
-    User *User `rel:"weak,Id"` // user vanishes → pointer nils, the log lives on
+    User *User `rel:"option,Id"` // user vanishes → pointer nils, the log lives on
 }
 type User struct {
     Id   int    `key:"primary"`

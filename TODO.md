@@ -39,9 +39,9 @@ Stuff I still want to do, roughly most-important first. Data safety before nice-
                       Declaring it makes ownership MANDATORY for the type (nil = error,
                       NO root special case); at most one ownedby field per type (I3).
         - `borrow`  — veto; target may not be deleted while I hold it (restrict, commit-time).
-        - `weak`    — no power; deleting the target nils my pointer (setnull). Nullable.
+        - `option`  — no power; deleting the target nils my pointer (setnull). Nullable.
         - `inverse` — computed `[]*T` view of who points at me; never stored, filled like
-                      mapby today. TO-MANY ONLY; second arg must name a `borrow`/`weak` field
+                      mapby today. TO-MANY ONLY; second arg must name a `borrow`/`option` field
                       on the element type whose target type is the declaring type. inverse of
                       own/ownedby is a schema error — the mirror of own IS ownedby.
       A `*T` always declares its own bond (no neutral pointer: it must say what happens when
@@ -50,7 +50,7 @@ Stuff I still want to do, roughly most-important first. Data safety before nice-
       other side needs a field; consistency between the ends is invariant I6. `field` =
       target-field-to-match on a to-one bond, child back-reference field on a to-many
       `own`/`inverse` (a raw int FK, or the child's ownedby field when two-sided).
-      Nullability falls out of role (own/ownedby/borrow non-nullable, weak nullable) — no
+      Nullability falls out of role (own/ownedby/borrow non-nullable, option nullable) — no
       `,nullable` modifier, that idea is dropped. FK storage: on the ownedby side when
       present; flattened on the owner for a lone to-one own (today's relto shape).
 - [ ] Rules for the ownership system — invariants I1–I6 + commit mechanics.
@@ -60,8 +60,8 @@ Stuff I still want to do, roughly most-important first. Data safety before nice-
       entries deleted in any order).
       Schema-time (Register):
         - I1 — one role per field.
-        - I2 — shape: ownedby *T only; inverse []*T only, naming a borrow/weak field on the
-               element type that points back at the declaring type; own/borrow/weak either.
+        - I2 — shape: ownedby *T only; inverse []*T only, naming a borrow/option field on the
+               element type that points back at the declaring type; own/borrow/option either.
         - I3 — satisfiability: a schema that can never have instances is rejected. ownedby =
                MANDATORY ownership → at most one ownedby field per type; no ownedby cycle in
                the type graph (incl. self-loop Node{ Parent *Node ownedby } — every node
@@ -78,13 +78,13 @@ Stuff I still want to do, roughly most-important first. Data safety before nice-
       Mechanics (not invariants): cascade closure; borrow veto = no SURVIVOR borrows a
       deleted node — error must name the pinned node and its borrower; a borrower dying in
       the same commit vetoes nothing (deep borrows pin all ancestors of their target; borrows
-      inside the doomed subtree are auto-released). weak setnull (ids never reused → no ABA).
+      inside the doomed subtree are auto-released). option setnull (ids never reused → no ABA).
       Non-nil own/ownedby/borrow on survivors.
       DROPPED, deliberately (old global ≼-acyclicity and pair exclusivity): mechanisms
-      compose instead of being pattern-banned. own+weak on own child = distinguished member
+      compose instead of being pattern-banned. own+option on own child = distinguished member
       (Playlist.LastHit); own+borrow on own child = protected member (Playlist.Current can't
       be deleted by accident, still dies with the playlist); mutual borrow = atomic pair
-      (deletable only in one tx — debit/credit). Backward borrow/weak at one's own(er) is
+      (deletable only in one tx — debit/credit). Backward borrow/option at one's own(er) is
       legal but inert while inside the owner's subtree (wakes after reparenting); "my owner"
       is spelled ownedby. Lint inert edges later, maybe.
       Patterns the grammar gives:
@@ -93,7 +93,7 @@ Stuff I still want to do, roughly most-important first. Data safety before nice-
           Uniform delete at every level — no special root rules.
         - co-death: never mutual own; a shared owner owns both (Invoice owns Header + Summary).
         - pin without owning: borrow, optionally with an inverse view on the target.
-        - self-sufficient holder: weak + inverse view; canonical example a Log.
+        - self-sufficient holder: option + inverse view; canonical example a Log.
         - m2m: symmetric junction = two borrows (links deleted explicitly, by design);
           link-belongs-to-one-side = ownedby + borrow. SQL double-CASCADE (link auto-dies
           with either side) is unspellable — two owners, I4 forbids it.
@@ -107,7 +107,7 @@ Stuff I still want to do, roughly most-important first. Data safety before nice-
         - direct delete of an owned node is allowed: prune its subtree and shrink the owner's
           `own []*T` — EXCEPT under a non-nullable to-one `own`, which can't be left empty:
           delete the owner or swap in a replacement first.
-        - target-delete behavior is the role, not a flag: `borrow` = restrict, `weak` = setnull.
+        - target-delete behavior is the role, not a flag: `borrow` = restrict, `option` = setnull.
         - ALL instance checks deferred to commit: I4–I6, non-nil own/ownedby/borrow, veto,
           setnull.
 
