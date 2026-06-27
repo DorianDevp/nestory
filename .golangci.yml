@@ -1,0 +1,36 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+
+  settings:
+    gofumpt:
+      extra-rules: true
+
+linters:
+  default: standard
+  enable:
+    - wsl_v5
+    - whitespace
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+
+  settings:
+    wsl_v5:
+      default: none
+      enable:
+        - after-block
+        - leading-whitespace
+        - trailing-whitespace
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

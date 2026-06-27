@@ -5,6 +5,13 @@ import (
 	"reflect"
 )
 
+const (
+	Own string = "own"
+	OwnedBy string = "ownedby"
+	Borrow string = "borrow"
+	Option string = "option"
+)
+
 // fillRelation rebuilds the pointer graph for this base. relto fields get the
 // matching target instance; mapby fields get every child whose mapby field
 // equals this entity's Id. Every target must already be in entityRegistry.
@@ -13,11 +20,14 @@ func (db *DB[T]) fillRelation() {
 	mapFields := make(map[string]string)
 
 	t := reflect.TypeOf(*new(T))
+
 	for idx := range t.NumField() {
 		f := t.Field(idx)
+
 		if relto := f.Tag.Get("relto"); relto != "" {
 			relFields[f.Name] = relto
 		}
+
 		if mapby := f.Tag.Get("mapby"); mapby != "" {
 			mapFields[f.Name] = mapby
 		}

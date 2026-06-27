@@ -4,20 +4,6 @@ import (
 	"testing"
 )
 
-// Relation primitives exercised here:
-//   - relto: pointer field. Stored as a flattened FK column named <FieldName><Tag>
-//     in the gob schema. Used for O2O and M2O navigation.
-//   - mapby: slice-of-pointer field. Not stored. On load, resolved by scanning the
-//     target entity and matching <tag-field-on-child> == parent.Id. Used for O2M
-//     and as each side of an M2M (via a junction entity with two plain int FKs).
-//
-// Each test below defines its OWN entity types and registers only those. This is
-// deliberate: Open -> fillRelation walks every relto/mapby field on a type and
-// panics if a referenced target type was never registered. By giving each test a
-// tUser-shaped type carrying only the relation under test, we never register more
-// than the scenario needs. It also documents, per test, the exact schema that the
-// behaviour depends on.
-
 type o2oSettings struct {
 	Id    int `key:"primary"`
 	Theme string
@@ -168,7 +154,7 @@ func TestRelations(t *testing.T) {
 	runIsolated(t, "Borrower deletion does not affects owner", func(t *testing.T) {
 	})
 
-	runIsolated(t, "Weak relation after deleting relation insert null", func(t *testing.T) {
+	runIsolated(t, "Option relation after deleting relation insert null", func(t *testing.T) {
 	})
 
 	runIsolated(t, "Inverse insits on having two-way described relation", func(t *testing.T) {
@@ -180,7 +166,7 @@ func TestRelations(t *testing.T) {
 	runIsolated(t, "Inverse properly behaves on borrow", func(t *testing.T) {
 	})
 
-	runIsolated(t, "Inverse properly behaves on weak", func(t *testing.T) {
+	runIsolated(t, "Inverse properly behaves on option", func(t *testing.T) {
 	})
 
 	// Rules of relations
@@ -188,7 +174,7 @@ func TestRelations(t *testing.T) {
 	runIsolated(t, "Owned value can only be owned ONCE", func(t *testing.T) {
 	})
 
-	runIsolated(t, "Ownedby can only have own or weak relations", func(t *testing.T) {
+	runIsolated(t, "Ownedby can only have own or option relations", func(t *testing.T) {
 	})
 	
 }
