@@ -4,88 +4,44 @@ import (
 	"testing"
 )
 
-type o2oSettings struct {
-	Id    int `key:"primary"`
-	Theme string
+type user struct {
+	Id                   int `key:"primary"`
+	OwnedProfile	     *profile `rel:"own,Id"`
+	OptionsFavouritePost *post  `rel:"option,Id"`
+	InversedPosts        []*post `rel:"inverse,Author"`
 }
 
-func (s o2oSettings) GetId() int { return s.Id }
-
-type o2oProfile struct {
-	Id       int `key:"primary"`
-	Nickname string
-	Settings *o2oSettings `relto:"Id"`
+func (u user) GetId() int {
+	return u.Id
 }
 
-func (p o2oProfile) GetId() int { return p.Id }
-
-type o2oUser struct {
-	Id      int `key:"primary"`
-	Name    string
-	Profile *o2oProfile `relto:"Id"`
+type profile struct {
+	Id              int `key:"primary"`
+	BorrowedAvatar  *avatar `rel:"borrow,Id"`
 }
 
-func (u o2oUser) GetId() int { return u.Id }
+func (p profile) GetId() int {
+	return p.Id
+}
 
-type o2mPost struct {
+type post struct {
 	Id     int `key:"primary"`
-	UserId int // FK consumed by o2mUser.Posts mapby
 	Title  string
+	Author *user `rel:"option,Id"`
 }
 
-func (p o2mPost) GetId() int { return p.Id }
-
-type o2mUser struct {
-	Id    int `key:"primary"`
-	Name  string
-	Posts []*o2mPost `mapby:"UserId"`
+func (p post) GetId() int {
+	return p.Id
 }
 
-func (u o2mUser) GetId() int { return u.Id }
-
-type m2oUser struct {
+type avatar struct {
 	Id   int `key:"primary"`
-	Name string
+	Path string
 }
 
-func (u m2oUser) GetId() int { return u.Id }
-
-type m2oComment struct {
-	Id     int `key:"primary"`
-	Body   string
-	Author *m2oUser `relto:"Id"`
+func (a avatar) GetId() int {
+	return a.Id
 }
-
-func (c m2oComment) GetId() int { return c.Id }
-
-// A child cannot carry BOTH a plain int FK (for the parent's mapby) AND a relto
-// back-pointer to the same parent: both flatten to the same schema column (e.g.
-// "UserId") and reflect.StructOf panics on duplicate fields. So the junction holds
-// plain int FKs only, with no back-pointers.
-
-type m2mUserTag struct {
-	Id     int `key:"primary"`
-	UserId int
-	TagId  int
-}
-
-func (ut m2mUserTag) GetId() int { return ut.Id }
-
-type m2mTag struct {
-	Id       int `key:"primary"`
-	Label    string
-	UserTags []*m2mUserTag `mapby:"TagId"` // side B
-}
-
-func (t m2mTag) GetId() int { return t.Id }
-
-type m2mUser struct {
-	Id       int `key:"primary"`
-	Name     string
-	UserTags []*m2mUserTag `mapby:"UserId"` // side A
-}
-
-func (u m2mUser) GetId() int { return u.Id }
 
 func resetRegistries() {
 	storeRegistry = make(map[string]any)
@@ -100,19 +56,24 @@ func runIsolated(t *testing.T, name string, fn func(t *testing.T)) {
 		originalDir := DataDir
 		DataDir = t.TempDir()
 
-		resetRegistries()
-
 		t.Cleanup(func() {
 			DataDir = originalDir
 			resetRegistries()
+			mustRegister(t)
 		})
 
 		fn(t)
 	})
 }
 
-func mustRegister(t *testing.T, err error) {
+func mustRegister(t *testing.T) {
 	t.Helper()
+
+	err := Register[user]()
+	err = Register[profile]()
+	err = Register[post]()
+	err = Register[avatar]()
+
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -120,7 +81,9 @@ func mustRegister(t *testing.T, err error) {
 
 func save[T Entity](t *testing.T, db *DB[T], label string, e *T) {
 	t.Helper()
+
 	db.AddToPersistQueue(e)
+
 	if err := db.Flush(); err != nil {
 		t.Fatalf("save %s: %v", label, err)
 	}
@@ -136,12 +99,99 @@ func del[T Entity](t *testing.T, db *DB[T], label string, e *T) {
 	}
 }
 
+func seed(t *testing.T) {
+	t.Helper()
+
+	avt := avatar {
+		Id: 0,
+		Path: "/assets/user_avatar.jpg",
+	}
+
+	prf := profile{
+		Id: 0,
+		BorrowedAvatar: &avt,
+	}
+
+	usr := user{ 
+		Id: 0, 
+		OwnedProfile: &prf, 
+		OptionsFavouritePost: nil, 
+		InversedPosts: make([]*post, 0),
+	}
+
+	posts := []*post {
+		{ Id: 0, Title: "One", Author: &usr },
+	}
+
+	avatarDb := Open[avatar]()
+	profileDb := Open[profile]()
+	userDb := Open[user]()
+	postDb := Open[post]()
+
+	save(t, avatarDb, "avatar_test", &avt)
+	save(t, profileDb, "profile_test", &prf)
+	save(t, userDb, "user_test", &usr)
+	for _, p := range posts {
+		save(t, postDb, "post_test", p)
+	}
+}
+
 func TestRelations(t *testing.T) {
 	// General relation behaviour
+
+	// Happy paths
+	runIsolated(t, "Seeds work", func(t *testing.T) {
+		seed(t)
+
+		avatarDb := Open[avatar]()
+		profileDb := Open[profile]()
+		userDb := Open[user]()
+		postDb := Open[post]()
+
+		if avatarDb.counter > 0 {
+			t.Error("avatarDB not loaded")
+		}
+
+		if profileDb.counter > 0 {
+			t.Error("ProfileDB not loaded")
+		} else if prf, err := profileDb.Get(1); err != nil || prf.GetId() != 1 || prf.BorrowedAvatar == nil {
+			t.Error("incorrectly loaded profiles")
+		}
+
+		if userDb.counter > 0 {
+			t.Error("userDB not loaded")
+		} else if usr, err := userDb.Get(1); err != nil || usr.GetId() != 1 || len(usr.InversedPosts) < 1 {
+			t.Error("Incorrectly loaded user")
+		} 
+
+		if postDb.counter > 0 {
+			t.Error("postDB not loaded")
+		} else if post, err := postDb.Get(1); err != nil || post.GetId() != 1 || post.Author == nil {
+			t.Error("Incorrectly loaded post")
+		}
+	})
+
+	// Edge cases
+
 	runIsolated(t, "Owner throws error on empty relation", func(t *testing.T) {
+		userDb := Open[user]()
+
+		err := userDb.UpdateWithin(1, func (u *user) {
+			u.OwnedProfile = nil
+		})
+
+		err = userDb.Flush()
+
+		if err != nil {
+			t.Error(err)
+		}
 	})
 
 	runIsolated(t, "Owner cascadely deletes children", func(t *testing.T) {
+		userDb := Open[user]()
+		user, _ := userDb.Get(1)
+
+		del(t, userDb, "user_delete", user)
 	})
 
 	runIsolated(t, "Ownedby dies after parent", func(t *testing.T) {
