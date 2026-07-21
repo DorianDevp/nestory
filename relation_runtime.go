@@ -54,6 +54,10 @@ func (db *DB[T]) relationDeleteIDs() []int {
 }
 
 func (db *DB[T]) relationApplyPending() error {
+	if len(db.persistQueue) == 0 {
+		return nil
+	}
+
 	existing := make(map[int]bool, db.store.Len())
 	db.store.Range(func(p *T) { existing[(*p).GetId()] = true })
 	for _, entity := range db.persistQueue {
@@ -1094,6 +1098,16 @@ func flushRelations() error {
 	graphMu.Lock()
 	defer graphMu.Unlock()
 
+	runtimes := relationRuntimes()
+	hasRelations, err := registeredRelations(runtimes)
+	if err != nil {
+		return err
+	}
+
+	if !hasRelations {
+		return flushWithoutRelations(runtimes)
+	}
+
 	nodes, err := collectRelationNodes(true, nil)
 	if err != nil {
 		return err
@@ -1112,7 +1126,6 @@ func flushRelations() error {
 		return err
 	}
 
-	runtimes := relationRuntimes()
 	for _, runtime := range runtimes {
 		if err := runtime.relationApplyPending(); err != nil {
 			return err
@@ -1163,6 +1176,55 @@ func flushRelations() error {
 	}
 	if err := refreshCommittedOwnership(); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func registeredRelations(runtimes []relationRuntime) (bool, error) {
+	for _, runtime := range runtimes {
+		specs, err := relationSpecs(runtime.relationType())
+		if err != nil {
+			return false, err
+		}
+
+		if len(specs) > 0 {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func flushWithoutRelations(runtimes []relationRuntime) error {
+	for _, runtime := range runtimes {
+		if err := runtime.relationApplyPending(); err != nil {
+			return err
+		}
+	}
+
+	for _, runtime := range runtimes {
+		ids := runtime.relationDeleteIDs()
+		if len(ids) == 0 {
+			continue
+		}
+
+		deleted := make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			deleted[id] = struct{}{}
+		}
+
+		runtime.relationDelete(deleted)
+	}
+
+	for _, runtime := range runtimes {
+		if err := runtime.relationSave(); err != nil {
+			return err
+		}
+	}
+
+	for _, runtime := range runtimes {
+		runtime.relationClearQueues()
 	}
 
 	return nil
