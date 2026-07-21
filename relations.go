@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 // relationKind describes the lifecycle role of a relation. Cardinality is
@@ -57,6 +58,13 @@ type relationSpec struct {
 }
 
 var entityInterface = reflect.TypeFor[Entity]()
+
+type cachedRelationSpecs struct {
+	specs []relationSpec
+	err   error
+}
+
+var relationSpecsCache sync.Map
 
 func relationTarget(t reflect.Type) (target reflect.Type, many, ok bool) {
 	switch t.Kind() {
@@ -131,15 +139,22 @@ func relationSpecs(t reflect.Type) ([]relationSpec, error) {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
+	if cached, ok := relationSpecsCache.Load(t); ok {
+		result := cached.(cachedRelationSpecs)
+		return result.specs, result.err
+	}
 
 	if t.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("%w: entity %s is not a struct", ErrRelationSchema, t)
+		err := fmt.Errorf("%w: entity %s is not a struct", ErrRelationSchema, t)
+		relationSpecsCache.Store(t, cachedRelationSpecs{err: err})
+		return nil, err
 	}
 
 	out := make([]relationSpec, 0)
 	for i := range t.NumField() {
 		r, ok, err := parseRelationField(t, i)
 		if err != nil {
+			relationSpecsCache.Store(t, cachedRelationSpecs{err: err})
 			return nil, err
 		}
 
@@ -148,6 +163,7 @@ func relationSpecs(t reflect.Type) ([]relationSpec, error) {
 		}
 	}
 
+	relationSpecsCache.Store(t, cachedRelationSpecs{specs: out})
 	return out, nil
 }
 
