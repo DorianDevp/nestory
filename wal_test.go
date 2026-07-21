@@ -169,6 +169,66 @@ func TestReplayWALIgnoresTornTail(t *testing.T) {
 	}
 }
 
+func TestWALReplaysInsertAndDeleteWithoutSnapshot(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[walTestEntity](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[walTestEntity]()
+	inserted := walTestEntity{Id: 7, Name: "from-wal"}
+	row, err := encodeRow(reflect.ValueOf(inserted))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.wal.appendFrame(walFrame{Rows: []walRow{{Id: int64(inserted.Id), Row: row}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	resetRegistries()
+	if err := Register[walTestEntity](); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := Open[walTestEntity]()
+	got, err := reloaded.Get(inserted.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Name != inserted.Name {
+		t.Fatalf("replayed insert = %#v, want %#v", got, inserted)
+	}
+
+	if err := reloaded.wal.appendFrame(walFrame{Rows: []walRow{{Id: -int64(inserted.Id)}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	resetRegistries()
+	if err := Register[walTestEntity](); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := Open[walTestEntity]().Len(); got != 0 {
+		t.Fatalf("live rows after replayed delete = %d, want 0", got)
+	}
+}
+
+type walTestEntity struct {
+	Id   int
+	Name string
+}
+
+func (entity walTestEntity) GetId() int { return entity.Id }
+
 func TestComplexDirectSchemaWALSurvivesReload(t *testing.T) {
 	originalDir := DataDir
 	DataDir = t.TempDir()

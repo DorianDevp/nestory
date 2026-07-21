@@ -113,8 +113,9 @@ func (w *wal) truncate() error {
 }
 
 type recoveredRow struct {
-	id  int
-	row reflect.Value
+	id      int
+	row     reflect.Value
+	deleted bool
 }
 
 // replayWAL reads every committed frame in order. A torn tail (short read or
@@ -152,6 +153,15 @@ func replayWAL(path string, rowType reflect.Type) ([]recoveredRow, error) {
 		}
 
 		for _, p := range rows {
+			if p.Id < 0 && len(p.Row) == 0 {
+				out = append(out, recoveredRow{id: -int(p.Id), deleted: true})
+				continue
+			}
+
+			if p.Id <= 0 {
+				return nil, fmt.Errorf("nestory: malformed WAL row id %d", p.Id)
+			}
+
 			rv, derr := decodeRow(p.Row, rowType)
 			if derr != nil {
 				return nil, derr
