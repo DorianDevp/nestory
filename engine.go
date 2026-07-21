@@ -191,6 +191,8 @@ func (en *Engine) commit(transactionId txId) error {
 			for _, runtime := range relationRuntimes() {
 				runtime.relationRewire()
 			}
+
+			storeCommittedOwnership(model)
 		}
 	}
 

@@ -120,3 +120,72 @@ func TestUnsafeGetMissingEntity(t *testing.T) {
 		t.Fatalf("error = %v, want ErrNotFound", err)
 	}
 }
+
+func TestUnsafeDeleteOwnerUsesCommittedOwnershipTree(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		world := seedRuntime(t)
+		user, err := world.userDB.UnsafeGet(world.user.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		profile, err := world.profileDB.UnsafeGet(world.profile.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Destroy both in-memory descriptions of the edge. Flush must still know
+		// that Profile belonged to User in the last committed graph.
+		user.Profile = nil
+		profile.Owner = nil
+		if err := world.watcherDB.QueueDelete(world.watcher.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := world.userDB.QueueDelete(world.user.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := world.userDB.Flush(); err != nil {
+			t.Fatalf("delete owner after unsafe relation mutation: %v", err)
+		}
+
+		if world.userDB.Len() != 0 || world.profileDB.Len() != 0 || world.postDB.Len() != 0 {
+			t.Fatal("owner deletion did not remove its committed ownership subtree")
+		}
+
+		if world.assetDB.Len() != 1 || world.logDB.Len() != 1 {
+			t.Fatal("owner deletion removed non-owned entities")
+		}
+
+		log, err := world.logDB.FindOneBy("Id", world.log.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if log.User != nil {
+			t.Fatal("option into deleted ownership subtree was not cleared")
+		}
+	})
+}
+
+func TestUpdateWithinRejectsBrokenOwnershipBeforeWrite(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		world := seedRuntime(t)
+		err := world.userDB.UpdateWithin(world.user.Id, func(user *rtUser) {
+			user.Profile = nil
+		})
+		if err == nil {
+			t.Fatal("UpdateWithin accepted a broken ownership tree")
+		}
+
+		live, findErr := world.userDB.FindOneBy("Id", world.user.Id)
+		if findErr != nil {
+			t.Fatal(findErr)
+		}
+
+		if live.Profile == nil {
+			t.Fatal("failed safe update mutated the live ownership tree")
+		}
+	})
+}
