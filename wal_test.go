@@ -17,6 +17,8 @@ type walComplexRow struct {
 	Values []string
 }
 
+func (row walComplexRow) GetId() int { return row.Id }
+
 func TestWALRowCodecs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -164,5 +166,49 @@ func TestReplayWALIgnoresTornTail(t *testing.T) {
 	got := recovered[0].row.Interface().(walTestRow)
 	if got != first {
 		t.Fatalf("recovered row = %#v, want %#v", got, first)
+	}
+}
+
+func TestComplexDirectSchemaWALSurvivesReload(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[walComplexRow](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[walComplexRow]()
+	entity := &walComplexRow{Values: []string{"snapshot"}}
+	db.Unsafe().Create(entity)
+	if err := db.Unsafe().Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpdateWithin(entity.Id, func(row *walComplexRow) error {
+		row.Values = append(row.Values, "wal")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resetRegistries()
+	if err := Register[walComplexRow](); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := Open[walComplexRow]()
+	got, err := reloaded.Get(entity.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"snapshot", "wal"}
+	if !reflect.DeepEqual(got.Values, want) {
+		t.Fatalf("reloaded values = %#v, want %#v", got.Values, want)
 	}
 }

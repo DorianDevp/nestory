@@ -33,6 +33,7 @@ type DB[T Entity] struct {
 	indices      indexMap[[]*T] // o2m index (not populated yet)
 	index        indexMap[*T]   // o2o index, keyed by field then value
 	schemaFields [][2]string
+	directSchema bool
 	mu           sync.RWMutex
 	resById      map[int]*resourceSlot[T] // id → stable resourceSlot slot
 	wal          *wal                     // durability log for commits
@@ -102,6 +103,12 @@ func Open[T Entity]() *DB[T] {
 	initBase.resById = make(map[int]*resourceSlot[T])
 	initBase.snapshots = make(map[*T]detachedRoot[T])
 	initBase.schemaFields = initBase.createSchemaFields()
+	specs, err := relationSpecs(reflect.TypeFor[T]())
+	if err != nil {
+		panic(err)
+	}
+
+	initBase.directSchema = len(specs) == 0
 
 	if entity, ok := storeRegistry[name]; ok {
 		initBase.store = entity.(*chunkStore[T])
@@ -253,7 +260,13 @@ func (db *DB[T]) logWrites(items []pendingWrite) error {
 	rec := walFrame{Rows: make([]walRow, 0, len(items))}
 
 	for _, it := range items {
-		rowBytes, err := encodeRow(db.normalizeToSchema(*it.work.(*T)))
+		entity := *it.work.(*T)
+		row := reflect.ValueOf(entity)
+		if !db.directSchema {
+			row = db.normalizeToSchema(entity)
+		}
+
+		rowBytes, err := encodeRow(row)
 		if err != nil {
 			return err
 		}
