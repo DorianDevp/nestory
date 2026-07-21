@@ -453,15 +453,15 @@ func seedRuntime(t *testing.T) runtimeWorld {
 	w.user.Current = w.current
 	w.user.Favorite = w.favorite
 
-	w.assetDB.AddToPersistQueue(w.asset)
-	w.userDB.AddToPersistQueue(w.user)
-	w.profileDB.AddToPersistQueue(w.profile)
-	w.postDB.AddToPersistQueue(w.current)
-	w.postDB.AddToPersistQueue(w.favorite)
-	w.logDB.AddToPersistQueue(w.log)
-	w.watcherDB.AddToPersistQueue(w.watcher)
-	w.collectionDB.AddToPersistQueue(w.collection)
-	if err := w.userDB.Flush(); err != nil {
+	w.assetDB.Unsafe().Create(w.asset)
+	w.userDB.Unsafe().Create(w.user)
+	w.profileDB.Unsafe().Create(w.profile)
+	w.postDB.Unsafe().Create(w.current)
+	w.postDB.Unsafe().Create(w.favorite)
+	w.logDB.Unsafe().Create(w.log)
+	w.watcherDB.Unsafe().Create(w.watcher)
+	w.collectionDB.Unsafe().Create(w.collection)
+	if err := w.userDB.Unsafe().Flush(); err != nil {
 		t.Fatalf("seed Flush: %v", err)
 	}
 
@@ -478,7 +478,7 @@ func TestRelationsPersistAndRehydrateEveryRole(t *testing.T) {
 		watcherDB, collectionDB := Open[rtWatcher](), Open[rtCollection]()
 		userDB := Open[rtUser]()
 
-		user, err := userDB.FindOneBy("Id", 1)
+		user, err := userDB.Unsafe().Get(1)
 		if err != nil || user == nil {
 			t.Fatalf("load user: user=%v err=%v", user, err)
 		}
@@ -496,29 +496,29 @@ func TestRelationsPersistAndRehydrateEveryRole(t *testing.T) {
 		}
 
 		var current *rtPost
-		for _, candidate := range postDB.AllEntities() {
+		for _, candidate := range postDB.Unsafe().All() {
 			if candidate.Title == "current" {
 				current = candidate
 			}
 		}
 
 		if current == nil || len(current.Watchers) != 1 || current.Watchers[0].Post != current {
-			watcher, _ := watcherDB.FindOneBy("Id", 1)
+			watcher, _ := watcherDB.Unsafe().Get(1)
 			watcherCount := -1
 			if current != nil {
 				watcherCount = len(current.Watchers)
 			}
 
-			t.Fatalf("borrow inverse was not rebuilt: posts=%#v current=%p watchers=%d watcher=%#v", postDB.AllEntities(), current, watcherCount, watcher)
+			t.Fatalf("borrow inverse was not rebuilt: posts=%#v current=%p watchers=%d watcher=%#v", postDB.Unsafe().All(), current, watcherCount, watcher)
 		}
 
-		profile, _ := profileDB.FindOneBy("Id", 1)
-		asset, _ := assetDB.FindOneBy("Id", 1)
+		profile, _ := profileDB.Unsafe().Get(1)
+		asset, _ := assetDB.Unsafe().Get(1)
 		if profile.Avatar != asset {
 			t.Fatalf("borrow pointer is not canonical")
 		}
 
-		collection, _ := collectionDB.FindOneBy("Id", 1)
+		collection, _ := collectionDB.Unsafe().Get(1)
 		if len(collection.Borrowed) != 1 || len(collection.Optional) != 1 || collection.Borrowed[0] != asset || collection.Optional[0] != asset {
 			t.Fatalf("borrow/option slices were not rehydrated")
 		}
@@ -533,11 +533,11 @@ func TestRelationDeleteSemantics(t *testing.T) {
 	t.Run("to-one owned target cannot die alone", func(t *testing.T) {
 		isolatedRelations(t, func(t *testing.T) {
 			w := seedRuntime(t)
-			if err := w.profileDB.QueueDelete(w.profile.Id); err != nil {
+			if err := w.profileDB.Unsafe().Delete(w.profile.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			err := w.profileDB.Flush()
+			err := w.profileDB.Unsafe().Flush()
 			if !errors.Is(err, ErrDeleteRestricted) {
 				t.Fatalf("error=%v, want ErrDeleteRestricted", err)
 			}
@@ -547,11 +547,11 @@ func TestRelationDeleteSemantics(t *testing.T) {
 	t.Run("borrow blocks target deletion", func(t *testing.T) {
 		isolatedRelations(t, func(t *testing.T) {
 			w := seedRuntime(t)
-			if err := w.postDB.QueueDelete(w.current.Id); err != nil {
+			if err := w.postDB.Unsafe().Delete(w.current.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			err := w.postDB.Flush()
+			err := w.postDB.Unsafe().Flush()
 			if !errors.Is(err, ErrDeleteRestricted) {
 				t.Fatalf("error=%v, want ErrDeleteRestricted", err)
 			}
@@ -561,11 +561,11 @@ func TestRelationDeleteSemantics(t *testing.T) {
 	t.Run("borrower deletion leaves target alive", func(t *testing.T) {
 		isolatedRelations(t, func(t *testing.T) {
 			w := seedRuntime(t)
-			if err := w.watcherDB.QueueDelete(w.watcher.Id); err != nil {
+			if err := w.watcherDB.Unsafe().Delete(w.watcher.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := w.watcherDB.Flush(); err != nil {
+			if err := w.watcherDB.Unsafe().Flush(); err != nil {
 				t.Fatal(err)
 			}
 
@@ -582,11 +582,11 @@ func TestRelationDeleteSemantics(t *testing.T) {
 	t.Run("option nils and own slice shrinks", func(t *testing.T) {
 		isolatedRelations(t, func(t *testing.T) {
 			w := seedRuntime(t)
-			if err := w.postDB.QueueDelete(w.favorite.Id); err != nil {
+			if err := w.postDB.Unsafe().Delete(w.favorite.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := w.postDB.Flush(); err != nil {
+			if err := w.postDB.Unsafe().Flush(); err != nil {
 				t.Fatal(err)
 			}
 
@@ -604,15 +604,15 @@ func TestRelationDeleteSemantics(t *testing.T) {
 	t.Run("deep cascade ignores doomed borrowers and nulls surviving options", func(t *testing.T) {
 		isolatedRelations(t, func(t *testing.T) {
 			w := seedRuntime(t)
-			if err := w.watcherDB.QueueDelete(w.watcher.Id); err != nil {
+			if err := w.watcherDB.Unsafe().Delete(w.watcher.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := w.userDB.QueueDelete(w.user.Id); err != nil {
+			if err := w.userDB.Unsafe().Delete(w.user.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := w.userDB.Flush(); err != nil {
+			if err := w.userDB.Unsafe().Flush(); err != nil {
 				t.Fatal(err)
 			}
 
@@ -634,11 +634,11 @@ func TestRelationDeleteSemantics(t *testing.T) {
 	t.Run("borrow and option slices", func(t *testing.T) {
 		isolatedRelations(t, func(t *testing.T) {
 			w := seedRuntime(t)
-			if err := w.assetDB.QueueDelete(w.asset.Id); err != nil {
+			if err := w.assetDB.Unsafe().Delete(w.asset.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := w.assetDB.Flush(); !errors.Is(err, ErrDeleteRestricted) {
+			if err := w.assetDB.Unsafe().Flush(); !errors.Is(err, ErrDeleteRestricted) {
 				t.Fatalf("error=%v, want borrow veto", err)
 			}
 		})
@@ -656,10 +656,10 @@ func TestRelationInstanceInvariants(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			Open[schemaTarget]().AddToPersistQueue(&schemaTarget{})
+			Open[schemaTarget]().Unsafe().Create(&schemaTarget{})
 			ownerDB := Open[schemaOwnPtr]()
-			ownerDB.AddToPersistQueue(&schemaOwnPtr{})
-			if err := ownerDB.Flush(); !errors.Is(err, ErrRelationInvariant) {
+			ownerDB.Unsafe().Create(&schemaOwnPtr{})
+			if err := ownerDB.Unsafe().Flush(); !errors.Is(err, ErrRelationInvariant) {
 				t.Fatalf("error=%v, want invariant error", err)
 			}
 		})
@@ -677,8 +677,8 @@ func TestRelationInstanceInvariants(t *testing.T) {
 
 			childDB := Open[schemaOwnedBy]()
 			Open[schemaTarget]()
-			childDB.AddToPersistQueue(&schemaOwnedBy{})
-			if err := childDB.Flush(); !errors.Is(err, ErrRelationInvariant) {
+			childDB.Unsafe().Create(&schemaOwnedBy{})
+			if err := childDB.Unsafe().Flush(); !errors.Is(err, ErrRelationInvariant) {
 				t.Fatalf("error=%v, want invariant error", err)
 			}
 		})
@@ -696,8 +696,8 @@ func TestRelationInstanceInvariants(t *testing.T) {
 
 			Open[schemaTarget]()
 			borrowerDB := Open[schemaBorrowPtr]()
-			borrowerDB.AddToPersistQueue(&schemaBorrowPtr{})
-			if err := borrowerDB.Flush(); !errors.Is(err, ErrRelationInvariant) {
+			borrowerDB.Unsafe().Create(&schemaBorrowPtr{})
+			if err := borrowerDB.Unsafe().Flush(); !errors.Is(err, ErrRelationInvariant) {
 				t.Fatalf("error=%v, want invariant error", err)
 			}
 		})
@@ -716,8 +716,8 @@ func TestRelationInstanceInvariants(t *testing.T) {
 			Open[schemaTarget]()
 			db := Open[schemaOptionPtr]()
 			item := &schemaOptionPtr{Target: &schemaTarget{Id: 999}}
-			db.AddToPersistQueue(item)
-			if err := db.Flush(); err != nil {
+			db.Unsafe().Create(item)
+			if err := db.Unsafe().Flush(); err != nil {
 				t.Fatal(err)
 			}
 
@@ -742,10 +742,10 @@ func TestRelationInstanceInvariants(t *testing.T) {
 			child := &rtChild{}
 			first := &rtParent{Children: []*rtChild{child}}
 			second := &rtParent{Children: []*rtChild{child}}
-			childDB.AddToPersistQueue(child)
-			parentDB.AddToPersistQueue(first)
-			parentDB.AddToPersistQueue(second)
-			if err := parentDB.Flush(); !errors.Is(err, ErrRelationInvariant) {
+			childDB.Unsafe().Create(child)
+			parentDB.Unsafe().Create(first)
+			parentDB.Unsafe().Create(second)
+			if err := parentDB.Unsafe().Flush(); !errors.Is(err, ErrRelationInvariant) {
 				t.Fatalf("error=%v, want I4 error", err)
 			}
 		})
@@ -759,9 +759,9 @@ func TestRelationInstanceInvariants(t *testing.T) {
 
 			db := Open[rtNode]()
 			node := &rtNode{}
-			db.AddToPersistQueue(node)
+			db.Unsafe().Create(node)
 			node.Children = []*rtNode{node}
-			if err := db.Flush(); !errors.Is(err, ErrRelationInvariant) {
+			if err := db.Unsafe().Flush(); !errors.Is(err, ErrRelationInvariant) {
 				t.Fatalf("error=%v, want I5 error", err)
 			}
 		})
@@ -780,26 +780,26 @@ func TestRelationInstanceInvariants(t *testing.T) {
 			aDB, bDB := Open[rtBorrowA](), Open[rtBorrowB]()
 			a, b := &rtBorrowA{}, &rtBorrowB{}
 			a.B, b.A = b, a
-			aDB.AddToPersistQueue(a)
-			bDB.AddToPersistQueue(b)
-			if err := aDB.Flush(); err != nil {
+			aDB.Unsafe().Create(a)
+			bDB.Unsafe().Create(b)
+			if err := aDB.Unsafe().Flush(); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := aDB.QueueDelete(a.Id); err != nil {
+			if err := aDB.Unsafe().Delete(a.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := aDB.Flush(); !errors.Is(err, ErrDeleteRestricted) {
+			if err := aDB.Unsafe().Flush(); !errors.Is(err, ErrDeleteRestricted) {
 				t.Fatalf("single delete error=%v", err)
 			}
 
 			// Failed commits retain their queues; adding B makes the final D contain both.
-			if err := bDB.QueueDelete(b.Id); err != nil {
+			if err := bDB.Unsafe().Delete(b.Id); err != nil {
 				t.Fatal(err)
 			}
 
-			if err := bDB.Flush(); err != nil {
+			if err := bDB.Unsafe().Flush(); err != nil {
 				t.Fatalf("co-death: %v", err)
 			}
 

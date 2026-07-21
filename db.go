@@ -1,7 +1,6 @@
 package nestory
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -10,13 +9,12 @@ import (
 )
 
 // Entity is the contract every persisted struct must satisfy. Id is the primary
-// key; auto-assigned on AddToPersistQueue if left zero.
+// key; auto-assigned on Create if left zero.
 type Entity interface {
 	GetId() int
 }
 
-// IndexMap: field name → field value → result. Indices for o2m, Index for o2o.
-type IndexMap[T any] map[string]map[any]T
+type indexMap[T any] map[string]map[any]T
 
 // DB is the in-memory state for one entity type. Construct via [Open].
 type DB[T Entity] struct {
@@ -26,26 +24,26 @@ type DB[T Entity] struct {
 	store        *chunkStore[T]
 	persistQueue []*T
 	deleteQueue  []*T
-	indices      IndexMap[[]*T] // o2m index (not populated yet)
-	index        IndexMap[*T]   // o2o index, keyed by field then value
+	indices      indexMap[[]*T] // o2m index (not populated yet)
+	index        indexMap[*T]   // o2o index, keyed by field then value
 	schemaFields [][2]string
 	mu           sync.RWMutex
-	resById      map[int]*Resource[T] // id → stable Resource slot
-	wal          *wal                 // durability log for commits
+	resById      map[int]*resourceSlot[T] // id → stable resourceSlot slot
+	wal          *wal                     // durability log for commits
 }
 
 var _ committer = (*DB[Entity])(nil)
 
 // Len returns the number of live entities.
-func (db *DB[T]) Len() int { return db.store.Len() }
+func (db *DB[T]) Len() int {
+	graphMu.RLock()
+	defer graphMu.RUnlock()
 
-// AllEntities returns stable pointers to every live entity, valid for the base's life.
-func (db *DB[T]) AllEntities() []*T { return db.store.StorePointers() }
+	return db.store.Len()
+}
 
 // DataDir is where every base writes its files. Override before [Register].
 var DataDir = "./data"
-
-var ErrEmptyEntity = errors.New("empty entity")
 
 var (
 	baseRegistry  = make(map[string]any)
@@ -91,9 +89,9 @@ func Open[T Entity]() *DB[T] {
 	initBase := &DB[T]{identifier: "Id"}
 
 	initBase.name = name
-	initBase.indices = make(IndexMap[[]*T])
-	initBase.index = make(IndexMap[*T])
-	initBase.resById = make(map[int]*Resource[T])
+	initBase.indices = make(indexMap[[]*T])
+	initBase.index = make(indexMap[*T])
+	initBase.resById = make(map[int]*resourceSlot[T])
 	initBase.schemaFields = initBase.createSchemaFields()
 
 	if entity, ok := storeRegistry[name]; ok {
@@ -115,10 +113,10 @@ func Open[T Entity]() *DB[T] {
 	return initBase
 }
 
-// syncResById rebuilds resById from the store. Called once from [Open]; [Add]
-// keeps it in step thereafter and [Flush] drops deleted ids.
+// syncResById rebuilds resById from the store. Called once from Open; commits
+// keep it in step thereafter and structural deletes drop removed ids.
 func (db *DB[T]) syncResById() {
-	db.store.rangeResources(func(r *Resource[T]) {
+	db.store.rangeResources(func(r *resourceSlot[T]) {
 		db.resById[(*r.item).GetId()] = r
 	})
 }
@@ -136,9 +134,7 @@ func (db *DB[T]) seedCounter() {
 	db.counter = maxId
 }
 
-// SetId writes id into the entity's Id field. Used by AddToPersistQueue;
-// exported for callers that pre-assign Ids.
-func SetId[T any](entity *T, id int) {
+func setID[T any](entity *T, id int) {
 	val := reflect.ValueOf(entity)
 
 	if val.Kind() != reflect.Pointer || val.IsNil() {
@@ -171,9 +167,9 @@ func (db *DB[T]) TypeName() string {
 	return reflect.TypeOf(t).Name()
 }
 
-// resource resolves the stable Resource slot for id, guarding resById against
+// resource resolves the stable resourceSlot slot for id, guarding resById against
 // a concurrent Add. The returned pointer is stable for the store's life.
-func (db *DB[T]) resource(id int) (*Resource[T], bool) {
+func (db *DB[T]) resource(id int) (*resourceSlot[T], bool) {
 	db.mu.RLock()
 	r, ok := db.resById[id]
 	db.mu.RUnlock()
@@ -181,7 +177,7 @@ func (db *DB[T]) resource(id int) (*Resource[T], bool) {
 	return r, ok
 }
 
-// committer — driven by the Engine. lockResource/unlockResource own the per-row
+// committer — driven by the transactionEngine. lockResource/unlockResource own the per-row
 // mutex; the rest assume it's already held.
 
 func (db *DB[T]) lockResource(id int) {
@@ -237,7 +233,7 @@ func (db *DB[T]) logWrites(items []pendingWrite) error {
 	rec := walFrame{Rows: make([]walRow, 0, len(items))}
 
 	for _, it := range items {
-		rowBytes, err := encodeRow(db.NormalizeToSchema(*it.work.(*T)))
+		rowBytes, err := encodeRow(db.normalizeToSchema(*it.work.(*T)))
 		if err != nil {
 			return err
 		}
@@ -246,10 +242,4 @@ func (db *DB[T]) logWrites(items []pendingWrite) error {
 	}
 
 	return db.wal.appendFrame(rec)
-}
-
-// DiscardSnapshot drops the transaction behind a snapshot from [DB.Get] without
-// committing it. Call it when you took a snapshot but decided not to write back.
-func (db *DB[T]) DiscardSnapshot(snapshot *T) {
-	engine.discardByPtr(snapshot)
 }

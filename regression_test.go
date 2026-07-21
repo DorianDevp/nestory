@@ -37,7 +37,7 @@ func TestRegression_BatchQueueAssignsDistinctIds(t *testing.T) {
 
 	// Queue all four before any Flush — what the old code mishandled.
 	for _, it := range items {
-		db.AddToPersistQueue(it)
+		db.Unsafe().Create(it)
 	}
 
 	seen := map[int]bool{}
@@ -58,7 +58,7 @@ func TestRegression_BatchQueueAssignsDistinctIds(t *testing.T) {
 		t.Errorf("expected 4 distinct Ids, got %d (set=%v)", len(seen), seen)
 	}
 
-	if err := db.Flush(); err != nil {
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -81,16 +81,16 @@ func TestRegression_QueueRespectsExistingMaxId(t *testing.T) {
 	db := Open[bqItem]()
 
 	for i := 0; i < 3; i++ {
-		db.AddToPersistQueue(&bqItem{Name: "batch1"})
+		db.Unsafe().Create(&bqItem{Name: "batch1"})
 	}
 
-	if err := db.Flush(); err != nil {
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("first Flush: %v", err)
 	}
 
 	// Second batch starts from 4, not 1.
 	second := &bqItem{Name: "batch2"}
-	db.AddToPersistQueue(second)
+	db.Unsafe().Create(second)
 	if second.Id != 4 {
 		t.Errorf("second batch first Id: got %d, want 4", second.Id)
 	}
@@ -112,10 +112,10 @@ func TestRegression_CounterSeededAfterReload(t *testing.T) {
 	Register[bqItem]()
 	db := Open[bqItem]()
 	for i := 0; i < 3; i++ {
-		db.AddToPersistQueue(&bqItem{Name: "seed"})
+		db.Unsafe().Create(&bqItem{Name: "seed"})
 	}
 
-	if err := db.Flush(); err != nil {
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("seed flush: %v", err)
 	}
 
@@ -125,12 +125,12 @@ func TestRegression_CounterSeededAfterReload(t *testing.T) {
 	db2 := Open[bqItem]()
 
 	fresh := &bqItem{Name: "after-reload"}
-	db2.AddToPersistQueue(fresh)
+	db2.Unsafe().Create(fresh)
 	if fresh.Id != 4 {
 		t.Fatalf("after reload, next id = %d, want 4 (counter must seed from max persisted id)", fresh.Id)
 	}
 
-	if err := db2.Flush(); err != nil {
+	if err := db2.Unsafe().Flush(); err != nil {
 		t.Fatalf("post-reload flush: %v", err)
 	}
 
@@ -154,8 +154,8 @@ func TestRegression_SaveIsAtomic_NoLeftoverTmp(t *testing.T) {
 	Register[bqItem]()
 	db := Open[bqItem]()
 
-	db.AddToPersistQueue(&bqItem{Name: "ok"})
-	if err := db.Flush(); err != nil {
+	db.Unsafe().Create(&bqItem{Name: "ok"})
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
@@ -191,8 +191,8 @@ func TestRegression_SaveOverwritePreservesPrevOnNewWrite(t *testing.T) {
 	Register[bqItem]()
 	db := Open[bqItem]()
 
-	db.AddToPersistQueue(&bqItem{Name: "v1"})
-	if err := db.Flush(); err != nil {
+	db.Unsafe().Create(&bqItem{Name: "v1"})
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("first Flush: %v", err)
 	}
 
@@ -204,8 +204,8 @@ func TestRegression_SaveOverwritePreservesPrevOnNewWrite(t *testing.T) {
 	}
 
 	// v2 — both rows live in chunk 0, rewritten in place.
-	db.AddToPersistQueue(&bqItem{Name: "v2"})
-	if err := db.Flush(); err != nil {
+	db.Unsafe().Create(&bqItem{Name: "v2"})
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("second Flush: %v", err)
 	}
 

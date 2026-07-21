@@ -32,15 +32,18 @@ func TestWAL_CommitSurvivesReloadWithoutFlush(t *testing.T) {
 	db := Open[tCounter]()
 
 	c := &tCounter{N: 10}
-	db.AddToPersistQueue(c)
-	if err := db.Flush(); err != nil { // snapshot N=10, WAL empty
+	db.Unsafe().Create(c)
+	if err := db.Unsafe().Flush(); err != nil { // snapshot N=10, WAL empty
 		t.Fatal(err)
 	}
 
 	id := c.Id
 
 	// no Flush — durability must come from the WAL alone
-	if err := db.UpdateWithin(id, func(c *tCounter) { c.N = 99 }); err != nil {
+	if err := db.UpdateWithin(id, func(c *tCounter) error {
+		c.N = 99
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -55,8 +58,6 @@ func TestWAL_CommitSurvivesReloadWithoutFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	db2.DiscardSnapshot(got)
 
 	if got.N != 99 {
 		t.Fatalf("after reload N=%d, want 99 (WAL not replayed over snapshot)", got.N)
@@ -82,8 +83,8 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 	db := Open[tCounter]()
 
 	c := &tCounter{}
-	db.AddToPersistQueue(c)
-	if err := db.Flush(); err != nil {
+	db.Unsafe().Create(c)
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -99,7 +100,10 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
 				// UpdateWithin retries ErrConflict internally — a non-nil return is real.
-				if err := db.UpdateWithin(id, func(c *tCounter) { c.N++ }); err != nil {
+				if err := db.UpdateWithin(id, func(c *tCounter) error {
+					c.N++
+					return nil
+				}); err != nil {
 					panic(err)
 				}
 			}
@@ -112,8 +116,6 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	db.DiscardSnapshot(got)
 
 	if want := goroutines * perG; got.N != want {
 		t.Fatalf("counter = %d, want %d (lost updates)", got.N, want)

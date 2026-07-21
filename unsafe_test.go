@@ -17,22 +17,22 @@ func TestUnsafeGetPersistsLiveMutation(t *testing.T) {
 
 	db := Open[bqItem]()
 	item := &bqItem{Name: "cold"}
-	db.AddToPersistQueue(item)
-	if err := db.Flush(); err != nil {
+	db.Unsafe().Create(item)
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatal(err)
 	}
 
-	live, err := db.UnsafeGet(item.Id)
+	live, err := db.Unsafe().Get(item.Id)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if live != db.AllEntities()[0] {
+	if live != db.Unsafe().All()[0] {
 		t.Fatal("UnsafeGet returned a copy instead of the stable store pointer")
 	}
 
 	allocs := testing.AllocsPerRun(1_000, func() {
-		_, _ = db.UnsafeGet(item.Id)
+		_, _ = db.Unsafe().Get(item.Id)
 	})
 	if allocs != 0 {
 		t.Fatalf("UnsafeGet allocations = %v, want 0", allocs)
@@ -43,7 +43,7 @@ func TestUnsafeGetPersistsLiveMutation(t *testing.T) {
 		t.Fatal("unsafe mutation was not immediately visible")
 	}
 
-	if err := db.Flush(); err != nil {
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -65,14 +65,14 @@ func TestUnsafeGetPersistsLiveMutation(t *testing.T) {
 func TestUnsafeGetValidatesRelationsAtFlush(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)
-		live, err := world.userDB.UnsafeGet(world.user.Id)
+		live, err := world.userDB.Unsafe().Get(world.user.Id)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		profile := live.Profile
 		live.Profile = nil
-		if err := world.userDB.Flush(); err == nil {
+		if err := world.userDB.Unsafe().Flush(); err == nil {
 			t.Fatal("Flush accepted a nil required own relation")
 		}
 
@@ -81,23 +81,23 @@ func TestUnsafeGetValidatesRelationsAtFlush(t *testing.T) {
 		}
 
 		live.Profile = profile
-		if err := world.userDB.Flush(); err != nil {
+		if err := world.userDB.Unsafe().Flush(); err != nil {
 			t.Fatalf("Flush after repairing live relation: %v", err)
 		}
 
-		ownedProfile, err := world.profileDB.UnsafeGet(profile.Id)
+		ownedProfile, err := world.profileDB.Unsafe().Get(profile.Id)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		owner := ownedProfile.Owner
 		ownedProfile.Owner = nil
-		if err := world.profileDB.Flush(); err == nil {
+		if err := world.profileDB.Unsafe().Flush(); err == nil {
 			t.Fatal("Flush inferred a nil required ownedby relation from own")
 		}
 
 		ownedProfile.Owner = owner
-		if err := world.profileDB.Flush(); err != nil {
+		if err := world.profileDB.Unsafe().Flush(); err != nil {
 			t.Fatalf("Flush after repairing ownedby relation: %v", err)
 		}
 	})
@@ -116,7 +116,7 @@ func TestUnsafeGetMissingEntity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open[bqItem]().UnsafeGet(404); err != ErrNotFound {
+	if _, err := Open[bqItem]().Unsafe().Get(404); err != ErrNotFound {
 		t.Fatalf("error = %v, want ErrNotFound", err)
 	}
 }
@@ -124,12 +124,12 @@ func TestUnsafeGetMissingEntity(t *testing.T) {
 func TestUnsafeDeleteOwnerUsesCommittedOwnershipTree(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)
-		user, err := world.userDB.UnsafeGet(world.user.Id)
+		user, err := world.userDB.Unsafe().Get(world.user.Id)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		profile, err := world.profileDB.UnsafeGet(world.profile.Id)
+		profile, err := world.profileDB.Unsafe().Get(world.profile.Id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -138,15 +138,15 @@ func TestUnsafeDeleteOwnerUsesCommittedOwnershipTree(t *testing.T) {
 		// that Profile belonged to User in the last committed graph.
 		user.Profile = nil
 		profile.Owner = nil
-		if err := world.watcherDB.QueueDelete(world.watcher.Id); err != nil {
+		if err := world.watcherDB.Unsafe().Delete(world.watcher.Id); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := world.userDB.QueueDelete(world.user.Id); err != nil {
+		if err := world.userDB.Unsafe().Delete(world.user.Id); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := world.userDB.Flush(); err != nil {
+		if err := world.userDB.Unsafe().Flush(); err != nil {
 			t.Fatalf("delete owner after unsafe relation mutation: %v", err)
 		}
 
@@ -172,8 +172,9 @@ func TestUnsafeDeleteOwnerUsesCommittedOwnershipTree(t *testing.T) {
 func TestUpdateWithinRejectsBrokenOwnershipBeforeWrite(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)
-		err := world.userDB.UpdateWithin(world.user.Id, func(user *rtUser) {
+		err := world.userDB.UpdateWithin(world.user.Id, func(user *rtUser) error {
 			user.Profile = nil
+			return nil
 		})
 		if err == nil {
 			t.Fatal("UpdateWithin accepted a broken ownership tree")

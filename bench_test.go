@@ -43,14 +43,14 @@ func newBenchDB(tb testing.TB, n int) *DB[benchItem] {
 	Register[benchItem]()
 	db := Open[benchItem]()
 	for i := 0; i < n; i++ {
-		db.AddToPersistQueue(&benchItem{
+		db.Unsafe().Create(&benchItem{
 			Name:  fmt.Sprintf("user-%d", i),
 			Email: fmt.Sprintf("user-%d@example.com", i),
 			Age:   i % 90,
 		})
 	}
 
-	if err := db.Flush(); err != nil {
+	if err := db.Unsafe().Flush(); err != nil {
 		tb.Fatalf("seed flush: %v", err)
 	}
 
@@ -83,10 +83,10 @@ func BenchmarkBatchInsertFlush(b *testing.B) {
 				b.StartTimer()
 
 				for _, it := range items {
-					db.AddToPersistQueue(it)
+					db.Unsafe().Create(it)
 				}
 
-				_ = db.Flush()
+				_ = db.Unsafe().Flush()
 			}
 		})
 	}
@@ -101,7 +101,7 @@ func BenchmarkFlushAtSize(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_ = db.Flush()
+				_ = db.Unsafe().Flush()
 			}
 		})
 	}
@@ -116,7 +116,7 @@ func BenchmarkAddToPersistQueue(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				db.AddToPersistQueue(&benchItem{Name: "x"})
+				db.Unsafe().Create(&benchItem{Name: "x"})
 			}
 		})
 	}
@@ -132,7 +132,10 @@ func BenchmarkPointWrite(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_ = db.UpdateWithin(id, func(it *benchItem) { it.Age = i % 90 })
+				_ = db.UpdateWithin(id, func(it *benchItem) error {
+					it.Age = i % 90
+					return nil
+				})
 			}
 		})
 	}

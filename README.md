@@ -18,32 +18,81 @@ nestory.Register[Profile]()
 nestory.Register[Post]()
 nestory.Register[User]()
 
-db := nestory.Open[User]()
-u, _ := db.FindOneBy("Id", 1)
+// Open every type participating in writable ownership branches.
+nestory.Open[Settings]()
+nestory.Open[Profile]()
+nestory.Open[Post]()
+users := nestory.Open[User]()
+u, _ := users.Get(1)
 
 u.Profile.Settings.Theme // already wired, no second lookup
 u.Posts[0].Title         // slice already filled
 ```
 
-Writes go through an optimistic transaction:
+`Get` returns a detached branch: the root and its complete `own` subtree are
+transaction-local copies. A flat branch is merged explicitly:
 
 ```go
-// snapshot -> mutate a detached copy -> commit
-db.UpdateWithin(1, func(u *User) { u.Name = "bob" })
+u, _ := users.Get(1)
+u.Name = "bob"
+u.Profile.Theme = "dark"
+err := users.Update(u)
 ```
 
-First commit wins; a concurrent one gets `ErrConflict` and a refreshed snapshot.
+For natural struct editing across several operations, `Transaction` detects
+changes automatically and commits the callback's final graph once:
 
-For exclusive, latency-sensitive work, `UnsafeGet` exposes the stable pointer in
+```go
+err := users.Transaction(func(tx *nestory.Tx[User]) error {
+    u, err := tx.Get(1)
+    if err != nil {
+        return err
+    }
+
+    u.Name = "bob"
+    u.Profile.Theme = "dark"
+
+    if err := tx.Create(&anotherUser); err != nil {
+        return err
+    }
+    return tx.Delete(oldUserID)
+})
+```
+
+There is no `tx.Update`: every branch loaded by the context is compared with its
+starting snapshot. `UpdateWithin` is the short, retrying form for one aggregate:
+
+```go
+err := users.UpdateWithin(1, func(u *User) error {
+    u.Name = "bob"
+    return nil
+})
+```
+
+The callback may run again after `ErrConflict`, so it must express intent without
+external side effects. Cross-type work joins the same context explicitly:
+
+```go
+err := users.Transaction(func(tx *nestory.Tx[User]) error {
+    logs := logDB.Join(tx)
+    if err := logs.Delete(logID); err != nil {
+        return err
+    }
+    return tx.Delete(userID)
+})
+```
+
+For exclusive, latency-sensitive work, `Unsafe` exposes the stable pointer in
 the live store without a snapshot or transaction bookkeeping:
 
 ```go
-u, _ := db.UnsafeGet(1)
+unsafe := users.Unsafe()
+u, _ := unsafe.Get(1)
 u.Name = "bob" // visible immediately
-err := db.Flush()
+err := unsafe.Flush()
 ```
 
-`UnsafeGet` marks the containing chunk dirty, so `Flush` persists direct
+`Unsafe().Get` marks the containing chunk dirty, so `Flush` persists direct
 mutations and validates the final relation graph. It deliberately provides no
 isolation, locking or rollback: the caller must guarantee exclusive access, and
 a rejected `Flush` leaves the invalid live mutation in memory until it is fixed.
@@ -517,14 +566,15 @@ your weekend project
 - RAM-speed reads — O(1) `Id` lookups, contiguous scans.
   badger on point read and scan by a wide margin (`bench/compare`).
 - Per-chunk durable writes; durable single-row write ~9µs (WAL).
-- OCC transaction path (`Get` / `Update` / `UpdateWithin`) is goroutine-safe,
-  race-tested.
+- OCC branches and callback transactions are goroutine-safe and race-tested.
+- Transaction callbacks edit normal structs; one callback produces at most one
+  commit, regardless of how many branches, creates, and deletes it contains.
 
 **Not there yet:**
-- Not fully ACID. Per-chunk `Flush` isn't cross-chunk atomic; the WAL is
-  per-type so a cross-type transaction isn't atomic either. Isolation only
-  covers the transaction path — `FindOneBy` / `Filter` / `Flush` still assume a
-  single goroutine.
+- Not fully ACID. Structural commits and unsafe `Flush` are not cross-chunk
+  atomic; the WAL is per-type, so a cross-type update is not crash-atomic.
+- `Filter` and every method under `Unsafe` require external synchronization when
+  used alongside writers.
 - Dataset must fit in RAM (target < 100 MB).
 - Non-`Id` queries are full scans.
 - Field rename breaks the gob files until schema migration lands.

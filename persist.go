@@ -3,131 +3,71 @@ package nestory
 import (
 	"errors"
 	"fmt"
-	"reflect"
 )
 
 var ErrAlreadyExists = errors.New("nestory: entity already exists")
 
-// Add appends entity and points the Id index at the store's stable slot, not
-// the caller's pointer. Used by Flush; prefer AddToPersistQueue + Flush.
-func (db *DB[T]) Add(entity *T) {
+func (db *DB[T]) add(entity *T) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	res := db.store.Append(*entity)
-	id := (*res.item).GetId()
-	db.index["Id"][id] = res.item
-	db.resById[id] = res
+	resource := db.store.Append(*entity)
+	id := (*resource.item).GetId()
+	db.index["Id"][id] = resource.item
+	db.resById[id] = resource
 }
 
-// AddToPersistQueue stages entity for the next Flush. Zero Id → auto-assigned.
-// An explicit Id that already exists (persisted or queued) is a no-op.
-func (db *DB[T]) AddToPersistQueue(entity *T) {
+// Create persists entity and its new ownership subtree in one short
+// transaction. Use Transaction to batch it with more work.
+func (db *DB[T]) Create(entity *T) error {
+	return db.Transaction(func(tx *Tx[T]) error {
+		return tx.Create(entity)
+	})
+}
+
+// Delete removes id and its complete owned subtree in one short transaction.
+// Use Transaction and Join to combine it with operations on other entity types.
+func (db *DB[T]) Delete(id int) error {
+	return db.Transaction(func(tx *Tx[T]) error {
+		return tx.Delete(id)
+	})
+}
+
+// The queue remains an internal adapter for unsafe Flush while that path is
+// intentionally live and non-transactional.
+func (db *DB[T]) queueCreate(entity *T) {
 	id := (*entity).GetId()
 	if id == 0 {
-		db.counter += 1
-		SetId(entity, db.counter)
+		db.counter++
+		setID(entity, db.counter)
 		db.persistQueue = append(db.persistQueue, entity)
-
 		return
 	}
-
-	// explicit Id — accept it, but dedupe against persisted + queued.
 	if existing := db.index[db.identifier][id]; existing != nil {
 		return
 	}
-
-	for _, q := range db.persistQueue {
-		if (*q).GetId() == id {
+	for _, queued := range db.persistQueue {
+		if (*queued).GetId() == id {
 			return
 		}
 	}
-
 	db.persistQueue = append(db.persistQueue, entity)
 }
 
-// ResetpersistQueue empties the persist queue without saving.
-func (db *DB[T]) ResetpersistQueue() {
-	db.persistQueue = []*T{}
-}
+func (db *DB[T]) resetPersistQueue() { db.persistQueue = []*T{} }
 
-// QueueDelete marks the entity with id for removal on next Flush. No-op if queued.
-func (db *DB[T]) QueueDelete(id any) error {
+func (db *DB[T]) queueDelete(id int) error {
 	instance, ok := db.index["Id"][id]
 	if !ok {
-		return fmt.Errorf("There is no item with given Id %d\n", id)
+		return fmt.Errorf("%w: %s(%d)", ErrNotFound, db.name, id)
 	}
-
-	for _, q := range db.deleteQueue {
-		if (*q).GetId() == id {
+	for _, queued := range db.deleteQueue {
+		if (*queued).GetId() == id {
 			return nil
 		}
 	}
-
 	db.deleteQueue = append(db.deleteQueue, instance)
-
 	return nil
 }
 
-func (db *DB[T]) resetDeleteQueue() {
-	db.deleteQueue = []*T{}
-}
-
-// PatchById applies non-zero, non-primary fields from item onto the instance
-// with id.
-func (db *DB[T]) PatchById(id any, item T) (*T, error) {
-	baseInstance, ok := db.index["Id"][id]
-	if !ok {
-		return nil, fmt.Errorf("There is no item with given Id %d\n", id)
-	}
-
-	if err := merge(baseInstance, item); err != nil {
-		return nil, err
-	}
-
-	if r, ok := db.resById[(*baseInstance).GetId()]; ok {
-		db.store.markDirty(r.chunk)
-	}
-
-	return baseInstance, nil
-}
-
-// Flush applies the persist queue (inserts or patches), then the delete queue,
-// then writes every dirty chunk to disk.
-func (db *DB[T]) Flush() error {
-	return flushRelations()
-}
-
-// merge copies non-zero fields from merger into target, skipping key:"primary".
-func merge[T any](target *T, merger T) error {
-	targetVal := reflect.ValueOf(target).Elem()
-	mergerVal := reflect.ValueOf(merger)
-	mergerType := reflect.TypeOf(merger)
-
-	if targetVal.Kind() != reflect.Struct || mergerVal.Kind() != reflect.Struct {
-		return fmt.Errorf("merge: target and merger must be structs")
-	}
-
-	for i := range mergerVal.NumField() {
-		mergerField := mergerVal.Field(i)
-		mergerFieldType := mergerType.Field(i)
-
-		targetField := targetVal.FieldByName(mergerFieldType.Name)
-		fieldKeyType := mergerFieldType.Tag.Get("key")
-
-		if fieldKeyType == "primary" || !targetField.CanSet() {
-			continue
-		}
-
-		if targetField.Kind() == reflect.Pointer && !mergerField.IsNil() {
-			targetField.Set(mergerField)
-			continue
-		}
-
-		if !mergerField.IsZero() {
-			targetField.Set(mergerField)
-		}
-	}
-
-	return nil
-}
+func (db *DB[T]) resetDeleteQueue() { db.deleteQueue = []*T{} }
