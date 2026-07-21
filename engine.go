@@ -112,6 +112,7 @@ func (en *transactionEngine) stageCreate(tx txId, created createdResource) error
 	if _, active := en.txs[tx]; !active {
 		return ErrExpiredSnapshot
 	}
+
 	if _, duplicate := en.creates[tx][created.key]; duplicate {
 		return fmt.Errorf("%w: %s", ErrAlreadyExists, created.key)
 	}
@@ -179,10 +180,12 @@ func (en *transactionEngine) commit(transactionId txId) error {
 	for key, created := range en.creates[transactionId] {
 		createdResources[key] = created
 	}
+
 	stagedDeletes := make(map[nodeKey]stagedDelete, len(en.deletes[transactionId]))
 	for key, deleted := range en.deletes[transactionId] {
 		stagedDeletes[key] = deleted
 	}
+
 	en.mu.Unlock()
 
 	if !active {
@@ -202,6 +205,7 @@ func (en *transactionEngine) commit(transactionId txId) error {
 	if err != nil {
 		return err
 	}
+
 	for key := range createdResources {
 		if _, exists := committerFor(key.typ.Name()).resourceVersion(key.id); exists {
 			return fmt.Errorf("%w: %s", ErrAlreadyExists, key)
@@ -261,6 +265,7 @@ func (en *transactionEngine) commit(transactionId txId) error {
 	for _, e := range touchedResources {
 		committerFor(e.dbName).applyWrite(e.id, e.work)
 	}
+
 	for _, created := range createdResources {
 		runtime := baseRegistry[created.key.typ.Name()].(relationRuntime)
 		runtime.relationApplyCreate(created.work)
@@ -270,10 +275,12 @@ func (en *transactionEngine) commit(transactionId txId) error {
 	if err != nil {
 		return err
 	}
+
 	model, err := buildRelationModel(nodes)
 	if err != nil {
 		return err
 	}
+
 	reconcileRelations(model, deleted)
 	applyDeletedNodes(deleted)
 	for _, runtime := range relationRuntimes() {
@@ -304,6 +311,7 @@ func logTransactionWrites(resources []touchedResource) error {
 		if _, seen := byDBName[resource.dbName]; !seen {
 			order = append(order, resource.dbName)
 		}
+
 		byDBName[resource.dbName] = append(byDBName[resource.dbName], pendingWrite{id: resource.id, work: resource.work})
 	}
 
@@ -387,6 +395,7 @@ func validateTransactionGraph(resources []touchedResource, creates map[nodeKey]c
 		key := nodeKey{typ: runtime.relationType(), id: resource.id}
 		overrides[key] = relationGraphNode{key: key, value: reflect.ValueOf(resource.work)}
 	}
+
 	for key, created := range creates {
 		overrides[key] = relationGraphNode{key: key, value: created.work}
 	}
@@ -405,10 +414,12 @@ func validateTransactionGraph(resources []touchedResource, creates map[nodeKey]c
 	for key := range deletes {
 		explicit[key] = struct{}{}
 	}
+
 	deleted, err := deletionClosure(model, explicit)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	if err := validateRequiredRelations(model, deleted); err != nil {
 		return nil, nil, err
 	}
