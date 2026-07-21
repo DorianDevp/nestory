@@ -157,7 +157,7 @@ var bucket = []byte("rec")
 
 func openBolt(tb testing.TB, dir string) *bolt.DB {
 	tb.Helper()
-	db, err := bolt.Open(filepath.Join(dir, "rec.bolt"), 0600, nil)
+	db, err := bolt.Open(filepath.Join(dir, "rec.bolt"), 0o600, nil)
 	if err != nil {
 		tb.Fatalf("open bolt: %v", err)
 	}
