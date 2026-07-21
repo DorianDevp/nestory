@@ -79,9 +79,11 @@ func (db *DB[T]) relationPrepareCreate(value reflect.Value) error {
 		setID(entity, db.counter)
 		return nil
 	}
+
 	if db.index[db.identifier][id] != nil {
 		return fmt.Errorf("%w: %s(%d)", ErrAlreadyExists, db.name, id)
 	}
+
 	if id > db.counter {
 		db.counter = id
 	}
@@ -326,6 +328,7 @@ func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeK
 	for key := range keys {
 		ordered = append(ordered, key)
 	}
+
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].typ.Name() != ordered[j].typ.Name() {
 			return ordered[i].typ.Name() < ordered[j].typ.Name()
@@ -337,6 +340,7 @@ func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeK
 	for _, key := range ordered {
 		committerFor(key.typ.Name()).lockResource(key.id)
 	}
+
 	defer func() {
 		for i := len(ordered) - 1; i >= 0; i-- {
 			committerFor(ordered[i].typ.Name()).unlockResource(ordered[i].id)
@@ -353,6 +357,7 @@ func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeK
 		if !found {
 			return nil, nil, nil, ErrNotFound
 		}
+
 		versions[key] = version
 	}
 
@@ -404,6 +409,7 @@ func rewireTouchedCopies(resources []touchedResource) {
 	if err != nil {
 		return
 	}
+
 	model, err := buildRelationModel(nodes)
 	if err != nil {
 		return
@@ -967,8 +973,10 @@ func applyDeletedNodes(deleted map[nodeKey]struct{}) {
 		if byType[key.typ] == nil {
 			byType[key.typ] = make(map[int]struct{})
 		}
+
 		byType[key.typ][key.id] = struct{}{}
 	}
+
 	for _, runtime := range relationRuntimes() {
 		runtime.relationDelete(byType[runtime.relationType()])
 	}

@@ -75,6 +75,7 @@ func (tx *Tx[T]) Delete(id int) error {
 	if !found {
 		return ErrNotFound
 	}
+
 	resource.mu.RLock()
 	version := resource.version
 	resource.mu.RUnlock()
@@ -100,9 +101,11 @@ func stageCreatedOwnershipTree(tx txId, root reflect.Value) error {
 		if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() {
 			return fmt.Errorf("nestory: create requires non-nil entity pointers")
 		}
+
 		if _, duplicate := seen[value.Pointer()]; duplicate {
 			return nil
 		}
+
 		seen[value.Pointer()] = struct{}{}
 
 		typ := value.Type().Elem()
@@ -110,6 +113,7 @@ func stageCreatedOwnershipTree(tx txId, root reflect.Value) error {
 		if !ok {
 			return fmt.Errorf("nestory: %s is not open", typ)
 		}
+
 		if err := runtime.relationPrepareCreate(value); err != nil {
 			return err
 		}
@@ -118,6 +122,7 @@ func stageCreatedOwnershipTree(tx txId, root reflect.Value) error {
 		if !ok {
 			return fmt.Errorf("nestory: %s does not implement Entity", typ)
 		}
+
 		key := nodeKey{typ: typ, id: id}
 		if err := engine.stageCreate(tx, createdResource{key: key, work: value}); err != nil {
 			return err
@@ -127,6 +132,7 @@ func stageCreatedOwnershipTree(tx txId, root reflect.Value) error {
 		if err != nil {
 			return err
 		}
+
 		for _, spec := range specs {
 			if spec.kind != ownRelation {
 				continue
@@ -137,8 +143,10 @@ func stageCreatedOwnershipTree(tx txId, root reflect.Value) error {
 				if err := stage(field); err != nil {
 					return err
 				}
+
 				continue
 			}
+
 			for i := range field.Len() {
 				if err := stage(field.Index(i)); err != nil {
 					return err

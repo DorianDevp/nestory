@@ -87,6 +87,7 @@ func (db *DB[T]) getInTransaction(tx txId, id int) (*T, error) {
 		if _, ok := baseRegistry[key.typ.Name()].(committer); !ok {
 			return nil, ErrNotFound
 		}
+
 		engine.record(tx, touchedResource{
 			dbName: key.typ.Name(), id: key.id, ver: versions[key],
 			work: value.Interface(), original: original[key].Interface(),
