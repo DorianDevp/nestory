@@ -110,6 +110,7 @@ func applyRecoveredRows[T Entity](store *chunkStore[T], creator *dbCreator, slic
 		if err != nil {
 			return err
 		}
+
 		if rowID := values[0].GetId(); rowID != recovered.id {
 			return fmt.Errorf("nestory: WAL row id %d contains entity id %d", recovered.id, rowID)
 		}

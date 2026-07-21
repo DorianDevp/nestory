@@ -1075,22 +1075,30 @@ func syncOwnSliceBackReference(model *relationModel, ref resolvedRelation) bool 
 	owner := model.nodes[ref.holder]
 	child := model.nodes[ref.target]
 	back := child.value.Elem().FieldByName(ref.spec.matchField)
-	if back.Kind() == reflect.Pointer {
-		if !back.IsNil() && back.Pointer() == owner.value.Pointer() {
-			return false
-		}
+	if ownSliceBackReferenceMatches(model, ref) {
+		return false
+	}
 
+	if back.Kind() == reflect.Pointer {
 		back.Set(owner.value)
 		return true
 	}
 
 	id := owner.value.Elem().FieldByName("Id")
-	if scalarEqual(back, id) {
-		return false
-	}
-
 	back.Set(id)
 	return true
+}
+
+func ownSliceBackReferenceMatches(model *relationModel, ref resolvedRelation) bool {
+	owner := model.nodes[ref.holder]
+	child := model.nodes[ref.target]
+	back := child.value.Elem().FieldByName(ref.spec.matchField)
+	if back.Kind() == reflect.Pointer {
+		return !back.IsNil() && back.Pointer() == owner.value.Pointer()
+	}
+
+	id := owner.value.Elem().FieldByName("Id")
+	return scalarEqual(back, id)
 }
 
 func markChangedRelations(changed map[nodeKey]struct{}) {

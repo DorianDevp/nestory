@@ -265,9 +265,10 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		defer graphMu.RUnlock()
 	}
 
+	var model *relationModel
 	var deleted map[nodeKey]struct{}
 	if graphChanged {
-		_, deleted, err = validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
+		model, deleted, err = validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
 		if err != nil {
 			return err
 		}
@@ -325,10 +326,13 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	// Relation checks see every changed branch at once, before either the WAL
-	// or live memory is changed.
+	logStructuralCreate := structural && len(stagedDeletes) == 0 && prepareStructuralCreateWAL(model, touchedResources, createdResources)
 	if !structural {
 		if err := logTransactionWrites(touchedResources); err != nil {
+			return err
+		}
+	} else if logStructuralCreate {
+		if err := logTransactionCreates(touchedResources, createdResources); err != nil {
 			return err
 		}
 	}
@@ -352,7 +356,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		return err
 	}
 
-	model, err := buildRelationModel(nodes)
+	model, err = buildRelationModel(nodes)
 	if err != nil {
 		return err
 	}
@@ -361,7 +365,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	applyDeletedNodes(deleted)
 	rewireRelations(relationRuntimes())
 
-	if structural {
+	if structural && !logStructuralCreate {
 		for _, runtime := range relationRuntimes() {
 			if err := runtime.relationSave(); err != nil {
 				return err
@@ -503,6 +507,72 @@ func logTransactionWrites(resources []touchedResource) error {
 	}
 
 	return nil
+}
+
+func logTransactionCreates(resources []touchedResource, creates map[nodeKey]createdResource) error {
+	byDBName := make(map[string][]pendingWrite)
+	for _, resource := range resources {
+		byDBName[resource.dbName] = append(byDBName[resource.dbName], pendingWrite{id: resource.id, work: resource.work})
+	}
+
+	for key, created := range creates {
+		byDBName[key.typ.Name()] = append(byDBName[key.typ.Name()], pendingWrite{id: key.id, work: created.work.Interface()})
+	}
+
+	dbNames := make([]string, 0, len(byDBName))
+	for dbName := range byDBName {
+		dbNames = append(dbNames, dbName)
+	}
+
+	sort.Strings(dbNames)
+	for _, dbName := range dbNames {
+		if err := committerFor(dbName).logWrites(byDBName[dbName]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func prepareStructuralCreateWAL(model *relationModel, resources []touchedResource, creates map[nodeKey]createdResource) bool {
+	covered := make(map[nodeKey]struct{}, len(resources)+len(creates))
+	for _, resource := range resources {
+		runtime, ok := baseRegistry[resource.dbName].(relationRuntime)
+		if ok {
+			covered[nodeKey{typ: runtime.relationType(), id: resource.id}] = struct{}{}
+		}
+	}
+
+	for key := range creates {
+		covered[key] = struct{}{}
+	}
+
+	for _, ref := range model.refs {
+		if ref.spec.kind != ownRelation || !ref.spec.many || ownSliceBackReferencePersists(model, ref) {
+			continue
+		}
+
+		if _, writable := covered[ref.target]; !writable {
+			return false
+		}
+
+		syncOwnSliceBackReference(model, ref)
+	}
+
+	return true
+}
+
+func ownSliceBackReferencePersists(model *relationModel, ref resolvedRelation) bool {
+	child := model.nodes[ref.target]
+	back := child.value.Elem().FieldByName(ref.spec.matchField)
+	if back.Kind() == reflect.Pointer {
+		id, present := valueID(back)
+		return present && id == ref.holder.id
+	}
+
+	owner := model.nodes[ref.holder]
+	id := owner.value.Elem().FieldByName("Id")
+	return scalarEqual(back, id)
 }
 
 func changedResources(resources []touchedResource) []touchedResource {
