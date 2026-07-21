@@ -222,10 +222,20 @@ func (db *DB[T]) save() error {
 // saveChunk writes one chunk atomically: encode to "<ci>.gob.tmp", fsync, rename
 // onto "<ci>.gob". A crash mid-encode leaves the previous good file untouched.
 func (db *DB[T]) saveChunk(dir string, ci int, sliceType reflect.Type) error {
-	slice := reflect.MakeSlice(sliceType, 0, 0)
-	db.store.chunkLive(ci, func(p *T) {
-		slice = reflect.Append(slice, db.normalizeToSchema(*p))
-	})
+	var contents any
+	if db.directSchema {
+		rows := make([]T, 0, db.store.chunkSlots(ci))
+		db.store.chunkLive(ci, func(p *T) {
+			rows = append(rows, *p)
+		})
+		contents = rows
+	} else {
+		slice := reflect.MakeSlice(sliceType, 0, db.store.chunkSlots(ci))
+		db.store.chunkLive(ci, func(p *T) {
+			slice = reflect.Append(slice, db.normalizeToSchema(*p))
+		})
+		contents = slice.Interface()
+	}
 
 	finalPath := filepath.Join(dir, fmt.Sprintf("%d.gob", ci))
 	tmpPath := finalPath + ".tmp"
@@ -235,7 +245,7 @@ func (db *DB[T]) saveChunk(dir string, ci int, sliceType reflect.Type) error {
 		return fmt.Errorf("nestory: create %s: %w", tmpPath, err)
 	}
 
-	if err := gob.NewEncoder(file).Encode(slice.Interface()); err != nil {
+	if err := gob.NewEncoder(file).Encode(contents); err != nil {
 		file.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("nestory: encode %s: %w", tmpPath, err)

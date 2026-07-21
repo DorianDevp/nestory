@@ -101,6 +101,8 @@ func (s *chunkStore[T]) chunkLive(ci int, fn func(*T)) {
 	}
 }
 
+func (s *chunkStore[T]) chunkSlots(ci int) int { return s.chunks[ci].n }
+
 // loadChunk appends a freshly read block, keeping file ↔ chunk index alignment.
 // The block is clean — it already matches disk.
 func (s *chunkStore[T]) loadChunk(vals []T) {
