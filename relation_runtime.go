@@ -157,10 +157,22 @@ type resolvedRelation struct {
 
 type relationModel struct {
 	nodes    map[nodeKey]relationGraphNode
+	targets  map[relationTargetKey]indexedRelationTarget
 	refs     []resolvedRelation
 	missing  []missingRelation
 	owners   map[nodeKey]nodeKey
 	outgoing map[nodeKey][]nodeKey
+}
+
+type relationTargetKey struct {
+	typ   reflect.Type
+	field string
+	value any
+}
+
+type indexedRelationTarget struct {
+	key       nodeKey
+	duplicate bool
 }
 
 type missingRelation struct {
@@ -514,25 +526,6 @@ func rewireResourcePointer(pointer reflect.Value, targetType reflect.Type, resou
 	pointer.Set(reflect.ValueOf(target))
 }
 
-func ownershipClosure(model *relationModel, root nodeKey) map[nodeKey]struct{} {
-	out := map[nodeKey]struct{}{root: {}}
-	queue := []nodeKey{root}
-	for len(queue) > 0 {
-		owner := queue[0]
-		queue = queue[1:]
-		for _, child := range model.outgoing[owner] {
-			if _, seen := out[child]; seen {
-				continue
-			}
-
-			out[child] = struct{}{}
-			queue = append(queue, child)
-		}
-	}
-
-	return out
-}
-
 func cloneEntityPointer(source reflect.Value) reflect.Value {
 	clone := reflect.New(source.Type().Elem())
 	clone.Elem().Set(source.Elem())
@@ -631,7 +624,7 @@ func addGraphNode(nodes map[nodeKey]relationGraphNode, value reflect.Value, typ 
 	return nil
 }
 
-func resolveGraphTarget(nodes map[nodeKey]relationGraphNode, r relationSpec, pointer reflect.Value) (nodeKey, bool, error) {
+func resolveGraphTarget(model *relationModel, r relationSpec, pointer reflect.Value) (nodeKey, bool, error) {
 	matchField := r.matchField
 	if r.kind == ownRelation && r.many {
 		matchField = "Id"
@@ -642,30 +635,23 @@ func resolveGraphTarget(nodes map[nodeKey]relationGraphNode, r relationSpec, poi
 		return nodeKey{}, false, nil
 	}
 
-	var found nodeKey
-	matches := 0
-	for candidateKey, candidate := range nodes {
-		if candidateKey.typ != r.target {
-			continue
-		}
-
-		candidateValue, ok := relationKey(candidate.value, matchField)
-		if ok && scalarEqual(key, candidateValue) {
-			found = candidateKey
-			matches++
-		}
-	}
-
-	if matches > 1 {
+	target, found := model.targets[relationTargetKey{typ: r.target, field: matchField, value: key.Interface()}]
+	if target.duplicate {
 		return nodeKey{}, false, fmt.Errorf("%w: %s.%s does not uniquely identify a target", ErrRelationInvariant, r.owner, r.fieldName)
 	}
 
-	return found, matches == 1, nil
+	return target.key, found, nil
 }
 
 func buildRelationModel(nodes map[nodeKey]relationGraphNode) (*relationModel, error) {
+	targets, err := buildRelationTargetIndex(nodes)
+	if err != nil {
+		return nil, err
+	}
+
 	model := &relationModel{
-		nodes: nodes, owners: make(map[nodeKey]nodeKey), outgoing: make(map[nodeKey][]nodeKey),
+		nodes: nodes, targets: targets,
+		owners: make(map[nodeKey]nodeKey), outgoing: make(map[nodeKey][]nodeKey),
 	}
 	incoming := make(map[nodeKey][]incomingOwn)
 	ownedBy := make(map[nodeKey]incomingOwn)
@@ -689,6 +675,61 @@ func buildRelationModel(nodes map[nodeKey]relationGraphNode) (*relationModel, er
 	return model, nil
 }
 
+func buildRelationTargetIndex(nodes map[nodeKey]relationGraphNode) (map[relationTargetKey]indexedRelationTarget, error) {
+	fieldsByType := make(map[reflect.Type]map[string]struct{})
+	visitedTypes := make(map[reflect.Type]struct{})
+	for key := range nodes {
+		if _, visited := visitedTypes[key.typ]; visited {
+			continue
+		}
+
+		visitedTypes[key.typ] = struct{}{}
+		specs, err := relationSpecs(key.typ)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, spec := range specs {
+			if spec.kind == inverseRelation {
+				continue
+			}
+
+			matchField := spec.matchField
+			if spec.kind == ownRelation && spec.many {
+				matchField = "Id"
+			}
+
+			if fieldsByType[spec.target] == nil {
+				fieldsByType[spec.target] = make(map[string]struct{})
+			}
+
+			fieldsByType[spec.target][matchField] = struct{}{}
+		}
+	}
+
+	targets := make(map[relationTargetKey]indexedRelationTarget)
+	for nodeKey, node := range nodes {
+		for field := range fieldsByType[nodeKey.typ] {
+			value, present := relationKey(node.value, field)
+			if !present {
+				continue
+			}
+
+			key := relationTargetKey{typ: nodeKey.typ, field: field, value: value.Interface()}
+			target, duplicate := targets[key]
+			if duplicate {
+				target.duplicate = true
+				targets[key] = target
+				continue
+			}
+
+			targets[key] = indexedRelationTarget{key: nodeKey}
+		}
+	}
+
+	return targets, nil
+}
+
 func scanNodeRelations(model *relationModel, node relationGraphNode, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
 	specs, err := relationSpecs(node.key.typ)
 	if err != nil {
@@ -710,45 +751,58 @@ func scanNodeRelations(model *relationModel, node relationGraphNode, incoming ma
 
 func scanRelationField(model *relationModel, node relationGraphNode, spec relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
 	field := node.value.Elem().Field(spec.fieldIndex)
-	values := relationFieldValues(field, spec.many)
-	seen := make(map[nodeKey]struct{}, len(values))
-	for _, pointer := range values {
-		target, found, err := resolveGraphTarget(model.nodes, spec, pointer)
-		if err != nil {
+	if !spec.many {
+		return scanRelationPointer(model, node, spec, field, nil, incoming, ownedBy)
+	}
+
+	var seen map[nodeKey]struct{}
+	if spec.kind == ownRelation {
+		seen = make(map[nodeKey]struct{}, field.Len())
+	}
+
+	for i := range field.Len() {
+		if err := scanRelationPointer(model, node, spec, field.Index(i), seen, incoming, ownedBy); err != nil {
 			return err
 		}
-
-		if !found {
-			if relationMayBeMissing(spec) {
-				continue
-			}
-
-			model.missing = append(model.missing, missingRelation{holder: node.key, spec: spec})
-			continue
-		}
-
-		if _, duplicate := seen[target]; duplicate && spec.kind == ownRelation {
-			return fmt.Errorf("%w: %s.%s contains owned child %s more than once", ErrRelationInvariant, node.key.typ, spec.fieldName, target)
-		}
-
-		seen[target] = struct{}{}
-		recordResolvedRelation(model, node.key, target, spec, incoming, ownedBy)
 	}
 
 	return nil
 }
 
-func relationFieldValues(field reflect.Value, many bool) []reflect.Value {
-	if !many {
-		return []reflect.Value{field}
+func scanRelationPointer(
+	model *relationModel,
+	node relationGraphNode,
+	spec relationSpec,
+	pointer reflect.Value,
+	seen map[nodeKey]struct{},
+	incoming map[nodeKey][]incomingOwn,
+	ownedBy map[nodeKey]incomingOwn,
+) error {
+	target, found, err := resolveGraphTarget(model, spec, pointer)
+	if err != nil {
+		return err
 	}
 
-	values := make([]reflect.Value, field.Len())
-	for i := range field.Len() {
-		values[i] = field.Index(i)
+	if !found {
+		if relationMayBeMissing(spec) {
+			return nil
+		}
+
+		model.missing = append(model.missing, missingRelation{holder: node.key, spec: spec})
+		return nil
 	}
 
-	return values
+	if _, duplicate := seen[target]; duplicate && spec.kind == ownRelation {
+		return fmt.Errorf("%w: %s.%s contains owned child %s more than once", ErrRelationInvariant, node.key.typ, spec.fieldName, target)
+	}
+
+	if seen != nil {
+		seen[target] = struct{}{}
+	}
+
+	recordResolvedRelation(model, node.key, target, spec, incoming, ownedBy)
+
+	return nil
 }
 
 func relationMayBeMissing(spec relationSpec) bool {
