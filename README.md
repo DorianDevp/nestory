@@ -34,6 +34,20 @@ db.UpdateWithin(1, func(u *User) { u.Name = "bob" })
 
 First commit wins; a concurrent one gets `ErrConflict` and a refreshed snapshot.
 
+For exclusive, latency-sensitive work, `UnsafeGet` exposes the stable pointer in
+the live store without a snapshot or transaction bookkeeping:
+
+```go
+u, _ := db.UnsafeGet(1)
+u.Name = "bob" // visible immediately
+err := db.Flush()
+```
+
+`UnsafeGet` marks the containing chunk dirty, so `Flush` persists direct
+mutations and validates the final relation graph. It deliberately provides no
+isolation, locking or rollback: the caller must guarantee exclusive access, and
+a rejected `Flush` leaves the invalid live mutation in memory until it is fixed.
+
 ## How it works
 
 - Entities live in a chunked arena (fixed 512-row blocks, never moved), so a
