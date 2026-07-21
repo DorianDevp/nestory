@@ -200,6 +200,17 @@ func (db *DB[T]) resourceVersion(id int) (int, bool) {
 	return 0, false
 }
 
+func (db *DB[T]) snapshotResource(id int) (reflect.Value, reflect.Value, int, bool) {
+	r, ok := db.resource(id)
+	if !ok {
+		return reflect.Value{}, reflect.Value{}, 0, false
+	}
+
+	source := reflect.ValueOf(r.item)
+
+	return cloneEntityPointer(source), cloneEntityPointer(source), r.version, true
+}
+
 func (db *DB[T]) applyWrite(id int, work any) {
 	if r, ok := db.resource(id); ok {
 		*r.item = *work.(*T) // write through the stable pointer — never moves
