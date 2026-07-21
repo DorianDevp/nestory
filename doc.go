@@ -4,9 +4,11 @@
 //
 // Tags:
 //
-//	key:"primary"     int Id field (required).
-//	relto:"Id"        pointer field; saved as a flattened FK, loaded as *T.
-//	mapby:"UserId"    slice-of-pointer; loaded with every *T whose UserId == Id.
+//	key:"primary"          int Id field (required).
+//	rel:"own,Id"           required owning pointer.
+//	rel:"borrow,Id"        required non-owning pointer with delete veto.
+//	rel:"option,Id"        nullable non-owning pointer.
+//	rel:"inverse,User"     computed reverse collection.
 //
 // Alpha. The API will change. Don't store anything you can't lose.
 package nestory
