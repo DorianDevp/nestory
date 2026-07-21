@@ -18,7 +18,7 @@ type relationRuntime interface {
 	relationApplyCreate(reflect.Value)
 	relationDelete(map[int]struct{})
 	relationMarkDirty(int)
-	relationRewire()
+	relationRewire(*relationWireIndex)
 	relationSave() error
 	relationClearQueues()
 }
@@ -122,7 +122,7 @@ func (db *DB[T]) relationMarkDirty(id int) {
 	}
 }
 
-func (db *DB[T]) relationRewire() { db.fillRelation() }
+func (db *DB[T]) relationRewire(index *relationWireIndex) { db.fillRelationFrom(index) }
 
 func (db *DB[T]) relationSave() error {
 	if err := db.save(); err != nil {
@@ -1165,9 +1165,7 @@ func flushRelations() error {
 		runtime.relationDelete(byType[runtime.relationType()])
 	}
 
-	for _, runtime := range runtimes {
-		runtime.relationRewire()
-	}
+	rewireRelations(runtimes)
 
 	for _, runtime := range runtimes {
 		if err := runtime.relationSave(); err != nil {

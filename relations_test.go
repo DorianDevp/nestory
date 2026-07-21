@@ -374,6 +374,20 @@ type rtBorrowB struct {
 
 func (v rtBorrowB) GetId() int { return v.Id }
 
+type rtIndexedTarget struct {
+	Id      int                `key:"primary"`
+	Holders []*rtIndexedHolder `rel:"inverse,Targets"`
+}
+
+func (v rtIndexedTarget) GetId() int { return v.Id }
+
+type rtIndexedHolder struct {
+	Id      int                `key:"primary"`
+	Targets []*rtIndexedTarget `rel:"borrow,Id"`
+}
+
+func (v rtIndexedHolder) GetId() int { return v.Id }
+
 func resetRegistries() {
 	storeRegistry = make(map[string]any)
 	baseRegistry = make(map[string]any)
@@ -525,6 +539,61 @@ func TestRelationsPersistAndRehydrateEveryRole(t *testing.T) {
 
 		if logDB.Len() != 1 || watcherDB.Len() != 1 {
 			t.Fatalf("unowned holders disappeared")
+		}
+	})
+}
+
+func TestIndexedRewirePreservesReferenceOrderAndInverseUniqueness(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtIndexedTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[rtIndexedHolder](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[rtIndexedTarget]()
+		holderDB := Open[rtIndexedHolder]()
+		first := &rtIndexedTarget{}
+		second := &rtIndexedTarget{}
+		targetDB.Unsafe().Create(first)
+		targetDB.Unsafe().Create(second)
+		holder := &rtIndexedHolder{Targets: []*rtIndexedTarget{second, first, second}}
+		holderDB.Unsafe().Create(holder)
+		if err := holderDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		resetRegistries()
+		if err := Register[rtIndexedTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[rtIndexedHolder](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB = Open[rtIndexedTarget]()
+		holderDB = Open[rtIndexedHolder]()
+		reloaded, err := holderDB.Unsafe().Get(holder.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(reloaded.Targets) != 3 || reloaded.Targets[0].Id != second.Id || reloaded.Targets[1].Id != first.Id || reloaded.Targets[2].Id != second.Id {
+			t.Fatalf("reference order changed: %#v", reloaded.Targets)
+		}
+
+		for _, id := range []int{first.Id, second.Id} {
+			target, getErr := targetDB.Unsafe().Get(id)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+
+			if len(target.Holders) != 1 || target.Holders[0] != reloaded {
+				t.Fatalf("inverse for target %d = %#v", id, target.Holders)
+			}
 		}
 	})
 }
