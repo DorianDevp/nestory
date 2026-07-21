@@ -377,6 +377,84 @@ func TestCreateUsesWALAndRehydratesScalarOwnership(t *testing.T) {
 	})
 }
 
+func TestReparentPersistsMaterializedOwnershipBackReference(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtNode](); err != nil {
+			t.Fatal(err)
+		}
+
+		db := Open[rtNode]()
+		root := &rtNode{}
+		left := &rtNode{}
+		right := &rtNode{}
+		branch := &rtNode{Children: []*rtNode{{}}}
+		left.Children = []*rtNode{branch}
+		root.Children = []*rtNode{left, right}
+		if err := db.Create(root); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		err := db.UpdateWithin(root.Id, func(current *rtNode) error {
+			currentLeft := findRTNode(current, left.Id)
+			currentRight := findRTNode(current, right.Id)
+			moved := currentLeft.Children[0]
+			currentLeft.Children = nil
+			currentRight.Children = append(currentRight.Children, moved)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stored, err := db.Unsafe().Get(branch.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if stored.ParentID != right.Id {
+			t.Fatalf("live branch ParentID = %d, want %d", stored.ParentID, right.Id)
+		}
+
+		resetRegistries()
+		if err := Register[rtNode](); err != nil {
+			t.Fatal(err)
+		}
+
+		reloaded, err := Open[rtNode]().Get(root.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		reloadedLeft := findRTNode(reloaded, left.Id)
+		reloadedRight := findRTNode(reloaded, right.Id)
+		if len(reloadedLeft.Children) != 0 {
+			t.Fatal("old parent regained the branch after WAL replay")
+		}
+
+		if children := reloadedRight.Children; len(children) != 1 || children[0].Id != branch.Id {
+			t.Fatalf("new parent's children = %#v", children)
+		}
+	})
+}
+
+func findRTNode(root *rtNode, id int) *rtNode {
+	if root.Id == id {
+		return root
+	}
+
+	for _, child := range root.Children {
+		if found := findRTNode(child, id); found != nil {
+			return found
+		}
+	}
+
+	return nil
+}
+
 func TestJoinCombinesDifferentTypesInOneCommit(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)

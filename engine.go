@@ -223,7 +223,7 @@ func (en *transactionEngine) commitByPtr(work any) error {
 func (en *transactionEngine) commit(tx *transactionState) error {
 	en.mu.Lock()
 	active := tx.active
-	touchedResources := tx.copyResources()
+	transactionResources := tx.copyResources()
 	var createdResources map[nodeKey]createdResource
 	if len(tx.creates) > 0 {
 		createdResources = make(map[nodeKey]createdResource, len(tx.creates))
@@ -246,7 +246,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		return ErrExpiredSnapshot
 	}
 
-	touchedResources = changedResources(touchedResources)
+	touchedResources := changedResources(transactionResources)
 	if len(touchedResources) == 0 && len(createdResources) == 0 && len(stagedDeletes) == 0 {
 		en.evict(tx)
 		return nil
@@ -271,6 +271,11 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	var deleted map[nodeKey]struct{}
 	if graphChanged {
 		model, deleted, err = validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
+		if err != nil {
+			return err
+		}
+
+		touchedResources, err = materializeOwnBackReferences(model, transactionResources, touchedResources, createdResources, deleted)
 		if err != nil {
 			return err
 		}
@@ -374,6 +379,79 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	en.evict(tx)
 
 	return nil
+}
+
+func materializeOwnBackReferences(
+	model *relationModel,
+	transactionResources []touchedResource,
+	changed []touchedResource,
+	creates map[nodeKey]createdResource,
+	deleted map[nodeKey]struct{},
+) ([]touchedResource, error) {
+	available := make(map[nodeKey]touchedResource, len(transactionResources))
+	changedKeys := make(map[nodeKey]struct{}, len(changed))
+	for _, resource := range transactionResources {
+		runtime := baseRegistry[resource.dbName].(relationRuntime)
+		available[nodeKey{typ: runtime.relationType(), id: resource.id}] = resource
+	}
+
+	for _, resource := range changed {
+		runtime := baseRegistry[resource.dbName].(relationRuntime)
+		changedKeys[nodeKey{typ: runtime.relationType(), id: resource.id}] = struct{}{}
+	}
+
+	for _, ref := range model.refs {
+		if ref.spec.kind != ownRelation || !ref.spec.many || ownSliceBackReferencePersists(model, ref) {
+			continue
+		}
+
+		if _, dies := deleted[ref.target]; dies {
+			continue
+		}
+
+		if created, exists := creates[ref.target]; exists {
+			model.nodes[ref.target] = relationGraphNode{key: ref.target, value: created.work}
+			syncOwnSliceBackReference(model, ref)
+			continue
+		}
+
+		if _, exists := changedKeys[ref.target]; exists {
+			syncOwnSliceBackReference(model, ref)
+			continue
+		}
+
+		resource, found := available[ref.target]
+		if !found {
+			var err error
+			resource, err = snapshotTouchedResource(ref.target)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		model.nodes[ref.target] = relationGraphNode{key: ref.target, value: reflect.ValueOf(resource.work)}
+		if syncOwnSliceBackReference(model, ref) {
+			changed = append(changed, resource)
+			changedKeys[ref.target] = struct{}{}
+		}
+	}
+
+	return changed, nil
+}
+
+func snapshotTouchedResource(key nodeKey) (touchedResource, error) {
+	committer := committerFor(key.typ.Name())
+	committer.lockResource(key.id)
+	work, original, version, found := committer.snapshotResource(key.id)
+	committer.unlockResource(key.id)
+	if !found {
+		return touchedResource{}, ErrNotFound
+	}
+
+	return touchedResource{
+		dbName: key.typ.Name(), id: key.id, ver: version,
+		work: work.Interface(), original: original.Interface(),
+	}, nil
 }
 
 func bindRelationModelToLiveNodes(model *relationModel, resources []touchedResource, creates map[nodeKey]createdResource) error {
