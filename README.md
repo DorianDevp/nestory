@@ -47,6 +47,10 @@ err := db.Flush()
 mutations and validates the final relation graph. It deliberately provides no
 isolation, locking or rollback: the caller must guarantee exclusive access, and
 a rejected `Flush` leaves the invalid live mutation in memory until it is fixed.
+Nestory keeps the last committed ownership index separately from those live
+pointers. Consequently, deleting an owner at `Flush` still cascades through its
+committed subtree even if unsafe mutations have already damaged the in-memory
+description of an ownership edge.
 
 ## How it works
 
@@ -80,7 +84,7 @@ entity's lifetime is structural — its place in the forest — not something yo
 discover by counting or chasing references. A reference that outlives its target
 is resolved by its role: `option` goes nil, `borrow` blocks the delete.
 
-## Ownership & cascade (planned)
+## Ownership & cascade
 
 A relation has two independent axes. **Cardinality** comes from the Go type —
 `*T` is to-one, `[]*T` is to-many — so you never tag it. **Lifecycle** — who owns

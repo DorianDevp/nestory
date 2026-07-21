@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 )
 
 type relationRuntime interface {
@@ -144,6 +145,70 @@ type missingRelation struct {
 type incomingOwn struct {
 	owner nodeKey
 	spec  relationSpec
+}
+
+var committedOwnership = struct {
+	sync.RWMutex
+	ready    bool
+	outgoing map[nodeKey][]nodeKey
+}{outgoing: make(map[nodeKey][]nodeKey)}
+
+func resetCommittedOwnership() {
+	committedOwnership.Lock()
+	defer committedOwnership.Unlock()
+
+	committedOwnership.ready = false
+	committedOwnership.outgoing = make(map[nodeKey][]nodeKey)
+}
+
+func ensureCommittedOwnership() error {
+	committedOwnership.RLock()
+	ready := committedOwnership.ready
+	committedOwnership.RUnlock()
+	if ready {
+		return nil
+	}
+
+	return refreshCommittedOwnership()
+}
+
+func refreshCommittedOwnership() error {
+	nodes, err := collectRelationNodes(false, nil)
+	if err != nil {
+		return err
+	}
+
+	model, err := buildRelationModel(nodes)
+	if err != nil {
+		return err
+	}
+
+	if err := validateRequiredRelations(model, nil); err != nil {
+		return err
+	}
+
+	storeCommittedOwnership(model)
+
+	return nil
+}
+
+func storeCommittedOwnership(model *relationModel) {
+	outgoing := make(map[nodeKey][]nodeKey, len(model.outgoing))
+	for owner, children := range model.outgoing {
+		outgoing[owner] = append([]nodeKey(nil), children...)
+	}
+
+	committedOwnership.Lock()
+	committedOwnership.ready = true
+	committedOwnership.outgoing = outgoing
+	committedOwnership.Unlock()
+}
+
+func committedChildren(owner nodeKey) []nodeKey {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	return append([]nodeKey(nil), committedOwnership.outgoing[owner]...)
 }
 
 func valueID(v reflect.Value) (int, bool) {
@@ -475,7 +540,7 @@ func deletionClosure(model *relationModel, explicit map[nodeKey]struct{}) (map[n
 	for len(queue) > 0 {
 		owner := queue[0]
 		queue = queue[1:]
-		for _, child := range model.outgoing[owner] {
+		for _, child := range deletionChildren(model, owner) {
 			if _, seen := deleted[child]; seen {
 				continue
 			}
@@ -505,6 +570,34 @@ func deletionClosure(model *relationModel, explicit map[nodeKey]struct{}) (map[n
 	}
 
 	return deleted, nil
+}
+
+func deletionChildren(model *relationModel, owner nodeKey) []nodeKey {
+	seen := make(map[nodeKey]struct{})
+	children := make([]nodeKey, 0)
+	for _, child := range model.outgoing[owner] {
+		seen[child] = struct{}{}
+		children = append(children, child)
+	}
+
+	for _, child := range committedChildren(owner) {
+		if _, exists := model.nodes[child]; !exists {
+			continue
+		}
+
+		if proposedOwner, reparented := model.owners[child]; reparented && proposedOwner != owner {
+			continue
+		}
+
+		if _, duplicate := seen[child]; duplicate {
+			continue
+		}
+
+		seen[child] = struct{}{}
+		children = append(children, child)
+	}
+
+	return children
 }
 
 func setRelationField(holder relationGraphNode, r relationSpec, target reflect.Value) bool {
@@ -681,6 +774,9 @@ func flushRelations() error {
 
 	for _, runtime := range runtimes {
 		runtime.relationClearQueues()
+	}
+	if err := refreshCommittedOwnership(); err != nil {
+		return err
 	}
 
 	return nil

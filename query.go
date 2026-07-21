@@ -164,6 +164,9 @@ func (db *DB[T]) UnsafeGet(id int) (*T, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
+	if err := ensureCommittedOwnership(); err != nil {
+		return nil, err
+	}
 
 	db.store.markDirty(resource.chunk)
 

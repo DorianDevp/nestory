@@ -378,6 +378,7 @@ func resetRegistries() {
 	storeRegistry = make(map[string]any)
 	baseRegistry = make(map[string]any)
 	engine = newEngine()
+	resetCommittedOwnership()
 }
 
 func isolatedRelations(t *testing.T, fn func(t *testing.T)) {
