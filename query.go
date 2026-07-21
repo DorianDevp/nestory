@@ -62,6 +62,11 @@ func (db *DB[T]) Filter(filterFn func(T) bool) []T {
 // Get returns a detached branch containing id and its complete ownership
 // subtree. Mutate owned nodes and hand the root to Update to merge the branch.
 func (db *DB[T]) Get(id int) (*T, error) {
+	root := nodeKey{typ: reflect.TypeFor[T](), id: id}
+	if work, handled, err := db.getDetachedRoot(root); handled {
+		return work, err
+	}
+
 	tx := engine.begin()
 	work, err := db.getInTransaction(tx, id)
 	if err != nil {
@@ -72,33 +77,26 @@ func (db *DB[T]) Get(id int) (*T, error) {
 	return work, nil
 }
 
-func (db *DB[T]) getInTransaction(tx txId, id int) (*T, error) {
+func (db *DB[T]) getInTransaction(tx *transactionState, id int) (*T, error) {
 	if existing, ok := engine.work(tx, db.name, id); ok {
 		return existing.(*T), nil
 	}
 
 	root := nodeKey{typ: reflect.TypeFor[T](), id: id}
-	work, original, versions, err := cloneOwnershipAggregate(root)
+	rootWork, err := cloneOwnershipAggregate(root, func(resource touchedResource) {
+		engine.record(tx, resource)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	for key, value := range work {
-		if _, ok := baseRegistry[key.typ.Name()].(committer); !ok {
-			return nil, ErrNotFound
-		}
-
-		engine.record(tx, touchedResource{
-			dbName: key.typ.Name(), id: key.id, ver: versions[key],
-			work: value.Interface(), original: original[key].Interface(),
-		})
-	}
-
-	return work[root].Interface().(*T), nil
+	return rootWork.(*T), nil
 }
 
 // Update merges the detached ownership branch returned by Get.
 func (db *DB[T]) Update(branch *T) error {
+	db.promoteDetachedRoot(branch)
+
 	return engine.commitByPtr(branch)
 }
 
