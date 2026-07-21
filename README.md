@@ -139,9 +139,10 @@ type User struct {
 
 When both ends are tagged, consistency is checked **at commit** (invariant I6):
 the `ownedby` pointer must equal the owner from the reverse index. A transaction
-that pushed `p` into `u1.Posts` but left `p.User == u2` is contradictory. If only
-one side was mutated the engine fills in the complement; if both were mutated and
-they disagree, that's an error, not a guess.
+that pushed `p` into `u1.Posts` but left `p.User == u2` is contradictory. Both
+declared fields are mandatory in the final state: the engine canonicalizes their
+pointers but never invents a missing side. Moving a two-sided edge therefore
+requires updating both fields before commit.
 
 Declaring `ownedby` is a commitment: every instance of the type must then have
 an owner, always — nil is an error, and there is no "root" special case (see the
@@ -290,9 +291,9 @@ Three are instance properties, checked at the end of every transaction:
   O(tree depth). With I4 this makes the ownership graph a **forest**: cascade is
   a plain subtree walk and the closure always terminates.
 - **I6 — pair consistency.** An `ownedby` pointer must equal the owner recorded
-  by the reverse index. If a transaction mutated only one side, the engine fills
-  in the complement; if it mutated both and they disagree, that's an error, not
-  a guess.
+  by the reverse index. Both declared fields must be non-nil and agree in the
+  final state; the engine canonicalizes pointers but never guesses a missing
+  complement.
 
 Whether a node may live unowned is the **child's declaration, not the owner's**:
 a type with an `ownedby` field must always have an owner (I3's mandatoriness);

@@ -70,19 +70,35 @@ func TestUnsafeGetValidatesRelationsAtFlush(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		current := live.Current
-		live.Current = nil
+		profile := live.Profile
+		live.Profile = nil
 		if err := world.userDB.Flush(); err == nil {
-			t.Fatal("Flush accepted a nil required borrow relation")
+			t.Fatal("Flush accepted a nil required own relation")
 		}
 
-		if live.Current != nil {
+		if live.Profile != nil {
 			t.Fatal("failed Flush unexpectedly rolled the unsafe mutation back")
 		}
 
-		live.Current = current
+		live.Profile = profile
 		if err := world.userDB.Flush(); err != nil {
 			t.Fatalf("Flush after repairing live relation: %v", err)
+		}
+
+		ownedProfile, err := world.profileDB.UnsafeGet(profile.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		owner := ownedProfile.Owner
+		ownedProfile.Owner = nil
+		if err := world.profileDB.Flush(); err == nil {
+			t.Fatal("Flush inferred a nil required ownedby relation from own")
+		}
+
+		ownedProfile.Owner = owner
+		if err := world.profileDB.Flush(); err != nil {
+			t.Fatalf("Flush after repairing ownedby relation: %v", err)
 		}
 	})
 }
