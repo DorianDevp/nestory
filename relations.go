@@ -7,16 +7,16 @@ import (
 	"strings"
 )
 
-// RelationKind describes the lifecycle role of a relation. Cardinality is
+// relationKind describes the lifecycle role of a relation. Cardinality is
 // deliberately not part of the kind: it is derived from *T versus []*T.
-type RelationKind string
+type relationKind string
 
 const (
-	Own     RelationKind = "own"
-	OwnedBy RelationKind = "ownedby"
-	Borrow  RelationKind = "borrow"
-	Option  RelationKind = "option"
-	Inverse RelationKind = "inverse"
+	ownRelation     relationKind = "own"
+	ownedByRelation relationKind = "ownedby"
+	borrowRelation  relationKind = "borrow"
+	optionRelation  relationKind = "option"
+	inverseRelation relationKind = "inverse"
 )
 
 var (
@@ -25,25 +25,25 @@ var (
 	ErrDeleteRestricted  = errors.New("nestory: delete restricted by relation")
 )
 
-// RelationRoot is the normalized relation schema reachable from one entity
+// relationRoot is the normalized relation schema reachable from one entity
 // type. Cycles are represented by pointers back to an already-created root.
-type RelationRoot struct {
+type relationRoot struct {
 	Type     reflect.Type
-	Children []RelationPoint
+	Children []relationPoint
 }
 
-// RelationPoint is one declared relation field.
-type RelationPoint struct {
+// relationPoint is one declared relation field.
+type relationPoint struct {
 	FieldName string
 	FieldType reflect.Type // target struct type (never *T or []*T)
 	Field     string       // second argument of rel:"role,field"
 	Many      bool
-	To        *RelationNode
+	To        *relationNode
 }
 
-type RelationNode struct {
-	RelationType RelationKind
-	To           *RelationRoot
+type relationNode struct {
+	RelationType relationKind
+	To           *relationRoot
 }
 
 type relationSpec struct {
@@ -51,7 +51,7 @@ type relationSpec struct {
 	fieldIndex int
 	fieldName  string
 	target     reflect.Type
-	kind       RelationKind
+	kind       relationKind
 	matchField string
 	many       bool
 }
@@ -105,19 +105,19 @@ func parseRelationField(owner reflect.Type, index int) (relationSpec, bool, erro
 		return relationSpec{}, false, fmt.Errorf("%w: %s.%s: rel must have the form role,field", ErrRelationSchema, owner, f.Name)
 	}
 
-	kind := RelationKind(strings.TrimSpace(parts[0]))
+	kind := relationKind(strings.TrimSpace(parts[0]))
 	match := strings.TrimSpace(parts[1])
 	switch kind {
-	case Own, OwnedBy, Borrow, Option, Inverse:
+	case ownRelation, ownedByRelation, borrowRelation, optionRelation, inverseRelation:
 	default:
 		return relationSpec{}, false, fmt.Errorf("%w: %s.%s: unknown role %q", ErrRelationSchema, owner, f.Name, kind)
 	}
 
-	if kind == OwnedBy && many {
+	if kind == ownedByRelation && many {
 		return relationSpec{}, false, fmt.Errorf("%w: %s.%s: ownedby requires *T", ErrRelationSchema, owner, f.Name)
 	}
 
-	if kind == Inverse && !many {
+	if kind == inverseRelation && !many {
 		return relationSpec{}, false, fmt.Errorf("%w: %s.%s: inverse requires []*T", ErrRelationSchema, owner, f.Name)
 	}
 
@@ -157,11 +157,11 @@ func validateRelationSpec(r relationSpec) error {
 		return fmt.Errorf("%w: %s.%s names missing field %s.%s", ErrRelationSchema, r.owner, r.fieldName, r.target, r.matchField)
 	}
 
-	if !r.many || (r.kind != Own && r.kind != Inverse) {
+	if !r.many || (r.kind != ownRelation && r.kind != inverseRelation) {
 		return validateScalarMatchField(r, back)
 	}
 
-	if r.kind == Own {
+	if r.kind == ownRelation {
 		return validateOwnBackField(r, back)
 	}
 
@@ -190,7 +190,7 @@ func validateOwnBackField(r relationSpec, back reflect.StructField) error {
 		return err
 	}
 
-	if tagged && complement.kind == OwnedBy && complement.target == r.owner {
+	if tagged && complement.kind == ownedByRelation && complement.target == r.owner {
 		return nil
 	}
 
@@ -203,7 +203,7 @@ func validateInverseBackField(r relationSpec, back reflect.StructField) error {
 		return err
 	}
 
-	validKind := complement.kind == Borrow || complement.kind == Option
+	validKind := complement.kind == borrowRelation || complement.kind == optionRelation
 	if tagged && validKind && complement.target == r.owner {
 		return nil
 	}
@@ -212,23 +212,23 @@ func validateInverseBackField(r relationSpec, back reflect.StructField) error {
 }
 
 type relationSchemaBuilder struct {
-	roots       map[reflect.Type]*RelationRoot
+	roots       map[reflect.Type]*relationRoot
 	specsByType map[reflect.Type][]relationSpec
 }
 
 func newRelationSchemaBuilder() *relationSchemaBuilder {
 	return &relationSchemaBuilder{
-		roots:       make(map[reflect.Type]*RelationRoot),
+		roots:       make(map[reflect.Type]*relationRoot),
 		specsByType: make(map[reflect.Type][]relationSpec),
 	}
 }
 
-func (b *relationSchemaBuilder) visit(t reflect.Type) (*RelationRoot, error) {
+func (b *relationSchemaBuilder) visit(t reflect.Type) (*relationRoot, error) {
 	if found := b.roots[t]; found != nil {
 		return found, nil
 	}
 
-	head := &RelationRoot{Type: t}
+	head := &relationRoot{Type: t}
 	b.roots[t] = head
 	specs, err := relationSpecs(t)
 	if err != nil {
@@ -237,7 +237,7 @@ func (b *relationSchemaBuilder) visit(t reflect.Type) (*RelationRoot, error) {
 
 	b.specsByType[t] = specs
 
-	if countRelationKind(specs, OwnedBy) > 1 {
+	if countRelationKind(specs, ownedByRelation) > 1 {
 		return nil, fmt.Errorf("%w: %s declares more than one ownedby field", ErrRelationSchema, t)
 	}
 
@@ -253,7 +253,7 @@ func (b *relationSchemaBuilder) visit(t reflect.Type) (*RelationRoot, error) {
 	return head, nil
 }
 
-func countRelationKind(specs []relationSpec, kind RelationKind) int {
+func countRelationKind(specs []relationSpec, kind relationKind) int {
 	count := 0
 	for _, spec := range specs {
 		if spec.kind == kind {
@@ -264,26 +264,26 @@ func countRelationKind(specs []relationSpec, kind RelationKind) int {
 	return count
 }
 
-func (b *relationSchemaBuilder) buildPoint(spec relationSpec) (RelationPoint, error) {
+func (b *relationSchemaBuilder) buildPoint(spec relationSpec) (relationPoint, error) {
 	if err := validateRelationSpec(spec); err != nil {
-		return RelationPoint{}, err
+		return relationPoint{}, err
 	}
 
 	child, err := b.visit(spec.target)
 	if err != nil {
-		return RelationPoint{}, err
+		return relationPoint{}, err
 	}
 
-	return RelationPoint{
+	return relationPoint{
 		FieldName: spec.fieldName,
 		FieldType: spec.target,
 		Field:     spec.matchField,
 		Many:      spec.many,
-		To:        &RelationNode{RelationType: spec.kind, To: child},
+		To:        &relationNode{RelationType: spec.kind, To: child},
 	}, nil
 }
 
-func (b *relationSchemaBuilder) validateRequiredCycles(kind RelationKind) error {
+func (b *relationSchemaBuilder) validateRequiredCycles(kind relationKind) error {
 	state := make(map[reflect.Type]uint8)
 	for typ := range b.specsByType {
 		if err := b.visitRequiredType(typ, kind, state); err != nil {
@@ -294,7 +294,7 @@ func (b *relationSchemaBuilder) validateRequiredCycles(kind RelationKind) error 
 	return nil
 }
 
-func (b *relationSchemaBuilder) visitRequiredType(t reflect.Type, kind RelationKind, state map[reflect.Type]uint8) error {
+func (b *relationSchemaBuilder) visitRequiredType(t reflect.Type, kind relationKind, state map[reflect.Type]uint8) error {
 	if state[t] == 1 {
 		return fmt.Errorf("%w: unsatisfiable %s cycle involving %s", ErrRelationSchema, kind, t)
 	}
@@ -318,18 +318,18 @@ func (b *relationSchemaBuilder) visitRequiredType(t reflect.Type, kind RelationK
 	return nil
 }
 
-func isRequiredTypeEdge(spec relationSpec, kind RelationKind) bool {
+func isRequiredTypeEdge(spec relationSpec, kind relationKind) bool {
 	if spec.kind != kind {
 		return false
 	}
 
-	return kind != Own || !spec.many
+	return kind != ownRelation || !spec.many
 }
 
 // buildRelationSchema validates every type reachable from root. Reflection can
 // inspect not-yet-registered types, so registration order does not weaken the
 // schema checks.
-func buildRelationSchema(root reflect.Type) (*RelationRoot, error) {
+func buildRelationSchema(root reflect.Type) (*relationRoot, error) {
 	if root.Kind() == reflect.Pointer {
 		root = root.Elem()
 	}
@@ -343,7 +343,7 @@ func buildRelationSchema(root reflect.Type) (*RelationRoot, error) {
 	// I3: mandatory ownedby edges and mandatory to-one own edges must each be
 	// acyclic in the type graph. Slice own is excluded because an empty slice
 	// terminates the descent.
-	for _, edgeKind := range []RelationKind{OwnedBy, Own} {
+	for _, edgeKind := range []relationKind{ownedByRelation, ownRelation} {
 		if err := builder.validateRequiredCycles(edgeKind); err != nil {
 			return nil, err
 		}
@@ -446,11 +446,11 @@ func wireRelation(entity reflect.Value, spec relationSpec) {
 	}
 
 	switch spec.kind {
-	case Borrow, Option:
+	case borrowRelation, optionRelation:
 		wireReferenceSlice(field, spec)
-	case Own:
+	case ownRelation:
 		wireOwnSlice(entity, field, spec)
-	case Inverse:
+	case inverseRelation:
 		wireInverseSlice(entity, field, spec)
 	}
 }

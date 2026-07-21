@@ -58,14 +58,10 @@ func (db *DB[T]) relationApplyPending() error {
 	for _, entity := range db.persistQueue {
 		id := (*entity).GetId()
 		if existing[id] {
-			if _, err := db.PatchById(id, *entity); err != nil {
-				return err
-			}
-
-			continue
+			return fmt.Errorf("%w: %s(%d)", ErrAlreadyExists, db.name, id)
 		}
 
-		db.Add(entity)
+		db.add(entity)
 		existing[id] = true
 	}
 
@@ -80,7 +76,7 @@ func (db *DB[T]) relationPrepareCreate(value reflect.Value) error {
 	id := (*entity).GetId()
 	if id == 0 {
 		db.counter++
-		SetId(entity, db.counter)
+		setID(entity, db.counter)
 		return nil
 	}
 	if db.index[db.identifier][id] != nil {
@@ -94,7 +90,7 @@ func (db *DB[T]) relationPrepareCreate(value reflect.Value) error {
 }
 
 func (db *DB[T]) relationApplyCreate(value reflect.Value) {
-	db.Add(value.Interface().(*T))
+	db.add(value.Interface().(*T))
 }
 
 func (db *DB[T]) relationDelete(ids map[int]struct{}) {
@@ -134,7 +130,7 @@ func (db *DB[T]) relationSave() error {
 }
 
 func (db *DB[T]) relationClearQueues() {
-	db.ResetpersistQueue()
+	db.resetPersistQueue()
 	db.resetDeleteQueue()
 }
 
@@ -484,7 +480,7 @@ func addGraphNode(nodes map[nodeKey]relationGraphNode, value reflect.Value, typ 
 
 func resolveGraphTarget(nodes map[nodeKey]relationGraphNode, r relationSpec, pointer reflect.Value) (nodeKey, bool, error) {
 	matchField := r.matchField
-	if r.kind == Own && r.many {
+	if r.kind == ownRelation && r.many {
 		matchField = "Id"
 	}
 
@@ -547,7 +543,7 @@ func scanNodeRelations(model *relationModel, node relationGraphNode, incoming ma
 	}
 
 	for _, spec := range specs {
-		if spec.kind == Inverse {
+		if spec.kind == inverseRelation {
 			continue
 		}
 
@@ -578,7 +574,7 @@ func scanRelationField(model *relationModel, node relationGraphNode, spec relati
 			continue
 		}
 
-		if _, duplicate := seen[target]; duplicate && spec.kind == Own {
+		if _, duplicate := seen[target]; duplicate && spec.kind == ownRelation {
 			return fmt.Errorf("%w: %s.%s contains owned child %s more than once", ErrRelationInvariant, node.key.typ, spec.fieldName, target)
 		}
 
@@ -603,21 +599,21 @@ func relationFieldValues(field reflect.Value, many bool) []reflect.Value {
 }
 
 func relationMayBeMissing(spec relationSpec) bool {
-	if spec.kind == Option {
+	if spec.kind == optionRelation {
 		return true
 	}
 
-	return spec.many && (spec.kind == Borrow || spec.kind == Own)
+	return spec.many && (spec.kind == borrowRelation || spec.kind == ownRelation)
 }
 
 func recordResolvedRelation(model *relationModel, holder, target nodeKey, spec relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) {
 	model.refs = append(model.refs, resolvedRelation{holder: holder, target: target, spec: spec})
 	edge := incomingOwn{owner: holder, spec: spec}
-	if spec.kind == Own {
+	if spec.kind == ownRelation {
 		incoming[target] = append(incoming[target], edge)
 	}
 
-	if spec.kind == OwnedBy {
+	if spec.kind == ownedByRelation {
 		edge.owner = target
 		ownedBy[holder] = edge
 	}
@@ -738,9 +734,9 @@ func deletionClosure(model *relationModel, explicit map[nodeKey]struct{}) (map[n
 		}
 
 		switch ref.spec.kind {
-		case Borrow:
+		case borrowRelation:
 			return nil, fmt.Errorf("%w: %s borrows doomed %s through %s", ErrDeleteRestricted, ref.holder, ref.target, ref.spec.fieldName)
-		case Own:
+		case ownRelation:
 			if ref.spec.many {
 				continue
 			}
@@ -825,7 +821,7 @@ func canonicalizeRelationPointers(model *relationModel, deleted, changed map[nod
 		}
 
 		if _, targetDies := deleted[ref.target]; targetDies {
-			if ref.spec.kind == Option && !ref.spec.many && setRelationField(holder, ref.spec, reflect.Value{}) {
+			if ref.spec.kind == optionRelation && !ref.spec.many && setRelationField(holder, ref.spec, reflect.Value{}) {
 				changed[ref.holder] = struct{}{}
 			}
 
@@ -840,7 +836,7 @@ func canonicalizeRelationPointers(model *relationModel, deleted, changed map[nod
 
 func syncOwnSliceBackReferences(model *relationModel, deleted, changed map[nodeKey]struct{}) {
 	for _, ref := range model.refs {
-		if ref.spec.kind != Own || !ref.spec.many {
+		if ref.spec.kind != ownRelation || !ref.spec.many {
 			continue
 		}
 
@@ -976,18 +972,4 @@ func applyDeletedNodes(deleted map[nodeKey]struct{}) {
 	for _, runtime := range relationRuntimes() {
 		runtime.relationDelete(byType[runtime.relationType()])
 	}
-}
-
-func validateRelationUpdate(t reflect.Type, id int, work reflect.Value) error {
-	nodes, err := collectRelationNodes(false, &relationGraphNode{key: nodeKey{typ: t, id: id}, value: work})
-	if err != nil {
-		return err
-	}
-
-	model, err := buildRelationModel(nodes)
-	if err != nil {
-		return err
-	}
-
-	return validateRequiredRelations(model, nil)
 }

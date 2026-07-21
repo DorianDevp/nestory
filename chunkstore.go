@@ -16,7 +16,7 @@ type pointerStoreIterator interface {
 	iterateStorePointers() any
 }
 
-type Resource[T any] struct {
+type resourceSlot[T any] struct {
 	item    *T
 	version int
 	chunk   int // owning block index; drives per-chunk dirty marking
@@ -44,10 +44,10 @@ func (arr *chunkBlock[T]) Len() int {
 }
 
 type chunkStore[T any] struct {
-	chunks []*chunkBlock[Resource[T]] // each block is heap-allocated, never moves
-	tomb   []*chunkBlock[bool]        // tombstone flags, same shape as chunks
-	n      int                        // total slots appended (incl. tombstoned)
-	dead   int                        // tombstoned slots
+	chunks []*chunkBlock[resourceSlot[T]] // each block is heap-allocated, never moves
+	tomb   []*chunkBlock[bool]            // tombstone flags, same shape as chunks
+	n      int                            // total slots appended (incl. tombstoned)
+	dead   int                            // tombstoned slots
 
 	// dirty[i]: chunk i changed since last save. Guarded by dirtyMu because
 	// commits mark dirty under per-row locks, not db.mu, so two could race.
@@ -103,12 +103,12 @@ func (s *chunkStore[T]) chunkLive(ci int, fn func(*T)) {
 // loadChunk appends a freshly read block, keeping file ↔ chunk index alignment.
 // The block is clean — it already matches disk.
 func (s *chunkStore[T]) loadChunk(vals []T) {
-	ch := &chunkBlock[Resource[T]]{}
+	ch := &chunkBlock[resourceSlot[T]]{}
 	tb := &chunkBlock[bool]{}
 	ci := len(s.chunks)
 	for i := range vals {
 		v := vals[i]
-		ch.data[ch.n] = Resource[T]{item: &v, chunk: ci}
+		ch.data[ch.n] = resourceSlot[T]{item: &v, chunk: ci}
 		ch.n++
 		tb.data[tb.n] = false
 		tb.n++
@@ -124,11 +124,11 @@ func newChunkStore[T any]() *chunkStore[T] {
 	return &chunkStore[T]{}
 }
 
-// Append stores v and returns a stable pointer to its Resource slot — safe to
-// index by id elsewhere, since neither the Resource nor its item ever moves.
-func (s *chunkStore[T]) Append(v T) *Resource[T] {
+// Append stores v and returns a stable pointer to its resourceSlot slot — safe to
+// index by id elsewhere, since neither the resourceSlot nor its item ever moves.
+func (s *chunkStore[T]) Append(v T) *resourceSlot[T] {
 	if len(s.chunks) == 0 || s.chunks[len(s.chunks)-1].Len() == chunkLimit {
-		s.chunks = append(s.chunks, &chunkBlock[Resource[T]]{})
+		s.chunks = append(s.chunks, &chunkBlock[resourceSlot[T]]{})
 		s.tomb = append(s.tomb, &chunkBlock[bool]{})
 		s.dirtyMu.Lock()
 		s.dirty = append(s.dirty, false)
@@ -137,7 +137,7 @@ func (s *chunkStore[T]) Append(v T) *Resource[T] {
 
 	ci := len(s.chunks) - 1
 	last := s.chunks[ci]
-	last.Push(Resource[T]{item: &v, chunk: ci})
+	last.Push(resourceSlot[T]{item: &v, chunk: ci})
 	s.tomb[ci].Push(false)
 
 	s.n++
@@ -153,7 +153,7 @@ func (s *chunkStore[T]) Len() int {
 
 // Chunks/Tombs expose the raw blocks for contiguous iteration. Callers must
 // not append to the returned inner slices.
-func (s *chunkStore[T]) Chunks() []*chunkBlock[Resource[T]] {
+func (s *chunkStore[T]) Chunks() []*chunkBlock[resourceSlot[T]] {
 	return s.chunks
 }
 
@@ -179,9 +179,9 @@ func (s *chunkStore[T]) Range(fn func(p *T)) {
 	}
 }
 
-// rangeResources calls fn for every live Resource slot. Used to rebuild
+// rangeResources calls fn for every live resourceSlot slot. Used to rebuild
 // resById after a load.
-func (s *chunkStore[T]) rangeResources(fn func(*Resource[T])) {
+func (s *chunkStore[T]) rangeResources(fn func(*resourceSlot[T])) {
 	for c := range s.chunks {
 		ch := s.chunks[c]
 		tb := s.tomb[c]

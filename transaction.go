@@ -13,6 +13,19 @@ type Tx[T Entity] struct {
 	id txId
 }
 
+// TransactionContext is implemented by a live Tx. Join uses it to expose a
+// differently typed DB inside the same commit context.
+type TransactionContext interface {
+	transactionID() txId
+}
+
+func (tx *Tx[T]) transactionID() txId { return tx.id }
+
+// Join binds db to an existing transaction without opening a nested commit.
+func (db *DB[T]) Join(context TransactionContext) *Tx[T] {
+	return &Tx[T]{db: db, id: context.transactionID()}
+}
+
 // Transaction runs fn against one shared transaction context and commits every
 // changed branch once. Returning an error discards the complete working set.
 func (db *DB[T]) Transaction(fn func(*Tx[T]) error) error {
@@ -115,7 +128,7 @@ func stageCreatedOwnershipTree(tx txId, root reflect.Value) error {
 			return err
 		}
 		for _, spec := range specs {
-			if spec.kind != Own {
+			if spec.kind != ownRelation {
 				continue
 			}
 

@@ -21,7 +21,7 @@ var ErrNotFound = errors.New("nestory: entity not found")
 type txId uint64
 
 // touchedResource is one resource a transaction touched — pure, type-erased
-// data. The live Resource and the typed write-back resolve at commit via
+// data. The live resourceSlot and the typed write-back resolve at commit via
 // baseRegistry[typ].
 type touchedResource struct {
 	dbName   string
@@ -31,9 +31,9 @@ type touchedResource struct {
 	original any // *T, state at the start of the branch
 }
 
-// committer is the type-erased view the Engine drives at commit. *DB[T]
+// committer is the type-erased view the transactionEngine drives at commit. *DB[T]
 // implements it. resourceVersion/applyWrite/refreshSnapshot assume the per-row
-// lock is already held — the Engine owns locking so it can enforce a global order.
+// lock is already held — the transactionEngine owns locking so it can enforce a global order.
 type committer interface {
 	lockResource(id int)
 	unlockResource(id int)
@@ -62,9 +62,9 @@ func committerFor(dbName string) committer {
 	return baseRegistry[dbName].(committer)
 }
 
-// Engine sits above every DB, owns the live contracts and serialises commits.
+// transactionEngine sits above every DB, owns the live contracts and serialises commits.
 // It stays generic — reaches a type's resources only through baseRegistry.
-type Engine struct {
+type transactionEngine struct {
 	mu      sync.Mutex
 	nextTx  txId
 	txs     map[txId][]touchedResource
@@ -73,8 +73,8 @@ type Engine struct {
 	bind    map[any]txId // snapshot *T → owning tx, for O(1) Get→Update
 }
 
-func newEngine() *Engine {
-	return &Engine{
+func newEngine() *transactionEngine {
+	return &transactionEngine{
 		txs:     make(map[txId][]touchedResource),
 		creates: make(map[txId]map[nodeKey]createdResource),
 		deletes: make(map[txId]map[nodeKey]stagedDelete),
@@ -84,7 +84,7 @@ func newEngine() *Engine {
 
 var engine = newEngine()
 
-func (en *Engine) begin() txId {
+func (en *transactionEngine) begin() txId {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
@@ -97,7 +97,7 @@ func (en *Engine) begin() txId {
 	return id
 }
 
-func (en *Engine) created(tx txId, key nodeKey) (reflect.Value, bool) {
+func (en *transactionEngine) created(tx txId, key nodeKey) (reflect.Value, bool) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
@@ -105,7 +105,7 @@ func (en *Engine) created(tx txId, key nodeKey) (reflect.Value, bool) {
 	return created.work, ok
 }
 
-func (en *Engine) stageCreate(tx txId, created createdResource) error {
+func (en *transactionEngine) stageCreate(tx txId, created createdResource) error {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
@@ -120,7 +120,7 @@ func (en *Engine) stageCreate(tx txId, created createdResource) error {
 	return nil
 }
 
-func (en *Engine) stageDelete(tx txId, deleted stagedDelete) error {
+func (en *transactionEngine) stageDelete(tx txId, deleted stagedDelete) error {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
@@ -132,7 +132,7 @@ func (en *Engine) stageDelete(tx txId, deleted stagedDelete) error {
 	return nil
 }
 
-func (en *Engine) record(tx txId, e touchedResource) {
+func (en *transactionEngine) record(tx txId, e touchedResource) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
@@ -146,7 +146,7 @@ func (en *Engine) record(tx txId, e touchedResource) {
 	en.bind[e.work] = tx
 }
 
-func (en *Engine) work(tx txId, dbName string, id int) (any, bool) {
+func (en *transactionEngine) work(tx txId, dbName string, id int) (any, bool) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
@@ -159,7 +159,7 @@ func (en *Engine) work(tx txId, dbName string, id int) (any, bool) {
 	return nil, false
 }
 
-func (en *Engine) commitByPtr(work any) error {
+func (en *transactionEngine) commitByPtr(work any) error {
 	en.mu.Lock()
 	tx, ok := en.bind[work]
 	en.mu.Unlock()
@@ -171,17 +171,7 @@ func (en *Engine) commitByPtr(work any) error {
 	return en.commit(tx)
 }
 
-func (en *Engine) discardByPtr(work any) {
-	en.mu.Lock()
-	tx, ok := en.bind[work]
-	en.mu.Unlock()
-
-	if ok {
-		en.evict(tx)
-	}
-}
-
-func (en *Engine) commit(transactionId txId) error {
+func (en *transactionEngine) commit(transactionId txId) error {
 	en.mu.Lock()
 	resources, active := en.txs[transactionId]
 	touchedResources := append([]touchedResource(nil), resources...)
@@ -208,7 +198,7 @@ func (en *Engine) commit(transactionId txId) error {
 		return nil
 	}
 
-	model, deleted, err := validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
+	_, deleted, err := validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
 	if err != nil {
 		return err
 	}
@@ -280,7 +270,7 @@ func (en *Engine) commit(transactionId txId) error {
 	if err != nil {
 		return err
 	}
-	model, err = buildRelationModel(nodes)
+	model, err := buildRelationModel(nodes)
 	if err != nil {
 		return err
 	}
@@ -429,7 +419,7 @@ func validateTransactionGraph(resources []touchedResource, creates map[nodeKey]c
 // refresh pulls live state into every snapshot and re-stamps versions so the
 // caller can retry. Caller holds every touched lock (commit does); en.mu is
 // only ever taken after resource locks, never the reverse, so no deadlock.
-func (en *Engine) refresh(tx txId) {
+func (en *transactionEngine) refresh(tx txId) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
@@ -450,7 +440,7 @@ func (en *Engine) refresh(tx txId) {
 	rewireTouchedCopies(en.txs[tx])
 }
 
-func (en *Engine) evict(tx txId) {
+func (en *transactionEngine) evict(tx txId) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 

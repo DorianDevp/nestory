@@ -102,8 +102,8 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 			return nil, ierr
 		}
 
-		byId := make(map[int]*Resource[T], store.Len())
-		store.rangeResources(func(r *Resource[T]) { byId[(*r.item).GetId()] = r })
+		byId := make(map[int]*resourceSlot[T], store.Len())
+		store.rangeResources(func(r *resourceSlot[T]) { byId[(*r.item).GetId()] = r })
 		for i := range vals {
 			if r, ok := byId[ids[i]]; ok {
 				*r.item = vals[i]
@@ -224,7 +224,7 @@ func (db *DB[T]) save() error {
 func (db *DB[T]) saveChunk(dir string, ci int, sliceType reflect.Type) error {
 	slice := reflect.MakeSlice(sliceType, 0, 0)
 	db.store.chunkLive(ci, func(p *T) {
-		slice = reflect.Append(slice, db.NormalizeToSchema(*p))
+		slice = reflect.Append(slice, db.normalizeToSchema(*p))
 	})
 
 	finalPath := filepath.Join(dir, fmt.Sprintf("%d.gob", ci))

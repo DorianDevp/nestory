@@ -34,7 +34,7 @@ func specsByField(t reflect.Type) (map[string]relationSpec, error) {
 }
 
 func persistedRelation(r relationSpec) bool {
-	return !r.many || r.kind == Borrow || r.kind == Option
+	return !r.many || r.kind == borrowRelation || r.kind == optionRelation
 }
 
 func relationColumnName(r relationSpec) string { return r.fieldName + r.matchField }
@@ -122,8 +122,7 @@ func inflateSlice[T Entity](creator *dbCreator, rows reflect.Value) ([]T, error)
 	return out, nil
 }
 
-// NormalizeToSchema flattens relations to scalar foreign keys (or key slices).
-func (db *DB[T]) NormalizeToSchema(instance T) reflect.Value {
+func (db *DB[T]) normalizeToSchema(instance T) reflect.Value {
 	v := reflect.ValueOf(instance)
 	specs, err := specsByField(v.Type())
 	if err != nil {

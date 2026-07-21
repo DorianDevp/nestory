@@ -55,8 +55,8 @@ func TestTransactionEditsOwnershipTreeWithoutUpdate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		user, _ := world.userDB.FindOneBy("Id", world.user.Id)
-		post, _ := world.postDB.FindOneBy("Id", world.current.Id)
+		user, _ := world.userDB.Unsafe().Get(world.user.Id)
+		post, _ := world.postDB.Unsafe().Get(world.current.Id)
 		if user.Name != "Grace" || post.Title != "transactional" {
 			t.Fatalf("committed graph = user %q, post %q", user.Name, post.Title)
 		}
@@ -132,9 +132,9 @@ func TestUpdateWithinRetriesNestedOwnershipConflict(t *testing.T) {
 		owner := &txOwner{}
 		child := &txChild{Owner: owner}
 		owner.Child = child
-		ownerDB.AddToPersistQueue(owner)
-		childDB.AddToPersistQueue(child)
-		if err := ownerDB.Flush(); err != nil {
+		ownerDB.Unsafe().Create(owner)
+		childDB.Unsafe().Create(child)
+		if err := ownerDB.Unsafe().Flush(); err != nil {
 			t.Fatal(err)
 		}
 
@@ -146,8 +146,9 @@ func TestUpdateWithinRetriesNestedOwnershipConflict(t *testing.T) {
 			go func() {
 				defer wait.Done()
 				for range perGoroutine {
-					if err := ownerDB.UpdateWithin(owner.Id, func(branch *txOwner) {
+					if err := ownerDB.UpdateWithin(owner.Id, func(branch *txOwner) error {
 						branch.Child.N++
+						return nil
 					}); err != nil {
 						panic(err)
 					}
@@ -180,9 +181,9 @@ func TestTransactionCreatesAndDeletesOwnershipTreesOnce(t *testing.T) {
 		oldOwner := &txOwner{}
 		oldChild := &txChild{Owner: oldOwner}
 		oldOwner.Child = oldChild
-		ownerDB.AddToPersistQueue(oldOwner)
-		childDB.AddToPersistQueue(oldChild)
-		if err := ownerDB.Flush(); err != nil {
+		ownerDB.Unsafe().Create(oldOwner)
+		childDB.Unsafe().Create(oldChild)
+		if err := ownerDB.Unsafe().Flush(); err != nil {
 			t.Fatal(err)
 		}
 
@@ -211,11 +212,11 @@ func TestTransactionCreatesAndDeletesOwnershipTreesOnce(t *testing.T) {
 		if ownerDB.Len() != 1 || childDB.Len() != 1 {
 			t.Fatalf("live counts = owners %d, children %d", ownerDB.Len(), childDB.Len())
 		}
-		storedOwner, err := ownerDB.FindOneBy("Id", newOwner.Id)
+		storedOwner, err := ownerDB.Unsafe().Get(newOwner.Id)
 		if err != nil {
 			t.Fatal(err)
 		}
-		storedChild, err := childDB.FindOneBy("Id", newChild.Id)
+		storedChild, err := childDB.Unsafe().Get(newChild.Id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -262,6 +263,73 @@ func TestTransactionErrorDiscardsCreatedTree(t *testing.T) {
 		}
 		if ownerDB.Len() != 0 || Open[txChild]().Len() != 0 {
 			t.Fatal("rolled back create reached the live store")
+		}
+	})
+}
+
+func TestShortCreateAndDeleteOwnCompleteTree(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txChild](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txOwner](); err != nil {
+			t.Fatal(err)
+		}
+
+		ownerDB := Open[txOwner]()
+		childDB := Open[txChild]()
+		owner := &txOwner{}
+		child := &txChild{Owner: owner}
+		owner.Child = child
+		if err := ownerDB.Create(owner); err != nil {
+			t.Fatal(err)
+		}
+
+		if ownerDB.Len() != 1 || childDB.Len() != 1 {
+			t.Fatal("Create did not persist the complete ownership tree")
+		}
+
+		if err := ownerDB.Delete(owner.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if ownerDB.Len() != 0 || childDB.Len() != 0 {
+			t.Fatal("Delete did not cascade through the complete ownership tree")
+		}
+	})
+}
+
+func TestJoinCombinesDifferentTypesInOneCommit(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		world := seedRuntime(t)
+		err := world.userDB.Transaction(func(users *Tx[rtUser]) error {
+			watchers := world.watcherDB.Join(users)
+			if err := watchers.Delete(world.watcher.Id); err != nil {
+				return err
+			}
+
+			return users.Delete(world.user.Id)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if world.userDB.Len() != 0 || world.profileDB.Len() != 0 || world.postDB.Len() != 0 || world.watcherDB.Len() != 0 {
+			t.Fatal("joined transaction did not delete the requested ownership and borrower trees")
+		}
+
+		if world.assetDB.Len() != 1 || world.logDB.Len() != 1 {
+			t.Fatal("joined transaction deleted unowned entities")
+		}
+
+		log, err := world.logDB.Unsafe().Get(world.log.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if log.User != nil {
+			t.Fatal("joined transaction did not clear an option into the deleted tree")
 		}
 	})
 }

@@ -1,124 +1,66 @@
 package nestory
 
 import (
-	"fmt"
 	"reflect"
-	"sync"
 )
 
-// Look by indices: exists && empty -> nil
-// routines through chunks
-func (db *DB[T]) FindOneBy(key string, withValue any) (*T, error) {
-	if db.store.Len() == 0 {
-		return nil, ErrEmptyEntity
+// FindOneBy returns a detached branch for the first matching entity.
+func (db *DB[T]) FindOneBy(field string, value any) (*T, error) {
+	graphMu.RLock()
+	id, err := db.findID(field, value)
+	graphMu.RUnlock()
+	if err != nil {
+		return nil, err
 	}
 
-	indexMap := db.index[key]
-	if indexMap != nil {
-		if val, ok := indexMap[withValue]; ok {
-			return val, nil
-		} else {
-			return nil, nil
-		}
-	}
-
-	chunks := db.store.Chunks()
-	tombs := db.store.Tombs()
-
-	needle := make(chan *Resource[T], 1)
-
-	var wg sync.WaitGroup
-
-	wg.Add(len(chunks))
-
-	for chunkIdx := range chunks {
-		go func(chunkIdx int) {
-			defer wg.Done()
-
-			chunk := chunks[chunkIdx]
-			tomb := tombs[chunkIdx]
-
-			for i := range chunk.n {
-				if tomb.data[i] {
-					continue
-				}
-
-				s := &chunk.data[i]
-
-				val := reflect.ValueOf(s).Elem()
-				for val.Kind() == reflect.Pointer || val.Kind() == reflect.Interface {
-					if val.IsNil() {
-						break
-					}
-
-					val = val.Elem()
-				}
-
-				if val.Kind() != reflect.Struct {
-					continue
-				}
-
-				f := val.FieldByName(key)
-				if f.IsValid() && f.Interface() == withValue {
-					s.mu.RLock()
-					needle <- s
-
-					return
-				}
-			}
-		}(chunkIdx)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case item := <-needle:
-		item.mu.RUnlock()
-		return item.item, nil
-	case <-done:
-		return nil, nil
-	}
+	return db.Get(id)
 }
 
-// Filter returns every live entity for which filterFn returns true (by value).
+func (db *DB[T]) findID(field string, value any) (int, error) {
+	if index := db.index[field]; index != nil {
+		entity, found := index[value]
+		if !found {
+			return 0, ErrNotFound
+		}
+
+		return (*entity).GetId(), nil
+	}
+
+	var id int
+	db.store.Range(func(entity *T) {
+		if id != 0 {
+			return
+		}
+
+		candidate := reflect.ValueOf(entity).Elem().FieldByName(field)
+		if candidate.IsValid() && reflect.DeepEqual(candidate.Interface(), value) {
+			id = (*entity).GetId()
+		}
+	})
+	if id == 0 {
+		return 0, ErrNotFound
+	}
+
+	return id, nil
+}
+
+// Filter returns detached root values matching filterFn. Use Transaction for
+// writable ownership branches.
 func (db *DB[T]) Filter(filterFn func(T) bool) []T {
-	var filteredSlice []T
-	db.store.Range(func(p *T) {
-		if filterFn(*p) {
-			filteredSlice = append(filteredSlice, *p)
+	graphMu.RLock()
+	defer graphMu.RUnlock()
+
+	var filtered []T
+	db.store.Range(func(entity *T) {
+		if filterFn(*entity) {
+			filtered = append(filtered, *entity)
 		}
 	})
-	return filteredSlice
+	return filtered
 }
-
-// FilterPtr is like Filter but returns stable *T pointers into the backing
-// store. Returns an error if the result is empty — callers depend on this for
-// "no rows" detection.
-func (db *DB[T]) FilterPtr(filterFn func(*T) bool) ([]*T, error) {
-	var filteredSlice []*T
-	db.store.Range(func(p *T) {
-		if filterFn(p) {
-			filteredSlice = append(filteredSlice, p)
-		}
-	})
-
-	if len(filteredSlice) == 0 {
-		return filteredSlice, fmt.Errorf("empty array")
-	}
-
-	return filteredSlice, nil
-}
-
-// These open and commit transactions through the Engine; the machinery they
-// drive lives in tx.go and engine.go.
 
 // Get returns a detached branch containing id and its complete ownership
-// subtree. Mutate any owned node through normal pointers, then hand the root to
-// Update. Non-owning relations outside the branch remain read-only live links.
+// subtree. Mutate owned nodes and hand the root to Update to merge the branch.
 func (db *DB[T]) Get(id int) (*T, error) {
 	tx := engine.begin()
 	work, err := db.getInTransaction(tx, id)
@@ -143,9 +85,8 @@ func (db *DB[T]) getInTransaction(tx txId, id int) (*T, error) {
 
 	for key, value := range work {
 		if _, ok := baseRegistry[key.typ.Name()].(committer); !ok {
-			return nil, fmt.Errorf("nestory: %s is not open", key.typ)
+			return nil, ErrNotFound
 		}
-
 		engine.record(tx, touchedResource{
 			dbName: key.typ.Name(), id: key.id, ver: versions[key],
 			work: value.Interface(), original: original[key].Interface(),
@@ -155,47 +96,18 @@ func (db *DB[T]) getInTransaction(tx txId, id int) (*T, error) {
 	return work[root].Interface().(*T), nil
 }
 
-// UnsafeGet returns the live, stable store pointer for id and marks its chunk
-// dirty so a later Flush persists direct mutations. It performs no snapshot,
-// copy, transaction bookkeeping, row locking, or rollback.
-//
-// The caller must provide exclusive access until Flush completes. Mutations are
-// visible immediately, even when Flush later rejects the relation graph. After
-// such an error, repair the live value and call Flush again.
-func (db *DB[T]) UnsafeGet(id int) (*T, error) {
-	resource, ok := db.resource(id)
-	if !ok {
-		return nil, ErrNotFound
-	}
-	if err := ensureCommittedOwnership(); err != nil {
-		return nil, err
-	}
-
-	db.store.markDirty(resource.chunk)
-
-	return resource.item, nil
+// Update merges the detached ownership branch returned by Get.
+func (db *DB[T]) Update(branch *T) error {
+	return engine.commitByPtr(branch)
 }
 
-// Update commits the transaction that produced work. On conflict it returns
-// ErrConflict and refreshes work in place to live state, so the caller can
-// re-apply and call Update again.
-func (db *DB[T]) Update(work *T) error {
-	return engine.commitByPtr(work)
-}
-
-// UpdateWithin runs fn against a fresh snapshot of id and commits, retrying on
-// conflict. fn must express intent (c.N++), not absolute values from a stale
-// read — it re-runs against the refreshed snapshot on each retry.
-func (db *DB[T]) UpdateWithin(id int, fn func(*T)) error {
-	work, err := db.Get(id)
-	if err != nil {
-		return err
-	}
-
+// UpdateWithin retries a short transaction on conflict. fn may run more than
+// once and must therefore express intent without external side effects.
+func (db *DB[T]) UpdateWithin(id int, fn func(*T) error) error {
 	for {
-		fn(work)
-
-		err := db.Update(work)
+		err := db.Transaction(func(tx *Tx[T]) error {
+			return tx.UpdateWithin(id, fn)
+		})
 		if err != ErrConflict {
 			return err
 		}

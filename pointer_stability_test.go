@@ -20,14 +20,14 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 	db := Open[bqItem]()
 
 	first := &bqItem{Name: "first"}
-	db.AddToPersistQueue(first)
-	if err := db.Flush(); err != nil {
+	db.Unsafe().Create(first)
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
 	// Grab a stable pointer into the store. Ids are int and integer literals
 	// are int, so the lookup key matches the index with no cast needed.
-	p, err := db.FindOneBy("Id", 1)
+	p, err := db.Unsafe().Get(1)
 	if err != nil || p == nil {
 		t.Fatalf("FindOneBy(Id,1): p=%v err=%v", p, err)
 	}
@@ -35,23 +35,29 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 	// Insert well past a chunk boundary — this is what used to reallocate the
 	// backing slice and invalidate p.
 	for i := 0; i < chunkLimit+50; i++ {
-		db.AddToPersistQueue(&bqItem{Name: "filler"})
+		db.Unsafe().Create(&bqItem{Name: "filler"})
 	}
 
-	if err := db.Flush(); err != nil {
+	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("flush 2: %v", err)
 	}
 
 	// Same id must resolve to the very same address...
-	p2, _ := db.FindOneBy("Id", 1)
+	p2, _ := db.Unsafe().Get(1)
 	if p2 != p {
 		t.Errorf("pointer to id=1 moved across growth: %p -> %p", p, p2)
 	}
 
 	// ...and a mutation applied through the store must be visible via the
 	// pointer we captured before all those inserts.
-	if _, err := db.PatchById(1, bqItem{Name: "updated"}); err != nil {
-		t.Fatalf("patch: %v", err)
+	branch, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("get branch: %v", err)
+	}
+
+	branch.Name = "updated"
+	if err := db.Update(branch); err != nil {
+		t.Fatalf("update: %v", err)
 	}
 
 	if p.Name != "updated" {
