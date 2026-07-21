@@ -94,6 +94,26 @@ or a newly introduced entity type deliberately fall back to a complete index
 rebuild. The end-to-end cost still grows with the ownership branch because the
 safe API returns and compares a detached mutable copy of that branch.
 
+### Targeted mutation versus total graph size
+
+To separate detached-branch copying from global graph maintenance, a second
+workload keeps the mutated local subtree constant while widening the unrelated
+part of the registered graph. Both operations address the mutated node or its
+two parents directly by ID.
+
+| operation | 100 total nodes | 1,000 total nodes | 10,000 total nodes |
+|---|---:|---:|---:|
+| scalar write | 5.24 µs | 5.30 µs | 5.23 µs |
+| reparent subtree | 130 µs | 1.21 ms | 12.25 ms |
+
+The scalar control stays flat, proving that ID-targeted access already avoids
+copying unrelated ownership branches. Structural mutation remains linear in
+the complete registered graph: the current transaction model copies global
+node/owner/reference indexes and relation rewiring scans every live relation
+store. Persistent relation indexes and targeted rewiring therefore take
+priority over transparent object-level copy-on-write, which ordinary mutable
+Go pointers cannot intercept without changing Nestory's struct-first API.
+
 ## Full scan + filter — time per scan (lower = better)
 
 | engine | n=100 | n=1,000 | n=10,000 |

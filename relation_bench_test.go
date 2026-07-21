@@ -147,6 +147,58 @@ func newDialogBenchDB(tb testing.TB, nodes int) (*DB[dialogBenchNode], *dialogBe
 	return db, root, all
 }
 
+type wideDialogBench struct {
+	db       *DB[dialogBenchNode]
+	leftID   int
+	rightID  int
+	branchID int
+	scalarID int
+}
+
+func newWideDialogBenchDB(tb testing.TB, nodes int) wideDialogBench {
+	tb.Helper()
+	if nodes < 5 {
+		tb.Fatal("wide dialog benchmark needs at least five nodes")
+	}
+
+	DataDir = tb.TempDir()
+	resetRegistries()
+	if err := Register[dialogBenchNode](); err != nil {
+		tb.Fatal(err)
+	}
+
+	db := Open[dialogBenchNode]()
+	root := &dialogBenchNode{Text: "root"}
+	left := &dialogBenchNode{Text: "left"}
+	right := &dialogBenchNode{Text: "right"}
+	branch := &dialogBenchNode{Text: "branch"}
+	scalar := &dialogBenchNode{Text: "scalar"}
+	for _, node := range []*dialogBenchNode{root, left, right, branch, scalar} {
+		db.Unsafe().Create(node)
+	}
+
+	left.ParentID = root.Id
+	right.ParentID = root.Id
+	branch.ParentID = left.Id
+	scalar.ParentID = root.Id
+	left.Children = []*dialogBenchNode{branch}
+	root.Children = []*dialogBenchNode{left, right, scalar}
+	for len(root.Children)+2 < nodes {
+		filler := &dialogBenchNode{ParentID: root.Id, Text: "filler"}
+		db.Unsafe().Create(filler)
+		root.Children = append(root.Children, filler)
+	}
+
+	if err := db.Unsafe().Flush(); err != nil {
+		tb.Fatal(err)
+	}
+
+	return wideDialogBench{
+		db: db, leftID: left.Id, rightID: right.Id,
+		branchID: branch.Id, scalarID: scalar.Id,
+	}
+}
+
 func findDialogNode(root *dialogBenchNode, id int) *dialogBenchNode {
 	if root.Id == id {
 		return root
@@ -382,6 +434,71 @@ func BenchmarkDialogTreeReparentBranch(b *testing.B) {
 					}
 
 					return fmt.Errorf("branch %d is not owned by %d", branchID, fromID)
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDialogTreeTargetedScalarWrite(b *testing.B) {
+	for _, nodes := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
+			quiet(b)
+			world := newWideDialogBenchDB(b, nodes)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				err := world.db.UpdateWithin(world.scalarID, func(node *dialogBenchNode) error {
+					if iteration%2 == 0 {
+						node.Text = "scalar-even"
+					} else {
+						node.Text = "scalar-odd"
+					}
+
+					return nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDialogTreeTargetedReparent(b *testing.B) {
+	for _, nodes := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
+			quiet(b)
+			world := newWideDialogBenchDB(b, nodes)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				fromID, toID := world.leftID, world.rightID
+				if iteration%2 == 1 {
+					fromID, toID = toID, fromID
+				}
+
+				err := world.db.Transaction(func(tx *Tx[dialogBenchNode]) error {
+					from, getErr := tx.Get(fromID)
+					if getErr != nil {
+						return getErr
+					}
+
+					to, getErr := tx.Get(toID)
+					if getErr != nil {
+						return getErr
+					}
+
+					if len(from.Children) != 1 || from.Children[0].Id != world.branchID {
+						return fmt.Errorf("branch %d is not owned by %d", world.branchID, fromID)
+					}
+
+					to.Children = append(to.Children, from.Children[0])
+					from.Children = nil
+					return nil
 				})
 				if err != nil {
 					b.Fatal(err)
