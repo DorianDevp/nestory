@@ -361,6 +361,7 @@ func cloneOwnershipAggregate(root nodeKey, record func(touchedResource)) (any, e
 	if err := ensureCommittedOwnership(); err != nil {
 		return nil, err
 	}
+
 	if !committedOwnerHasChildren(root) {
 		return cloneSingleOwnershipResource(root, record)
 	}
@@ -527,6 +528,7 @@ func rewireResourcePointer(pointer reflect.Value, targetType reflect.Type, resou
 	if original {
 		target = resources[position].original
 	}
+
 	pointer.Set(reflect.ValueOf(target))
 }
 
@@ -1122,6 +1124,7 @@ func flushRelations() error {
 	if err != nil {
 		return err
 	}
+
 	if err := validateRequiredRelations(model, deleted); err != nil {
 		return err
 	}
@@ -1142,6 +1145,7 @@ func flushRelations() error {
 	if err != nil {
 		return err
 	}
+
 	if err := validateRequiredRelations(model, deleted); err != nil {
 		return err
 	}
@@ -1174,6 +1178,7 @@ func flushRelations() error {
 	for _, runtime := range runtimes {
 		runtime.relationClearQueues()
 	}
+
 	if err := refreshCommittedOwnership(); err != nil {
 		return err
 	}

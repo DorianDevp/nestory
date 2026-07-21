@@ -255,6 +255,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	if err != nil {
 		return err
 	}
+
 	graphChanged := structural || relationChanged
 	if graphChanged {
 		graphMu.Lock()
@@ -271,6 +272,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 			return err
 		}
 	}
+
 	if !graphChanged && len(touchedResources) == 1 {
 		return en.commitSingleWrite(tx, touchedResources[0])
 	}
@@ -311,6 +313,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 			return ErrConflict
 		}
 	}
+
 	for key, deletedResource := range stagedDeletes {
 		if _, created := createdResources[key]; created {
 			continue
@@ -338,6 +341,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		runtime := baseRegistry[created.key.typ.Name()].(relationRuntime)
 		runtime.relationApplyCreate(created.work)
 	}
+
 	if !graphChanged {
 		en.evict(tx)
 		return nil
@@ -412,6 +416,7 @@ func resourcesChangeRelationGraph(resources []touchedResource) (bool, error) {
 		if resource.original.(Entity).GetId() != resource.work.(Entity).GetId() {
 			return false, fmt.Errorf("%w: primary key of %s(%d) changed", ErrRelationInvariant, before.Type(), resource.id)
 		}
+
 		if !hasRelations {
 			continue
 		}
@@ -522,6 +527,7 @@ func entityStateEqual(before, after any) bool {
 	if err != nil {
 		return false
 	}
+
 	if len(specs) == 0 {
 		return reflect.DeepEqual(a.Interface(), b.Interface())
 	}
@@ -534,6 +540,7 @@ func entityStateEqual(before, after any) bool {
 			if !relationValueEqual(left, right, spec.many) {
 				return false
 			}
+
 			continue
 		}
 
