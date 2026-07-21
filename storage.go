@@ -42,10 +42,6 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 		return nil, err
 	}
 
-	if len(paths) == 0 {
-		return store, nil
-	}
-
 	results := make([][]T, len(paths))
 	errs := make([]error, len(paths))
 
@@ -89,29 +85,54 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 		return nil, werr
 	}
 
-	if len(walRows) > 0 {
-		rows := reflect.MakeSlice(sliceType, 0, len(walRows))
-		ids := make([]int, len(walRows))
-		for i, wr := range walRows {
-			rows = reflect.Append(rows, wr.row)
-			ids[i] = wr.id
-		}
-
-		vals, ierr := inflateSlice[T](creator, rows)
-		if ierr != nil {
-			return nil, ierr
-		}
-
-		byId := make(map[int]*resourceSlot[T], store.Len())
-		store.rangeResources(func(r *resourceSlot[T]) { byId[(*r.item).GetId()] = r })
-		for i := range vals {
-			if r, ok := byId[ids[i]]; ok {
-				*r.item = vals[i]
-			}
-		}
+	if err := applyRecoveredRows(store, creator, sliceType, walRows); err != nil {
+		return nil, err
 	}
 
 	return store, nil
+}
+
+func applyRecoveredRows[T Entity](store *chunkStore[T], creator *dbCreator, sliceType reflect.Type, rows []recoveredRow) error {
+	byID := make(map[int]*resourceSlot[T], store.Len()+len(rows))
+	store.rangeResources(func(resource *resourceSlot[T]) {
+		byID[(*resource.item).GetId()] = resource
+	})
+	deleted := make(map[int]struct{})
+	for _, recovered := range rows {
+		if recovered.deleted {
+			deleted[recovered.id] = struct{}{}
+			continue
+		}
+
+		encoded := reflect.MakeSlice(sliceType, 1, 1)
+		encoded.Index(0).Set(recovered.row)
+		values, err := inflateSlice[T](creator, encoded)
+		if err != nil {
+			return err
+		}
+		if rowID := values[0].GetId(); rowID != recovered.id {
+			return fmt.Errorf("nestory: WAL row id %d contains entity id %d", recovered.id, rowID)
+		}
+
+		delete(deleted, recovered.id)
+		if resource, found := byID[recovered.id]; found {
+			*resource.item = values[0]
+			store.markDirty(resource.chunk)
+			continue
+		}
+
+		resource := store.Append(values[0])
+		byID[recovered.id] = resource
+	}
+
+	if len(deleted) > 0 {
+		store.DeleteFunc(func(entity *T) bool {
+			_, found := deleted[(*entity).GetId()]
+			return found
+		})
+	}
+
+	return nil
 }
 
 // sortedChunkFiles lists "<n>.gob" files in dir, ordered by n.
