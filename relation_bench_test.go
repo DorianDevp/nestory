@@ -53,6 +53,15 @@ type parallelBenchB struct {
 
 func (entity parallelBenchB) GetId() int { return entity.Id }
 
+type dialogBenchNode struct {
+	Id       int `key:"primary"`
+	ParentID int
+	Text     string
+	Children []*dialogBenchNode `rel:"own,ParentID"`
+}
+
+func (node dialogBenchNode) GetId() int { return node.Id }
+
 var relationBranchSizes = []int{0, 1, 10, 100, 1000}
 
 func newRelationBenchDB(tb testing.TB, children int) (*DB[relationBenchOwner], *DB[relationBenchChild], int) {
@@ -108,6 +117,48 @@ func newOneToOneBenchDB(tb testing.TB) (*DB[relationBenchOneOwner], int) {
 	}
 
 	return ownerDB, owner.Id
+}
+
+func newDialogBenchDB(tb testing.TB, nodes int) (*DB[dialogBenchNode], *dialogBenchNode, []*dialogBenchNode) {
+	tb.Helper()
+	DataDir = tb.TempDir()
+	resetRegistries()
+	if err := Register[dialogBenchNode](); err != nil {
+		tb.Fatal(err)
+	}
+
+	db := Open[dialogBenchNode]()
+	all := make([]*dialogBenchNode, 0, nodes)
+	root := &dialogBenchNode{Text: "root"}
+	db.Unsafe().Create(root)
+	all = append(all, root)
+	for index := 1; index < nodes; index++ {
+		parent := all[(index-1)/2]
+		node := &dialogBenchNode{ParentID: parent.Id, Text: "message"}
+		db.Unsafe().Create(node)
+		parent.Children = append(parent.Children, node)
+		all = append(all, node)
+	}
+
+	if err := db.Unsafe().Flush(); err != nil {
+		tb.Fatal(err)
+	}
+
+	return db, root, all
+}
+
+func findDialogNode(root *dialogBenchNode, id int) *dialogBenchNode {
+	if root.Id == id {
+		return root
+	}
+
+	for _, child := range root.Children {
+		if found := findDialogNode(child, id); found != nil {
+			return found
+		}
+	}
+
+	return nil
 }
 
 func BenchmarkRelationBranchLifecycle(b *testing.B) {
@@ -263,6 +314,76 @@ func BenchmarkRelationCascadeDelete(b *testing.B) {
 				b.StartTimer()
 
 				if err := ownerDB.Delete(id); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDialogTreeAddBranch(b *testing.B) {
+	for _, nodes := range []int{50, 100} {
+		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
+			quiet(b)
+			b.ReportAllocs()
+			for range b.N {
+				b.StopTimer()
+				db, root, all := newDialogBenchDB(b, nodes)
+				parentID := all[nodes/3].Id
+				b.StartTimer()
+
+				err := db.Transaction(func(tx *Tx[dialogBenchNode]) error {
+					branch := &dialogBenchNode{Text: "branch-0"}
+					branch.Children = []*dialogBenchNode{{Text: "branch-1", Children: []*dialogBenchNode{{Text: "branch-2"}}}}
+					current, getErr := tx.Get(root.Id)
+					if getErr != nil {
+						return getErr
+					}
+
+					parent := findDialogNode(current, parentID)
+					parent.Children = append(parent.Children, branch)
+					return tx.Create(branch)
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDialogTreeReparentBranch(b *testing.B) {
+	for _, nodes := range []int{50, 100} {
+		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
+			quiet(b)
+			db, root, all := newDialogBenchDB(b, nodes)
+			leftID := all[1].Id
+			rightID := all[2].Id
+			branchID := all[3].Id
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				fromID, toID := leftID, rightID
+				if iteration%2 == 1 {
+					fromID, toID = rightID, leftID
+				}
+
+				err := db.UpdateWithin(root.Id, func(current *dialogBenchNode) error {
+					from := findDialogNode(current, fromID)
+					to := findDialogNode(current, toID)
+					for index, child := range from.Children {
+						if child.Id != branchID {
+							continue
+						}
+
+						from.Children = append(from.Children[:index], from.Children[index+1:]...)
+						to.Children = append(to.Children, child)
+						return nil
+					}
+
+					return fmt.Errorf("branch %d is not owned by %d", branchID, fromID)
+				})
+				if err != nil {
 					b.Fatal(err)
 				}
 			}
