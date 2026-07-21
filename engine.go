@@ -543,7 +543,7 @@ func resourcesChangeRelationGraph(resources []touchedResource) (bool, error) {
 		}
 
 		for fieldIndex := range matchFields[before.Type()] {
-			if !reflect.DeepEqual(before.Field(fieldIndex).Interface(), after.Field(fieldIndex).Interface()) {
+			if !relationFieldEqual(before.Field(fieldIndex), after.Field(fieldIndex)) {
 				return true, nil
 			}
 		}
@@ -561,7 +561,11 @@ func registeredRelationMatchFields() (map[reflect.Type]map[int]struct{}, error) 
 			return nil, fmt.Errorf("%w: %s.Id does not exist", ErrRelationSchema, typ)
 		}
 
-		fields[typ] = map[int]struct{}{idField.Index[0]: {}}
+		if fields[typ] == nil {
+			fields[typ] = make(map[int]struct{})
+		}
+
+		fields[typ][idField.Index[0]] = struct{}{}
 
 		specs, err := relationSpecs(typ)
 		if err != nil {
@@ -713,12 +717,35 @@ func entityStateEqual(before, after any) bool {
 			continue
 		}
 
-		if !reflect.DeepEqual(left.Interface(), right.Interface()) {
+		if !relationFieldEqual(left, right) {
 			return false
 		}
 	}
 
 	return true
+}
+
+func relationFieldEqual(left, right reflect.Value) bool {
+	if left.Type() == right.Type() {
+		switch left.Kind() {
+		case reflect.Bool:
+			return left.Bool() == right.Bool()
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return left.Int() == right.Int()
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			return left.Uint() == right.Uint()
+		case reflect.Float32, reflect.Float64:
+			return left.Float() == right.Float()
+		case reflect.Complex64, reflect.Complex128:
+			return left.Complex() == right.Complex()
+		case reflect.String:
+			return left.String() == right.String()
+		case reflect.Chan, reflect.Pointer, reflect.UnsafePointer:
+			return left.Pointer() == right.Pointer()
+		}
+	}
+
+	return reflect.DeepEqual(left.Interface(), right.Interface())
 }
 
 func relationValueEqual(left, right reflect.Value, many bool) bool {
@@ -759,12 +786,18 @@ func validateTransactionGraph(resources []touchedResource, creates map[nodeKey]c
 		overrides[key] = relationGraphNode{key: key, value: created.work}
 	}
 
-	nodes, err := collectRelationNodesWithOverrides(false, overrides)
+	state, err := prepareTransactionRelationState(overrides, creates)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	model, err := buildRelationModel(nodes)
+	var model *relationModel
+	if state.rebuild {
+		model, err = buildRelationModelFromTargets(state.nodes, state.targets, state.targetFields)
+	} else {
+		model, err = buildRelationModelDelta(state.committed, state.nodes, state.targets, overrides)
+	}
+
 	if err != nil {
 		return nil, nil, err
 	}
@@ -784,6 +817,144 @@ func validateTransactionGraph(resources []touchedResource, creates map[nodeKey]c
 	}
 
 	return model, deleted, nil
+}
+
+type transactionRelationState struct {
+	committed    *relationModel
+	nodes        map[nodeKey]relationGraphNode
+	targets      map[relationTargetKey]indexedRelationTarget
+	targetFields map[reflect.Type]map[string]struct{}
+	rebuild      bool
+}
+
+func prepareTransactionRelationState(
+	overrides map[nodeKey]relationGraphNode,
+	creates map[nodeKey]createdResource,
+) (transactionRelationState, error) {
+	committed := committedRelationModel()
+	if committed == nil {
+		nodes, err := collectRelationNodesWithOverrides(false, overrides)
+		if err != nil {
+			return transactionRelationState{}, err
+		}
+
+		fields, err := relationTargetFields(nodes)
+		if err != nil {
+			return transactionRelationState{}, err
+		}
+
+		return transactionRelationState{
+			nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields),
+			targetFields: fields, rebuild: true,
+		}, nil
+	}
+
+	nodes := make(map[nodeKey]relationGraphNode, len(committed.nodes)+len(creates))
+	for key, node := range committed.nodes {
+		nodes[key] = node
+	}
+
+	for key, node := range overrides {
+		nodes[key] = node
+	}
+
+	for key := range creates {
+		if !relationModelHasType(committed, key.typ) {
+			fields, err := relationTargetFields(nodes)
+			if err != nil {
+				return transactionRelationState{}, err
+			}
+
+			return transactionRelationState{
+				committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields),
+				targetFields: fields, rebuild: true,
+			}, nil
+		}
+	}
+
+	if relationTargetKeysChanged(overrides, committed.nodes, committed.targetFields) {
+		return transactionRelationState{
+			committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, committed.targetFields),
+			targetFields: committed.targetFields, rebuild: true,
+		}, nil
+	}
+
+	if len(creates) == 0 {
+		return transactionRelationState{
+			committed: committed, nodes: nodes, targets: committed.targets, targetFields: committed.targetFields,
+		}, nil
+	}
+
+	targets := make(map[relationTargetKey]indexedRelationTarget, len(committed.targets)+len(creates))
+	for key, target := range committed.targets {
+		targets[key] = target
+	}
+
+	rebuild := false
+	for key := range creates {
+		if relationNodeTargetsOverlap(targets, nodes[key], committed.targetFields[key.typ]) {
+			rebuild = true
+		}
+
+		indexRelationNodeTargets(targets, nodes[key], committed.targetFields[key.typ])
+	}
+
+	return transactionRelationState{
+		committed: committed, nodes: nodes, targets: targets,
+		targetFields: committed.targetFields, rebuild: rebuild,
+	}, nil
+}
+
+func relationModelHasType(model *relationModel, typ reflect.Type) bool {
+	for key := range model.nodes {
+		if key.typ == typ {
+			return true
+		}
+	}
+
+	return false
+}
+
+func relationNodeTargetsOverlap(
+	targets map[relationTargetKey]indexedRelationTarget,
+	node relationGraphNode,
+	fields map[string]struct{},
+) bool {
+	for field := range fields {
+		value, present := relationKey(node.value, field)
+		if !present {
+			continue
+		}
+
+		key := relationTargetKey{typ: node.key.typ, field: field, value: value.Interface()}
+		if _, exists := targets[key]; exists {
+			return true
+		}
+	}
+
+	return false
+}
+
+func relationTargetKeysChanged(
+	overrides, committed map[nodeKey]relationGraphNode,
+	fields map[reflect.Type]map[string]struct{},
+) bool {
+	for key, after := range overrides {
+		before, exists := committed[key]
+		if !exists {
+			continue
+		}
+
+		for field := range fields[key.typ] {
+			left := before.value.Elem().FieldByName(field)
+			right := after.value.Elem().FieldByName(field)
+			if !relationFieldEqual(left, right) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // refresh pulls live state into every snapshot and re-stamps versions so the
