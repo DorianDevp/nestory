@@ -264,12 +264,15 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		defer graphMu.RUnlock()
 	}
 
-	deleted := make(map[nodeKey]struct{})
+	var deleted map[nodeKey]struct{}
 	if graphChanged {
 		_, deleted, err = validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
 		if err != nil {
 			return err
 		}
+	}
+	if !graphChanged && len(touchedResources) == 1 {
+		return en.commitSingleWrite(tx, touchedResources[0])
 	}
 
 	for key := range createdResources {
@@ -368,6 +371,29 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		return err
 	}
 
+	en.evict(tx)
+
+	return nil
+}
+
+func (en *transactionEngine) commitSingleWrite(tx *transactionState, resource touchedResource) error {
+	committer := committerFor(resource.dbName)
+	committer.lockResource(resource.id)
+	defer committer.unlockResource(resource.id)
+
+	version, found := committer.resourceVersion(resource.id)
+	if !found || version != resource.ver {
+		en.refresh(tx)
+
+		return ErrConflict
+	}
+
+	write := [1]pendingWrite{{id: resource.id, work: resource.work}}
+	if err := committer.logWrites(write[:]); err != nil {
+		return err
+	}
+
+	committer.applyWrite(resource.id, resource.work)
 	en.evict(tx)
 
 	return nil
