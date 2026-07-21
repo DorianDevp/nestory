@@ -363,10 +363,11 @@ Three are instance properties, checked at the end of every transaction:
 - **I5 — ownership is acyclic, per instance.** Self-referential *types* are
   legal — `Node{ Children []*Node rel:"own,ParentId" }` is a tree, the canonical
   case. What is forbidden is an instance cycle: adopting `r` under `a` while `r`
-  is an ancestor of `a`. The check is one walk up the owner chain from the
-  adopter — a single chain, because I4 — and meeting the adoptee means a cycle;
-  O(tree depth). With I4 this makes the ownership graph a **forest**: cascade is
-  a plain subtree walk and the closure always terminates.
+  is an ancestor of `a`. Incremental transactions walk the single owner chain
+  from every affected child, O(changed edges × tree depth); initial validation
+  and safe full-index fallbacks remain O(nodes). With I4 this makes the
+  ownership graph a **forest**: cascade is a plain subtree walk and the closure
+  always terminates.
 - **I6 — pair consistency.** An `ownedby` pointer must equal the owner recorded
   by the reverse index. Both declared fields must be non-nil and agree in the
   final state; the engine canonicalizes pointers but never guesses a missing

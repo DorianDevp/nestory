@@ -579,3 +579,67 @@ func TestJoinCombinesDifferentTypesInOneCommit(t *testing.T) {
 		}
 	})
 }
+
+func TestTransactionDeleteIsBlockedByOutsiderBorrow(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		world := seedRuntime(t)
+		err := world.userDB.Delete(world.user.Id)
+		if !errors.Is(err, ErrDeleteRestricted) {
+			t.Fatalf("delete error = %v, want %v", err, ErrDeleteRestricted)
+		}
+
+		if world.userDB.Len() != 1 || world.postDB.Len() != 2 || world.watcherDB.Len() != 1 {
+			t.Fatal("rejected delete changed the live ownership or borrower graph")
+		}
+
+		current, getErr := world.postDB.Unsafe().Get(world.current.Id)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+
+		if len(current.Watchers) != 1 || current.Watchers[0].Id != world.watcher.Id {
+			t.Fatal("rejected delete detached the outsider borrow inverse")
+		}
+	})
+}
+
+func TestTargetedBorrowRepointUpdatesBothInverseSides(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		world := seedRuntime(t)
+		favorite, err := world.postDB.Unsafe().Get(world.favorite.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = world.watcherDB.UpdateWithin(world.watcher.Id, func(watcher *rtWatcher) error {
+			watcher.Post = favorite
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		current, err := world.postDB.Unsafe().Get(world.current.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		favorite, err = world.postDB.Unsafe().Get(world.favorite.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		watcher, err := world.watcherDB.Unsafe().Get(world.watcher.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(current.Watchers) != 0 {
+			t.Fatal("old borrow target retained the inverse holder")
+		}
+
+		if len(favorite.Watchers) != 1 || favorite.Watchers[0] != watcher || watcher.Post != favorite {
+			t.Fatal("new borrow target did not receive the canonical inverse holder")
+		}
+	})
+}
