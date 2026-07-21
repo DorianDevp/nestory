@@ -12,6 +12,60 @@ type walTestRow struct {
 	Name string
 }
 
+type walComplexRow struct {
+	Id     int
+	Values []string
+}
+
+func TestWALRowCodecs(t *testing.T) {
+	tests := []struct {
+		name     string
+		row      any
+		encoding byte
+	}{
+		{name: "scalar", row: walTestRow{Id: -7, Name: "nestory"}, encoding: rowEncodingScalar},
+		{name: "gob fallback", row: walComplexRow{Id: 9, Values: []string{"a", "b"}}, encoding: rowEncodingGob},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := reflect.ValueOf(test.row)
+			encoded, err := encodeRow(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if encoded[0] != test.encoding {
+				t.Fatalf("encoding = %d, want %d", encoded[0], test.encoding)
+			}
+
+			decoded, err := decodeRow(encoded, value.Type())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(decoded.Interface(), test.row) {
+				t.Fatalf("decoded row = %#v, want %#v", decoded.Interface(), test.row)
+			}
+		})
+	}
+}
+
+func TestScalarWALRowRejectsCorruption(t *testing.T) {
+	encoded, err := encodeRow(reflect.ValueOf(walTestRow{Id: 1, Name: "row"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := decodeRow(encoded[:len(encoded)-1], reflect.TypeOf(walTestRow{})); err == nil {
+		t.Fatal("accepted truncated scalar row")
+	}
+
+	if _, err := decodeRow([]byte{99}, reflect.TypeOf(walTestRow{})); err == nil {
+		t.Fatal("accepted unknown row encoding")
+	}
+}
+
 func TestWALFrameRoundTrip(t *testing.T) {
 	want := walFrame{Rows: []walRow{
 		{Id: 7, Row: []byte("first")},
