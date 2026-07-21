@@ -214,7 +214,22 @@ func (db *DB[T]) applyWrite(id int, work any) {
 
 func (db *DB[T]) refreshSnapshot(id int, work any) {
 	if r, ok := db.resource(id); ok {
-		*work.(*T) = *r.item
+		target := work.(*T)
+		*target = *r.item
+		cloneSliceFields(reflect.ValueOf(target).Elem())
+	}
+}
+
+func cloneSliceFields(value reflect.Value) {
+	for i := range value.NumField() {
+		field := value.Field(i)
+		if field.Kind() != reflect.Slice || field.IsNil() || !field.CanSet() {
+			continue
+		}
+
+		clone := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
+		reflect.Copy(clone, field)
+		field.Set(clone)
 	}
 }
 
