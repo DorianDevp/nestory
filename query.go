@@ -129,6 +129,18 @@ func (db *DB[T]) Get(id int) (*T, error) {
 
 	r.mu.RLock()
 	cp := *r.item
+	// A struct copy still aliases slice backing arrays. Clone every slice so a
+	// transaction cannot mutate live relation collections before commit.
+	cpValue := reflect.ValueOf(&cp).Elem()
+	for i := range cpValue.NumField() {
+		field := cpValue.Field(i)
+		if field.Kind() == reflect.Slice && !field.IsNil() && field.CanSet() {
+			clone := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
+			reflect.Copy(clone, field)
+			field.Set(clone)
+		}
+	}
+
 	ver := r.version
 	r.mu.RUnlock()
 

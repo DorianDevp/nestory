@@ -2,7 +2,6 @@ package nestory
 
 import (
 	"fmt"
-	"log"
 	"reflect"
 )
 
@@ -93,46 +92,7 @@ func (db *DB[T]) PatchById(id any, item T) (*T, error) {
 // Flush applies the persist queue (inserts or patches), then the delete queue,
 // then writes every dirty chunk to disk.
 func (db *DB[T]) Flush() error {
-	// Persisted-id set once (O(n)) so insert-vs-patch is O(1) per queued item.
-	existing := make(map[int]bool, db.store.Len())
-	db.store.Range(func(p *T) { existing[(*p).GetId()] = true })
-
-	for _, ent := range db.persistQueue {
-		id := (*ent).GetId()
-		if existing[id] {
-			db.PatchById(id, *ent)
-			continue
-		}
-
-		db.Add(ent)
-		existing[id] = true
-	}
-
-	db.ResetpersistQueue()
-	// No syncIdIndex: Add maintains Index["Id"] and the delete loop drops ids.
-
-	// Deletes tombstone in place (no shift → pointers stay valid). Drop the index too.
-	for _, instance := range db.deleteQueue {
-		delId := (*instance).GetId()
-		db.store.DeleteFunc(func(p *T) bool { return (*p).GetId() == delId })
-		delete(db.index["Id"], delId)
-		delete(db.resById, delId)
-	}
-
-	db.resetDeleteQueue()
-
-	if err := db.save(); err != nil {
-		log.Panicln("Panic during saving a base", db.TypeName(), err)
-	}
-
-	// Compaction folded every WAL'd change into the rewritten chunks, so drop it.
-	if db.wal != nil {
-		if err := db.wal.truncate(); err != nil {
-			log.Panicln("Panic during WAL truncate", db.TypeName(), err)
-		}
-	}
-
-	return nil
+	return flushRelations()
 }
 
 // merge copies non-zero fields from merger into target, skipping key:"primary".
