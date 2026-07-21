@@ -116,40 +116,43 @@ func (db *DB[T]) FilterPtr(filterFn func(*T) bool) ([]*T, error) {
 // These open and commit transactions through the Engine; the machinery they
 // drive lives in tx.go and engine.go.
 
-// Get returns a detached snapshot of id and opens a contract around it. Mutate
-// the returned *T (it's a copy), then hand it to Update.
-//
-// The snapshot clones slice headers and backing arrays, but relation targets
-// still point at live entities. Reassign relation fields freely; do not mutate
-// a pointed-to entity through the snapshot.
+// Get returns a detached branch containing id and its complete ownership
+// subtree. Mutate any owned node through normal pointers, then hand the root to
+// Update. Non-owning relations outside the branch remain read-only live links.
 func (db *DB[T]) Get(id int) (*T, error) {
-	r, ok := db.resource(id)
-	if !ok {
-		return nil, ErrNotFound
-	}
-
-	r.mu.RLock()
-	cp := *r.item
-	// A struct copy still aliases slice backing arrays. Clone every slice so a
-	// transaction cannot mutate live relation collections before commit.
-	cpValue := reflect.ValueOf(&cp).Elem()
-	for i := range cpValue.NumField() {
-		field := cpValue.Field(i)
-		if field.Kind() == reflect.Slice && !field.IsNil() && field.CanSet() {
-			clone := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
-			reflect.Copy(clone, field)
-			field.Set(clone)
-		}
-	}
-
-	ver := r.version
-	r.mu.RUnlock()
-
-	work := &cp
 	tx := engine.begin()
-	engine.record(tx, touchedResource{dbName: db.name, id: id, ver: ver, work: work})
+	work, err := db.getInTransaction(tx, id)
+	if err != nil {
+		engine.evict(tx)
+		return nil, err
+	}
 
 	return work, nil
+}
+
+func (db *DB[T]) getInTransaction(tx txId, id int) (*T, error) {
+	if existing, ok := engine.work(tx, db.name, id); ok {
+		return existing.(*T), nil
+	}
+
+	root := nodeKey{typ: reflect.TypeFor[T](), id: id}
+	work, original, versions, err := cloneOwnershipAggregate(root)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range work {
+		if _, ok := baseRegistry[key.typ.Name()].(committer); !ok {
+			return nil, fmt.Errorf("nestory: %s is not open", key.typ)
+		}
+
+		engine.record(tx, touchedResource{
+			dbName: key.typ.Name(), id: key.id, ver: versions[key],
+			work: value.Interface(), original: original[key].Interface(),
+		})
+	}
+
+	return work[root].Interface().(*T), nil
 }
 
 // UnsafeGet returns the live, stable store pointer for id and marks its chunk

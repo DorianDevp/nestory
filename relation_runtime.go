@@ -153,6 +153,10 @@ var committedOwnership = struct {
 	outgoing map[nodeKey][]nodeKey
 }{outgoing: make(map[nodeKey][]nodeKey)}
 
+// graphMu protects live relation pointers while a branch is copied or a commit
+// publishes and rewires a new graph. User callbacks run entirely outside it.
+var graphMu sync.RWMutex
+
 func resetCommittedOwnership() {
 	committedOwnership.Lock()
 	defer committedOwnership.Unlock()
@@ -212,6 +216,10 @@ func committedChildren(owner nodeKey) []nodeKey {
 }
 
 func valueID(v reflect.Value) (int, bool) {
+	if !v.IsValid() || v.Kind() == reflect.Pointer && v.IsNil() {
+		return 0, false
+	}
+
 	if v.IsValid() && v.CanInterface() {
 		if entity, ok := v.Interface().(Entity); ok {
 			return entity.GetId(), true
@@ -239,6 +247,15 @@ func relationRuntimes() []relationRuntime {
 }
 
 func collectRelationNodes(includePending bool, override *relationGraphNode) (map[nodeKey]relationGraphNode, error) {
+	overrides := make(map[nodeKey]relationGraphNode)
+	if override != nil {
+		overrides[override.key] = *override
+	}
+
+	return collectRelationNodesWithOverrides(includePending, overrides)
+}
+
+func collectRelationNodesWithOverrides(includePending bool, overrides map[nodeKey]relationGraphNode) (map[nodeKey]relationGraphNode, error) {
 	nodes := make(map[nodeKey]relationGraphNode)
 	for _, rawStore := range storeRegistry {
 		if err := collectStoreNodes(nodes, rawStore); err != nil {
@@ -252,11 +269,147 @@ func collectRelationNodes(includePending bool, override *relationGraphNode) (map
 		}
 	}
 
-	if override != nil {
-		nodes[override.key] = *override
+	for key, override := range overrides {
+		nodes[key] = override
 	}
 
 	return nodes, nil
+}
+
+// cloneOwnershipAggregate creates a transaction-local copy of root and every
+// node it transitively owns. Relation pointers inside that aggregate are
+// rewired to the copies, preserving pointer identity without touching live
+// store objects.
+func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeKey]reflect.Value, map[nodeKey]int, error) {
+	graphMu.RLock()
+	defer graphMu.RUnlock()
+
+	nodes, err := collectRelationNodes(false, nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	model, err := buildRelationModel(nodes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if _, found := nodes[root]; !found {
+		return nil, nil, nil, ErrNotFound
+	}
+
+	keys := ownershipClosure(model, root)
+	ordered := make([]nodeKey, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].typ.Name() != ordered[j].typ.Name() {
+			return ordered[i].typ.Name() < ordered[j].typ.Name()
+		}
+
+		return ordered[i].id < ordered[j].id
+	})
+
+	for _, key := range ordered {
+		committerFor(key.typ.Name()).lockResource(key.id)
+	}
+	defer func() {
+		for i := len(ordered) - 1; i >= 0; i-- {
+			committerFor(ordered[i].typ.Name()).unlockResource(ordered[i].id)
+		}
+	}()
+
+	work := make(map[nodeKey]reflect.Value, len(keys))
+	original := make(map[nodeKey]reflect.Value, len(keys))
+	versions := make(map[nodeKey]int, len(keys))
+	for _, key := range ordered {
+		work[key] = cloneEntityPointer(nodes[key].value)
+		original[key] = cloneEntityPointer(nodes[key].value)
+		version, found := committerFor(key.typ.Name()).resourceVersion(key.id)
+		if !found {
+			return nil, nil, nil, ErrNotFound
+		}
+		versions[key] = version
+	}
+
+	rewireAggregateCopies(model, work)
+	rewireAggregateCopies(model, original)
+
+	return work, original, versions, nil
+}
+
+func ownershipClosure(model *relationModel, root nodeKey) map[nodeKey]struct{} {
+	out := map[nodeKey]struct{}{root: {}}
+	queue := []nodeKey{root}
+	for len(queue) > 0 {
+		owner := queue[0]
+		queue = queue[1:]
+		for _, child := range model.outgoing[owner] {
+			if _, seen := out[child]; seen {
+				continue
+			}
+
+			out[child] = struct{}{}
+			queue = append(queue, child)
+		}
+	}
+
+	return out
+}
+
+func cloneEntityPointer(source reflect.Value) reflect.Value {
+	clone := reflect.New(source.Type().Elem())
+	clone.Elem().Set(source.Elem())
+	cloneSliceFields(clone.Elem())
+
+	return clone
+}
+
+func rewireTouchedCopies(resources []touchedResource) {
+	copies := make(map[nodeKey]reflect.Value, len(resources))
+	for _, resource := range resources {
+		runtime, ok := baseRegistry[resource.dbName].(relationRuntime)
+		if !ok {
+			continue
+		}
+
+		copies[nodeKey{typ: runtime.relationType(), id: resource.id}] = reflect.ValueOf(resource.work)
+	}
+
+	nodes, err := collectRelationNodes(false, nil)
+	if err != nil {
+		return
+	}
+	model, err := buildRelationModel(nodes)
+	if err != nil {
+		return
+	}
+
+	rewireAggregateCopies(model, copies)
+}
+
+func rewireAggregateCopies(model *relationModel, copies map[nodeKey]reflect.Value) {
+	for _, ref := range model.refs {
+		holder, holderCopied := copies[ref.holder]
+		target, targetCopied := copies[ref.target]
+		if !holderCopied || !targetCopied {
+			continue
+		}
+
+		field := holder.Elem().Field(ref.spec.fieldIndex)
+		if !ref.spec.many {
+			field.Set(target)
+			continue
+		}
+
+		for i := range field.Len() {
+			id, ok := valueID(field.Index(i))
+			if ok && id == ref.target.id {
+				field.Index(i).Set(target)
+			}
+		}
+	}
 }
 
 func collectStoreNodes(nodes map[nodeKey]relationGraphNode, rawStore any) error {
@@ -708,6 +861,9 @@ func markChangedRelations(changed map[nodeKey]struct{}) {
 }
 
 func flushRelations() error {
+	graphMu.Lock()
+	defer graphMu.Unlock()
+
 	nodes, err := collectRelationNodes(true, nil)
 	if err != nil {
 		return err
