@@ -107,8 +107,8 @@ func BenchmarkFlushAtSize(b *testing.B) {
 	}
 }
 
-// in-memory insert path, no Flush.
-func BenchmarkAddToPersistQueue(b *testing.B) {
+// Unsafe in-memory insert path, without validation or persistence.
+func BenchmarkUnsafeCreate(b *testing.B) {
 	for _, n := range benchSizes {
 		b.Run(fmt.Sprintf("seed=%d", n), func(b *testing.B) {
 			quiet(b)
@@ -122,7 +122,7 @@ func BenchmarkAddToPersistQueue(b *testing.B) {
 	}
 }
 
-// one durable transactional row update — WAL frame, no chunk rewrite. ~constant in n.
+// One safe, durable transactional update through the ownership branch.
 func BenchmarkPointWrite(b *testing.B) {
 	for _, n := range benchSizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
