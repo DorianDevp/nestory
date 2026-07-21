@@ -369,9 +369,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	if err := refreshCommittedOwnership(); err != nil {
-		return err
-	}
+	storeCommittedOwnership(model, deleted)
 
 	en.evict(tx)
 
