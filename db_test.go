@@ -121,3 +121,63 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 		t.Fatalf("counter = %d, want %d (lost updates)", got.N, want)
 	}
 }
+
+func TestDetachedRootPromotesIntoCommitEngine(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalDir := DataDir
+	DataDir = tmpDir
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[tCounter](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[tCounter]()
+	counter := &tCounter{N: 1}
+	db.Unsafe().Create(counter)
+	if err := db.Unsafe().Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := db.Get(counter.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := db.Get(counter.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first.N = 2
+	if err := db.Update(first); err != nil {
+		t.Fatal(err)
+	}
+
+	second.N = 3
+	if err := db.Update(second); err != ErrConflict {
+		t.Fatalf("stale Update error = %v, want %v", err, ErrConflict)
+	}
+
+	if second.N != 2 {
+		t.Fatalf("refreshed branch N = %d, want 2", second.N)
+	}
+
+	second.N = 3
+	if err := db.Update(second); err != nil {
+		t.Fatal(err)
+	}
+
+	live, err := db.Unsafe().Get(counter.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if live.N != 3 {
+		t.Fatalf("live N = %d, want 3", live.N)
+	}
+}

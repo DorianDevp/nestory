@@ -188,6 +188,48 @@ func BenchmarkSafeGetByID(b *testing.B) {
 	}
 }
 
+func BenchmarkSafeGetByIDOnly(b *testing.B) {
+	const branchBatch = 1024
+
+	for _, n := range benchSizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			quiet(b)
+			db := newBenchDB(b, n)
+			target := n / 2
+			branches := make([]*benchItem, 0, branchBatch)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				branch, err := db.Get(target)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				branches = append(branches, branch)
+
+				if len(branches) == cap(branches) {
+					b.StopTimer()
+					for _, pending := range branches {
+						if err := db.Update(pending); err != nil {
+							b.Fatal(err)
+						}
+					}
+
+					branches = branches[:0]
+					b.StartTimer()
+				}
+			}
+
+			b.StopTimer()
+			for _, pending := range branches {
+				if err := db.Update(pending); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkUnsafeGetByID(b *testing.B) {
 	for _, n := range benchSizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
