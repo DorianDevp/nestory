@@ -13,6 +13,8 @@ type relationRuntime interface {
 	relationPending() []reflect.Value
 	relationDeleteIDs() []int
 	relationApplyPending() error
+	relationPrepareCreate(reflect.Value) error
+	relationApplyCreate(reflect.Value)
 	relationDelete(map[int]struct{})
 	relationMarkDirty(int)
 	relationRewire()
@@ -68,6 +70,31 @@ func (db *DB[T]) relationApplyPending() error {
 	}
 
 	return nil
+}
+
+func (db *DB[T]) relationPrepareCreate(value reflect.Value) error {
+	entity := value.Interface().(*T)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	id := (*entity).GetId()
+	if id == 0 {
+		db.counter++
+		SetId(entity, db.counter)
+		return nil
+	}
+	if db.index[db.identifier][id] != nil {
+		return fmt.Errorf("%w: %s(%d)", ErrAlreadyExists, db.name, id)
+	}
+	if id > db.counter {
+		db.counter = id
+	}
+
+	return nil
+}
+
+func (db *DB[T]) relationApplyCreate(value reflect.Value) {
+	db.Add(value.Interface().(*T))
 }
 
 func (db *DB[T]) relationDelete(ids map[int]struct{}) {
@@ -936,6 +963,19 @@ func flushRelations() error {
 	}
 
 	return nil
+}
+
+func applyDeletedNodes(deleted map[nodeKey]struct{}) {
+	byType := make(map[reflect.Type]map[int]struct{})
+	for key := range deleted {
+		if byType[key.typ] == nil {
+			byType[key.typ] = make(map[int]struct{})
+		}
+		byType[key.typ][key.id] = struct{}{}
+	}
+	for _, runtime := range relationRuntimes() {
+		runtime.relationDelete(byType[runtime.relationType()])
+	}
 }
 
 func validateRelationUpdate(t reflect.Type, id int, work reflect.Value) error {
