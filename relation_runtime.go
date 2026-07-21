@@ -131,8 +131,14 @@ type resolvedRelation struct {
 type relationModel struct {
 	nodes    map[nodeKey]relationGraphNode
 	refs     []resolvedRelation
+	missing  []missingRelation
 	owners   map[nodeKey]nodeKey
 	outgoing map[nodeKey][]nodeKey
+}
+
+type missingRelation struct {
+	holder nodeKey
+	spec   relationSpec
 }
 
 type incomingOwn struct {
@@ -282,10 +288,6 @@ func buildRelationModel(nodes map[nodeKey]relationGraphNode) (*relationModel, er
 		}
 	}
 
-	if err := validateMandatoryComplements(model); err != nil {
-		return nil, err
-	}
-
 	if err := validateOwnershipCycles(model); err != nil {
 		return nil, err
 	}
@@ -327,7 +329,8 @@ func scanRelationField(model *relationModel, node relationGraphNode, spec relati
 				continue
 			}
 
-			return fmt.Errorf("%w: required relation %s.%s on %s has no live target", ErrRelationInvariant, node.key.typ, spec.fieldName, node.key)
+			model.missing = append(model.missing, missingRelation{holder: node.key, spec: spec})
+			continue
 		}
 
 		if _, duplicate := seen[target]; duplicate && spec.kind == Own {
@@ -359,11 +362,7 @@ func relationMayBeMissing(spec relationSpec) bool {
 		return true
 	}
 
-	if !spec.many {
-		return spec.kind == Own || spec.kind == OwnedBy
-	}
-
-	return spec.kind == Borrow || spec.kind == Own
+	return spec.many && (spec.kind == Borrow || spec.kind == Own)
 }
 
 func recordResolvedRelation(model *relationModel, holder, target nodeKey, spec relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) {
@@ -411,47 +410,16 @@ func resolvedOwner(raw []incomingOwn, back incomingOwn, hasBack bool) (nodeKey, 
 	return nodeKey{}, false
 }
 
-func validateMandatoryComplements(model *relationModel) error {
-	for key, node := range model.nodes {
-		specs, _ := relationSpecs(key.typ)
-		for _, spec := range specs {
-			if mandatoryComplementSatisfied(model, node, spec) {
-				continue
-			}
-
-			return fmt.Errorf("%w: required relation %s.%s on %s is nil", ErrRelationInvariant, key.typ, spec.fieldName, key)
+func validateRequiredRelations(model *relationModel, deleted map[nodeKey]struct{}) error {
+	for _, missing := range model.missing {
+		if _, dies := deleted[missing.holder]; dies {
+			continue
 		}
+
+		return fmt.Errorf("%w: required relation %s.%s on %s is nil or has no live target", ErrRelationInvariant, missing.holder.typ, missing.spec.fieldName, missing.holder)
 	}
 
 	return nil
-}
-
-func mandatoryComplementSatisfied(model *relationModel, node relationGraphNode, spec relationSpec) bool {
-	if spec.many || (spec.kind != Own && spec.kind != OwnedBy) {
-		return true
-	}
-
-	if !node.value.Elem().Field(spec.fieldIndex).IsNil() {
-		return true
-	}
-
-	if spec.kind == OwnedBy {
-		_, supplied := model.owners[node.key]
-		return supplied
-	}
-
-	return childCountOfType(model.outgoing[node.key], spec.target) == 1
-}
-
-func childCountOfType(children []nodeKey, typ reflect.Type) int {
-	count := 0
-	for _, child := range children {
-		if child.typ == typ {
-			count++
-		}
-	}
-
-	return count
 }
 
 func validateOwnershipCycles(model *relationModel) error {
@@ -566,13 +534,11 @@ func clearPointer(field reflect.Value) bool {
 	return true
 }
 
-// reconcileRelations canonicalizes references, fills own/ownedby complements,
-// applies option set-null, and synchronizes the child-side FK of own slices.
+// reconcileRelations canonicalizes references, applies option set-null, and
+// synchronizes the child-side FK of own slices.
 func reconcileRelations(model *relationModel, deleted map[nodeKey]struct{}) {
 	changed := make(map[nodeKey]struct{})
 	canonicalizeRelationPointers(model, deleted, changed)
-	fillOwnedByComplements(model, deleted, changed)
-	fillOwnComplements(model, changed)
 	syncOwnSliceBackReferences(model, deleted, changed)
 	markChangedRelations(changed)
 }
@@ -597,60 +563,6 @@ func canonicalizeRelationPointers(model *relationModel, deleted, changed map[nod
 			changed[ref.holder] = struct{}{}
 		}
 	}
-}
-
-func fillOwnedByComplements(model *relationModel, deleted, changed map[nodeKey]struct{}) {
-	for child, owner := range model.owners {
-		if _, dies := deleted[child]; dies {
-			continue
-		}
-
-		complement, found := relationOfKindTo(child.typ, OwnedBy, owner.typ, false)
-		if !found {
-			continue
-		}
-
-		if setRelationField(model.nodes[child], complement, model.nodes[owner].value) {
-			changed[child] = struct{}{}
-		}
-	}
-}
-
-func fillOwnComplements(model *relationModel, changed map[nodeKey]struct{}) {
-	for owner, children := range model.outgoing {
-		specs, _ := relationSpecs(owner.typ)
-		for _, spec := range specs {
-			fillOwnComplement(model, owner, children, spec, changed)
-		}
-	}
-}
-
-func fillOwnComplement(model *relationModel, owner nodeKey, children []nodeKey, spec relationSpec, changed map[nodeKey]struct{}) {
-	if spec.kind != Own || spec.many {
-		return
-	}
-
-	match, count := onlyChildOfType(children, spec.target)
-	if count != 1 {
-		return
-	}
-
-	if setRelationField(model.nodes[owner], spec, model.nodes[match].value) {
-		changed[owner] = struct{}{}
-	}
-}
-
-func onlyChildOfType(children []nodeKey, typ reflect.Type) (nodeKey, int) {
-	var match nodeKey
-	count := 0
-	for _, child := range children {
-		if child.typ == typ {
-			match = child
-			count++
-		}
-	}
-
-	return match, count
 }
 
 func syncOwnSliceBackReferences(model *relationModel, deleted, changed map[nodeKey]struct{}) {
@@ -702,21 +614,6 @@ func markChangedRelations(changed map[nodeKey]struct{}) {
 	}
 }
 
-func relationOfKindTo(owner reflect.Type, kind RelationKind, target reflect.Type, many bool) (relationSpec, bool) {
-	specs, err := relationSpecs(owner)
-	if err != nil {
-		return relationSpec{}, false
-	}
-
-	for _, spec := range specs {
-		if spec.kind == kind && spec.target == target && spec.many == many {
-			return spec, true
-		}
-	}
-
-	return relationSpec{}, false
-}
-
 func flushRelations() error {
 	nodes, err := collectRelationNodes(true, nil)
 	if err != nil {
@@ -730,6 +627,9 @@ func flushRelations() error {
 
 	deleted, err := deletionClosure(model, explicitDeletes())
 	if err != nil {
+		return err
+	}
+	if err := validateRequiredRelations(model, deleted); err != nil {
 		return err
 	}
 
@@ -748,6 +648,9 @@ func flushRelations() error {
 
 	model, err = buildRelationModel(nodes)
 	if err != nil {
+		return err
+	}
+	if err := validateRequiredRelations(model, deleted); err != nil {
 		return err
 	}
 
@@ -789,6 +692,10 @@ func validateRelationUpdate(t reflect.Type, id int, work reflect.Value) error {
 		return err
 	}
 
-	_, err = buildRelationModel(nodes)
-	return err
+	model, err := buildRelationModel(nodes)
+	if err != nil {
+		return err
+	}
+
+	return validateRequiredRelations(model, nil)
 }
