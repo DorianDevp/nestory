@@ -76,6 +76,24 @@ Nestory appends and fsyncs one compact WAL frame before publishing the in-memory
 update. On this filesystem it beats every durable comparator in the point-write
 workload. go-memdb remains a non-durable reference floor.
 
+## Durable structural graph mutation — µs/op (lower = better)
+
+This workload uses a binary dialog tree through the public safe API. “Add”
+attaches a new three-node branch; “reparent” moves an existing subtree between
+two parents. Both include detached branch creation, relation validation, WAL
+commit, publication, and relation rewiring.
+
+| operation | 50 existing nodes | 100 existing nodes | allocs/op at 100 |
+|---|---:|---:|---:|
+| add three-node branch | 212 µs | 379 µs | 1,985 |
+| reparent subtree | 159 µs | 305 µs | 1,696 |
+
+Transaction validation reuses the last committed relation model and rescans
+only changed holders. Changes to a relation match key, a duplicate target key,
+or a newly introduced entity type deliberately fall back to a complete index
+rebuild. The end-to-end cost still grows with the ownership branch because the
+safe API returns and compares a detached mutable copy of that branch.
+
 ## Full scan + filter — time per scan (lower = better)
 
 | engine | n=100 | n=1,000 | n=10,000 |
@@ -97,9 +115,9 @@ because every value is gob-decoded on read — inherent to a KV store of blobs.)
    disk-backed engines. This is the real edge.
 
 2. **Flat writes and graph writes are different workloads.** A scalar point
-   update uses the WAL fast path. Structural relation changes still validate the
-   registered graph; their cost scales with graph size until validation becomes
-   incremental.
+   update uses the WAL fast path. Structural transactions now validate relation
+   deltas, but still copy and compare the detached ownership branch, so their
+   end-to-end cost scales with branch size.
 
 3. **go-memdb's writes aren't durable** — exclude them from the durability
    comparison.
@@ -116,15 +134,15 @@ because every value is gob-decoded on read — inherent to a KV store of blobs.)
 
 For its niche — an in-RAM, pointer-native graph with WAL durability — nestory is
 the fastest measured engine on flat reads, scans, durable point writes and
-durable bulk inserts in this harness. The unresolved weakness is structural
-graph mutation: correct today, but still globally validated and therefore not
-yet competitive at large graph sizes.
+durable bulk inserts in this harness. Structural graph mutation now avoids a
+global reflective validation pass; detached branch copying remains its main
+size-dependent cost.
 
 ## Reproduce
 
 ```sh
 # nestory (from repo root — needs the in-package harness):
-go test -run='^$' -bench='BatchInsertFlush|SafeGetByIDOnly|UnsafeGetByID|RelationView|PointWrite|Filter' -benchmem -benchtime=300ms
+go test -run='^$' -bench='BatchInsertFlush|SafeGetByIDOnly|UnsafeGetByID|RelationView|PointWrite|Filter|DialogTree' -benchmem -benchtime=300ms
 
 # competitors (from ./bench):
 go test ./compare/ -run='^$' -bench=. -benchmem -benchtime=300ms
