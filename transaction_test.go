@@ -643,3 +643,160 @@ func TestTargetedBorrowRepointUpdatesBothInverseSides(t *testing.T) {
 		}
 	})
 }
+
+func TestConcurrentBorrowAndDeleteCannotBothCommit(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txKeyTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txKeyBorrower](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[txKeyTarget]()
+		borrowerDB := Open[txKeyBorrower]()
+		first := &txKeyTarget{Key: "first"}
+		doomed := &txKeyTarget{Key: "doomed"}
+		borrower := &txKeyBorrower{Target: first}
+		targetDB.Unsafe().Create(first)
+		targetDB.Unsafe().Create(doomed)
+		borrowerDB.Unsafe().Create(borrower)
+		if err := targetDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		doomedLive, err := targetDB.Unsafe().Get(doomed.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ready := make(chan struct{}, 2)
+		release := make(chan struct{})
+		results := make(chan transactionRaceResult, 2)
+		go func() {
+			err := targetDB.Transaction(func(tx *Tx[txKeyTarget]) error {
+				if deleteErr := tx.Delete(doomed.Id); deleteErr != nil {
+					return deleteErr
+				}
+
+				ready <- struct{}{}
+				<-release
+				return nil
+			})
+			results <- transactionRaceResult{name: "delete", err: err}
+		}()
+		go func() {
+			err := borrowerDB.Transaction(func(tx *Tx[txKeyBorrower]) error {
+				current, getErr := tx.Get(borrower.Id)
+				if getErr != nil {
+					return getErr
+				}
+
+				current.Target = doomedLive
+				ready <- struct{}{}
+				<-release
+				return nil
+			})
+			results <- transactionRaceResult{name: "borrow", err: err}
+		}()
+
+		<-ready
+		<-ready
+		close(release)
+		firstResult := <-results
+		secondResult := <-results
+		if firstResult.err == nil && secondResult.err == nil {
+			t.Fatal("concurrent borrow and target delete both committed")
+		}
+
+		if firstResult.err != nil && secondResult.err != nil {
+			t.Fatalf("both transactions failed: %s=%v, %s=%v", firstResult.name, firstResult.err, secondResult.name, secondResult.err)
+		}
+	})
+}
+
+type transactionRaceResult struct {
+	name string
+	err  error
+}
+
+func TestTargetedReferenceReorderPreservesOrderAndInverseUniqueness(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtIndexedTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[rtIndexedHolder](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[rtIndexedTarget]()
+		holderDB := Open[rtIndexedHolder]()
+		first := &rtIndexedTarget{}
+		second := &rtIndexedTarget{}
+		targetDB.Unsafe().Create(first)
+		targetDB.Unsafe().Create(second)
+		holder := &rtIndexedHolder{Targets: []*rtIndexedTarget{second, first, second}}
+		holderDB.Unsafe().Create(holder)
+		if err := holderDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		firstLive, err := targetDB.Unsafe().Get(first.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		secondLive, err := targetDB.Unsafe().Get(second.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = holderDB.UpdateWithin(holder.Id, func(current *rtIndexedHolder) error {
+			current.Targets = []*rtIndexedTarget{firstLive, secondLive, firstLive}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		holderLive, err := holderDB.Unsafe().Get(holder.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(holderLive.Targets) != 3 || holderLive.Targets[0] != firstLive || holderLive.Targets[1] != secondLive || holderLive.Targets[2] != firstLive {
+			t.Fatalf("reference order changed: %#v", holderLive.Targets)
+		}
+
+		for _, target := range []*rtIndexedTarget{firstLive, secondLive} {
+			if len(target.Holders) != 1 || target.Holders[0] != holderLive {
+				t.Fatalf("inverse for target %d = %#v", target.Id, target.Holders)
+			}
+		}
+	})
+}
+
+func TestSelfBorrowCountsOnceAndDoesNotBlockOwnDelete(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[schemaSelfBorrow](); err != nil {
+			t.Fatal(err)
+		}
+
+		db := Open[schemaSelfBorrow]()
+		entity := &schemaSelfBorrow{}
+		entity.Peer = entity
+		if err := db.Create(entity); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Delete(entity.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if db.Len() != 0 {
+			t.Fatal("self-borrowing entity survived its own delete")
+		}
+	})
+}
