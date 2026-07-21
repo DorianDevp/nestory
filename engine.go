@@ -359,9 +359,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 
 	reconcileRelations(model, deleted)
 	applyDeletedNodes(deleted)
-	for _, runtime := range relationRuntimes() {
-		runtime.relationRewire()
-	}
+	rewireRelations(relationRuntimes())
 
 	if structural {
 		for _, runtime := range relationRuntimes() {

@@ -57,6 +57,19 @@ type relationSpec struct {
 	many       bool
 }
 
+type relationFieldKey struct {
+	owner reflect.Type
+	field int
+}
+
+// relationWireIndex is a short-lived index for one graph rewire. Building it
+// once keeps rehydration linear in nodes and edges instead of scanning a
+// foreign store for every relation field.
+type relationWireIndex struct {
+	targets map[relationTargetKey]reflect.Value
+	slices  map[relationFieldKey]map[any][]reflect.Value
+}
+
 var entityInterface = reflect.TypeFor[Entity]()
 
 type cachedRelationSpecs struct {
@@ -400,89 +413,68 @@ func relationKey(v reflect.Value, field string) (reflect.Value, bool) {
 	return f, f.IsValid() && !f.IsZero()
 }
 
-func canonicalTarget(target reflect.Type, match string, key reflect.Value) (reflect.Value, bool) {
-	foreign, ok := getForeignStoreByType(target.Name())
-	if !ok {
-		return reflect.Value{}, false
-	}
-
-	for i := range foreign.Len() {
-		candidate := foreign.Index(i)
-		candidateKey, valid := relationKey(candidate, match)
-		if valid && scalarEqual(candidateKey, key) {
-			return candidate, true
-		}
-	}
-
-	return reflect.Value{}, false
-}
-
-func valueReferences(v reflect.Value, r relationSpec, target reflect.Value) bool {
-	want, ok := relationKey(target, "Id")
-	if !ok {
-		return false
-	}
-
-	f := v.Field(r.fieldIndex)
-	if r.many {
-		for i := range f.Len() {
-			got, valid := relationKey(f.Index(i), r.matchField)
-			if valid && scalarEqual(got, want) {
-				return true
-			}
-		}
-
-		return false
-	}
-
-	got, valid := relationKey(f, r.matchField)
-	return valid && scalarEqual(got, want)
-}
-
 // fillRelation rewires persisted hollow pointers to stable store pointers and
 // rebuilds computed own/inverse slices. It is idempotent.
 func (db *DB[T]) fillRelation() {
+	index, err := buildRelationWireIndex()
+	if err != nil {
+		panic(err)
+	}
+
+	db.fillRelationFrom(index)
+}
+
+func (db *DB[T]) fillRelationFrom(index *relationWireIndex) {
 	specs, err := relationSpecs(reflect.TypeFor[T]())
 	if err != nil {
 		panic(err)
 	}
 
 	db.store.Range(func(entity *T) {
-		wireEntityRelations(reflect.ValueOf(entity).Elem(), specs)
+		wireEntityRelations(reflect.ValueOf(entity).Elem(), specs, index)
 	})
 }
 
-func wireEntityRelations(entity reflect.Value, specs []relationSpec) {
-	for _, spec := range specs {
-		wireRelation(entity, spec)
+func rewireRelations(runtimes []relationRuntime) {
+	index, err := buildRelationWireIndex()
+	if err != nil {
+		panic(err)
+	}
+
+	for _, runtime := range runtimes {
+		runtime.relationRewire(index)
 	}
 }
 
-func wireRelation(entity reflect.Value, spec relationSpec) {
+func wireEntityRelations(entity reflect.Value, specs []relationSpec, index *relationWireIndex) {
+	for _, spec := range specs {
+		wireRelation(entity, spec, index)
+	}
+}
+
+func wireRelation(entity reflect.Value, spec relationSpec, index *relationWireIndex) {
 	field := entity.Field(spec.fieldIndex)
 	if !spec.many {
-		wireToOne(field, spec)
+		wireToOne(field, spec, index)
 		return
 	}
 
 	switch spec.kind {
 	case borrowRelation, optionRelation:
-		wireReferenceSlice(field, spec)
-	case ownRelation:
-		wireOwnSlice(entity, field, spec)
-	case inverseRelation:
-		wireInverseSlice(entity, field, spec)
+		wireReferenceSlice(field, spec, index)
+	case ownRelation, inverseRelation:
+		wireIndexedSlice(entity, field, spec, index)
 	}
 }
 
-func wireToOne(field reflect.Value, spec relationSpec) {
+func wireToOne(field reflect.Value, spec relationSpec, index *relationWireIndex) {
 	key, present := relationKey(field, spec.matchField)
 	if !present {
 		field.SetZero()
 		return
 	}
 
-	target, found := canonicalTarget(spec.target, spec.matchField, key)
+	target, found := index.targets[relationTargetKey{typ: spec.target, field: spec.matchField, value: key.Interface()}]
 	if !found {
 		field.SetZero()
 		return
@@ -491,10 +483,10 @@ func wireToOne(field reflect.Value, spec relationSpec) {
 	field.Set(target)
 }
 
-func wireReferenceSlice(field reflect.Value, spec relationSpec) {
+func wireReferenceSlice(field reflect.Value, spec relationSpec, index *relationWireIndex) {
 	wired := reflect.MakeSlice(field.Type(), 0, field.Len())
 	for i := range field.Len() {
-		target, found := canonicalSliceElement(field.Index(i), spec)
+		target, found := canonicalSliceElement(field.Index(i), spec, index)
 		if found {
 			wired = reflect.Append(wired, target)
 		}
@@ -503,64 +495,27 @@ func wireReferenceSlice(field reflect.Value, spec relationSpec) {
 	field.Set(wired)
 }
 
-func canonicalSliceElement(element reflect.Value, spec relationSpec) (reflect.Value, bool) {
+func canonicalSliceElement(element reflect.Value, spec relationSpec, index *relationWireIndex) (reflect.Value, bool) {
 	key, present := relationKey(element, spec.matchField)
 	if !present {
 		return reflect.Value{}, false
 	}
 
-	return canonicalTarget(spec.target, spec.matchField, key)
+	target, found := index.targets[relationTargetKey{typ: spec.target, field: spec.matchField, value: key.Interface()}]
+	return target, found
 }
 
-func wireOwnSlice(owner, field reflect.Value, spec relationSpec) {
-	wired := reflect.MakeSlice(field.Type(), 0, 0)
-	foreign, found := getForeignStoreByType(spec.target.Name())
-	if !found {
-		field.Set(wired)
+func wireIndexedSlice(owner, field reflect.Value, spec relationSpec, index *relationWireIndex) {
+	key, present := relationKey(owner, "Id")
+	if !present {
+		field.Set(reflect.MakeSlice(field.Type(), 0, 0))
 		return
 	}
 
-	ownerID, _ := relationKey(owner, "Id")
-	back, _ := spec.target.FieldByName(spec.matchField)
-	for i := range foreign.Len() {
-		candidate := foreign.Index(i)
-		if candidateBelongsToOwner(candidate, back, ownerID) {
-			wired = reflect.Append(wired, candidate)
-		}
-	}
-
-	field.Set(wired)
-}
-
-func candidateBelongsToOwner(candidate reflect.Value, back reflect.StructField, ownerID reflect.Value) bool {
-	backValue := candidate.Elem().FieldByIndex(back.Index)
-	if backValue.Kind() != reflect.Pointer {
-		return scalarEqual(backValue, ownerID)
-	}
-
-	key, present := relationKey(backValue, "Id")
-	return present && scalarEqual(key, ownerID)
-}
-
-func wireInverseSlice(target, field reflect.Value, spec relationSpec) {
-	wired := reflect.MakeSlice(field.Type(), 0, 0)
-	foreign, found := getForeignStoreByType(spec.target.Name())
-	if !found {
-		field.Set(wired)
-		return
-	}
-
-	back, found := namedRelationSpec(spec.target, spec.matchField)
-	if !found {
-		field.Set(wired)
-		return
-	}
-
-	for i := range foreign.Len() {
-		candidate := foreign.Index(i)
-		if valueReferences(candidate.Elem(), back, target.Addr()) {
-			wired = reflect.Append(wired, candidate)
-		}
+	values := index.slices[relationFieldKey{owner: spec.owner, field: spec.fieldIndex}][key.Interface()]
+	wired := reflect.MakeSlice(field.Type(), len(values), len(values))
+	for i := range values {
+		wired.Index(i).Set(values[i])
 	}
 
 	field.Set(wired)
@@ -579,6 +534,156 @@ func namedRelationSpec(owner reflect.Type, fieldName string) (relationSpec, bool
 	}
 
 	return relationSpec{}, false
+}
+
+func buildRelationWireIndex() (*relationWireIndex, error) {
+	index := &relationWireIndex{
+		targets: make(map[relationTargetKey]reflect.Value),
+		slices:  make(map[relationFieldKey]map[any][]reflect.Value),
+	}
+	targetFields := make(map[reflect.Type]map[string]int)
+
+	for _, rawStore := range storeRegistry {
+		store, ok := rawStore.(pointerStoreIterator)
+		if !ok {
+			continue
+		}
+
+		values := reflect.ValueOf(store.iterateStorePointers())
+		typ := values.Type().Elem().Elem()
+		specs, err := relationSpecs(typ)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, spec := range specs {
+			switch {
+			case spec.kind == ownRelation && spec.many:
+				indexOwnSlice(index, spec)
+			case spec.kind == inverseRelation:
+				indexInverseSlice(index, spec)
+			default:
+				field, found := spec.target.FieldByName(spec.matchField)
+				if found {
+					if targetFields[spec.target] == nil {
+						targetFields[spec.target] = make(map[string]int)
+					}
+
+					targetFields[spec.target][spec.matchField] = field.Index[0]
+				}
+			}
+		}
+	}
+
+	for _, rawStore := range storeRegistry {
+		store, ok := rawStore.(pointerStoreIterator)
+		if !ok {
+			continue
+		}
+
+		values := reflect.ValueOf(store.iterateStorePointers())
+		typ := values.Type().Elem().Elem()
+		for i := range values.Len() {
+			indexEntityTargets(index, typ, values.Index(i), targetFields[typ])
+		}
+	}
+
+	return index, nil
+}
+
+func indexEntityTargets(index *relationWireIndex, typ reflect.Type, entity reflect.Value, fields map[string]int) {
+	for fieldName, fieldIndex := range fields {
+		value := entity.Elem().Field(fieldIndex)
+		if value.IsZero() || !value.CanInterface() {
+			continue
+		}
+
+		key := relationTargetKey{typ: typ, field: fieldName, value: value.Interface()}
+		if _, exists := index.targets[key]; !exists {
+			index.targets[key] = entity
+		}
+	}
+}
+
+func indexOwnSlice(index *relationWireIndex, spec relationSpec) {
+	foreign, found := getForeignStoreByType(spec.target.Name())
+	if !found {
+		return
+	}
+
+	byOwner := make(map[any][]reflect.Value)
+	back, _ := spec.target.FieldByName(spec.matchField)
+	for i := range foreign.Len() {
+		candidate := foreign.Index(i)
+		backValue := candidate.Elem().FieldByIndex(back.Index)
+		key := backValue
+		if backValue.Kind() == reflect.Pointer {
+			var present bool
+			key, present = relationKey(backValue, "Id")
+			if !present {
+				continue
+			}
+		}
+
+		if key.IsZero() || !key.CanInterface() {
+			continue
+		}
+
+		value := key.Interface()
+		byOwner[value] = append(byOwner[value], candidate)
+	}
+
+	index.slices[relationFieldKey{owner: spec.owner, field: spec.fieldIndex}] = byOwner
+}
+
+func indexInverseSlice(index *relationWireIndex, spec relationSpec) {
+	foreign, found := getForeignStoreByType(spec.target.Name())
+	if !found {
+		return
+	}
+
+	back, found := namedRelationSpec(spec.target, spec.matchField)
+	if !found {
+		return
+	}
+
+	byTarget := make(map[any][]reflect.Value)
+	for i := range foreign.Len() {
+		candidate := foreign.Index(i)
+		field := candidate.Elem().Field(back.fieldIndex)
+		if !back.many {
+			indexInverseReference(byTarget, candidate, field, back.matchField)
+			continue
+		}
+
+		seen := make(map[any]struct{}, field.Len())
+		for j := range field.Len() {
+			key, present := relationKey(field.Index(j), back.matchField)
+			if !present || !key.CanInterface() {
+				continue
+			}
+
+			value := key.Interface()
+			if _, duplicate := seen[value]; duplicate {
+				continue
+			}
+
+			seen[value] = struct{}{}
+			byTarget[value] = append(byTarget[value], candidate)
+		}
+	}
+
+	index.slices[relationFieldKey{owner: spec.owner, field: spec.fieldIndex}] = byTarget
+}
+
+func indexInverseReference(byTarget map[any][]reflect.Value, holder, pointer reflect.Value, matchField string) {
+	key, present := relationKey(pointer, matchField)
+	if !present || !key.CanInterface() {
+		return
+	}
+
+	value := key.Interface()
+	byTarget[value] = append(byTarget[value], holder)
 }
 
 // getForeignStoreByType returns the live []*T for typeName as a reflect.Value.
