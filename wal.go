@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"fmt"
 	"io"
 	"os"
 	"reflect"
@@ -33,8 +34,8 @@ type wal struct {
 
 func openWAL(path string) *wal { return &wal{path: path} }
 
-// appendFrame writes one frame ([uint32 len][gob walFrame]) and fsyncs. The fsync
-// is the durable commit point.
+// appendFrame writes one length-prefixed binary frame and fsyncs. The fsync is
+// the durable commit point.
 func (w *wal) appendFrame(rec walFrame) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -48,23 +49,47 @@ func (w *wal) appendFrame(rec walFrame) error {
 		w.f = f
 	}
 
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(rec); err != nil {
+	frame, err := encodeWALFrame(rec)
+	if err != nil {
 		return err
 	}
 
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(buf.Len()))
-
-	if _, err := w.f.Write(hdr[:]); err != nil {
-		return err
-	}
-
-	if _, err := w.f.Write(buf.Bytes()); err != nil {
+	if _, err := w.f.Write(frame); err != nil {
 		return err
 	}
 
 	return w.f.Sync()
+}
+
+func encodeWALFrame(rec walFrame) ([]byte, error) {
+	const (
+		frameHeader = 4
+		rowHeader   = 12
+		maxUint32   = uint64(^uint32(0))
+	)
+
+	bodySize := uint64(frameHeader)
+	for _, row := range rec.Rows {
+		bodySize += rowHeader + uint64(len(row.Row))
+	}
+
+	if bodySize > maxUint32 || uint64(len(rec.Rows)) > maxUint32 {
+		return nil, fmt.Errorf("nestory: WAL frame is too large")
+	}
+
+	frame := make([]byte, frameHeader+int(bodySize))
+	binary.BigEndian.PutUint32(frame, uint32(bodySize))
+	binary.BigEndian.PutUint32(frame[frameHeader:], uint32(len(rec.Rows)))
+
+	offset := frameHeader * 2
+	for _, row := range rec.Rows {
+		binary.BigEndian.PutUint64(frame[offset:], uint64(row.Id))
+		binary.BigEndian.PutUint32(frame[offset+8:], uint32(len(row.Row)))
+		copy(frame[offset+rowHeader:], row.Row)
+		offset += rowHeader + len(row.Row)
+	}
+
+	return frame, nil
 }
 
 func (w *wal) truncate() error {
@@ -117,12 +142,12 @@ func replayWAL(path string, rowType reflect.Type) ([]recoveredRow, error) {
 			break
 		}
 
-		var rec walFrame
-		if err := gob.NewDecoder(bytes.NewReader(body)).Decode(&rec); err != nil {
+		rows, valid := decodeWALFrame(body)
+		if !valid {
 			break
 		}
 
-		for _, p := range rec.Rows {
+		for _, p := range rows {
 			rv := reflect.New(rowType)
 
 			if derr := gob.NewDecoder(bytes.NewReader(p.Row)).DecodeValue(rv); derr != nil {
@@ -134,6 +159,38 @@ func replayWAL(path string, rowType reflect.Type) ([]recoveredRow, error) {
 	}
 
 	return out, nil
+}
+
+func decodeWALFrame(body []byte) ([]walRow, bool) {
+	const rowHeader = 12
+	if len(body) < 4 {
+		return nil, false
+	}
+
+	count := int(binary.BigEndian.Uint32(body))
+	if count > (len(body)-4)/rowHeader {
+		return nil, false
+	}
+
+	rows := make([]walRow, 0, count)
+	offset := 4
+	for range count {
+		if len(body)-offset < rowHeader {
+			return nil, false
+		}
+
+		id := int64(binary.BigEndian.Uint64(body[offset:]))
+		rowSize := int(binary.BigEndian.Uint32(body[offset+8:]))
+		offset += rowHeader
+		if rowSize > len(body)-offset {
+			return nil, false
+		}
+
+		rows = append(rows, walRow{Id: id, Row: body[offset : offset+rowSize]})
+		offset += rowSize
+	}
+
+	return rows, offset == len(body)
 }
 
 // encodeRow gob-encodes one flat schema row (no interface boxing, so no
