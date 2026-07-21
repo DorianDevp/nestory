@@ -14,6 +14,7 @@ func isScalarKey(k reflect.Kind) bool {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return true
 	}
+
 	return false
 }
 
@@ -143,6 +144,7 @@ func (db *DB[T]) normalizeToSchema(instance T) reflect.Value {
 	if err != nil {
 		panic(err)
 	}
+
 	row := db.createSchemaStruct()
 
 	for _, pair := range db.schemaFields {
@@ -171,8 +173,10 @@ func (db *DB[T]) normalizeToSchema(instance T) reflect.Value {
 				keys = reflect.Append(keys, key)
 			}
 		}
+
 		column.Set(keys)
 	}
+
 	return row
 }
 
@@ -193,11 +197,14 @@ func schemaFieldsFor(t reflect.Type) [][2]string {
 			if !persistedRelation(r) {
 				continue
 			}
+
 			fields = append(fields, [2]string{f.Name, relationColumnName(r)})
 			continue
 		}
+
 		fields = append(fields, [2]string{f.Name, f.Name})
 	}
+
 	return fields
 }
 
@@ -209,10 +216,12 @@ func schemaStructFor(t reflect.Type) reflect.Value {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
+
 	specs, err := specsByField(t)
 	if err != nil {
 		panic(err)
 	}
+
 	fields := schemaFieldsFor(t)
 	columns := make([]reflect.StructField, 0, len(fields))
 	for _, pair := range fields {
@@ -221,6 +230,7 @@ func schemaStructFor(t reflect.Type) reflect.Value {
 		if r, ok := specs[pair[0]]; ok {
 			columnType = relationColumnType(r)
 		}
+
 		columns = append(columns, reflect.StructField{Name: pair[1], Type: columnType})
 	}
 

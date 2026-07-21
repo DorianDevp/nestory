@@ -74,6 +74,7 @@ func relationTarget(t reflect.Type) (target reflect.Type, many, ok bool) {
 		if t.Elem().Kind() != reflect.Pointer {
 			return nil, false, false
 		}
+
 		target, many = t.Elem().Elem(), true
 	default:
 		return nil, false, false
@@ -97,6 +98,7 @@ func parseRelationField(owner reflect.Type, index int) (relationSpec, bool, erro
 		if relationShape && isEntityType(target) {
 			return relationSpec{}, false, fmt.Errorf("%w: %s.%s points to entity %s but has no rel tag", ErrRelationSchema, owner, f.Name, target)
 		}
+
 		return relationSpec{}, false, nil
 	}
 
@@ -139,6 +141,7 @@ func relationSpecs(t reflect.Type) ([]relationSpec, error) {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
+
 	if cached, ok := relationSpecsCache.Load(t); ok {
 		result := cached.(cachedRelationSpecs)
 		return result.specs, result.err
@@ -428,6 +431,7 @@ func valueReferences(v reflect.Value, r relationSpec, target reflect.Value) bool
 				return true
 			}
 		}
+
 		return false
 	}
 
@@ -583,9 +587,11 @@ func getForeignStoreByType(typeName string) (reflect.Value, bool) {
 	if !ok {
 		return reflect.Value{}, false
 	}
+
 	iter, ok := e.(pointerStoreIterator)
 	if !ok {
 		return reflect.Value{}, false
 	}
+
 	return reflect.ValueOf(iter.iterateStorePointers()), true
 }

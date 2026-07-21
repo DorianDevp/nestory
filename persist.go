@@ -43,14 +43,17 @@ func (db *DB[T]) queueCreate(entity *T) {
 		db.persistQueue = append(db.persistQueue, entity)
 		return
 	}
+
 	if existing := db.index[db.identifier][id]; existing != nil {
 		return
 	}
+
 	for _, queued := range db.persistQueue {
 		if (*queued).GetId() == id {
 			return
 		}
 	}
+
 	db.persistQueue = append(db.persistQueue, entity)
 }
 
@@ -61,11 +64,13 @@ func (db *DB[T]) queueDelete(id int) error {
 	if !ok {
 		return fmt.Errorf("%w: %s(%d)", ErrNotFound, db.name, id)
 	}
+
 	for _, queued := range db.deleteQueue {
 		if (*queued).GetId() == id {
 			return nil
 		}
 	}
+
 	db.deleteQueue = append(db.deleteQueue, instance)
 	return nil
 }
