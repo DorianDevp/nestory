@@ -170,12 +170,14 @@ type resolvedRelation struct {
 }
 
 type relationModel struct {
-	nodes    map[nodeKey]relationGraphNode
-	targets  map[relationTargetKey]indexedRelationTarget
-	refs     []resolvedRelation
-	missing  []missingRelation
-	owners   map[nodeKey]nodeKey
-	outgoing map[nodeKey][]nodeKey
+	nodes        map[nodeKey]relationGraphNode
+	targets      map[relationTargetKey]indexedRelationTarget
+	targetFields map[reflect.Type]map[string]struct{}
+	refs         []resolvedRelation
+	unresolved   []unresolvedRelation
+	missing      []missingRelation
+	owners       map[nodeKey]nodeKey
+	outgoing     map[nodeKey][]nodeKey
 }
 
 type relationTargetKey struct {
@@ -194,6 +196,12 @@ type missingRelation struct {
 	spec   relationSpec
 }
 
+type unresolvedRelation struct {
+	holder nodeKey
+	spec   relationSpec
+	lookup relationTargetKey
+}
+
 type incomingOwn struct {
 	owner nodeKey
 	spec  relationSpec
@@ -204,6 +212,7 @@ var committedOwnership = struct {
 	ready    atomic.Bool
 	outgoing map[nodeKey][]nodeKey
 	branches map[nodeKey][]nodeKey
+	graph    *relationModel
 }{outgoing: make(map[nodeKey][]nodeKey), branches: make(map[nodeKey][]nodeKey)}
 
 // graphMu protects live relation pointers while a branch is copied or a commit
@@ -217,6 +226,7 @@ func resetCommittedOwnership() {
 	committedOwnership.ready.Store(false)
 	committedOwnership.outgoing = make(map[nodeKey][]nodeKey)
 	committedOwnership.branches = make(map[nodeKey][]nodeKey)
+	committedOwnership.graph = nil
 }
 
 func ensureCommittedOwnership() error {
@@ -264,8 +274,21 @@ func storeCommittedOwnership(model *relationModel, deleted map[nodeKey]struct{})
 	committedOwnership.Lock()
 	committedOwnership.outgoing = outgoing
 	committedOwnership.branches = make(map[nodeKey][]nodeKey)
+	if len(deleted) == 0 {
+		committedOwnership.graph = model
+	} else {
+		committedOwnership.graph = nil
+	}
+
 	committedOwnership.Unlock()
 	committedOwnership.ready.Store(true)
+}
+
+func committedRelationModel() *relationModel {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	return committedOwnership.graph
 }
 
 func committedChildren(owner nodeKey) []nodeKey {
@@ -650,17 +673,12 @@ func addGraphNode(nodes map[nodeKey]relationGraphNode, value reflect.Value, typ 
 }
 
 func resolveGraphTarget(model *relationModel, r relationSpec, pointer reflect.Value) (nodeKey, bool, error) {
-	matchField := r.matchField
-	if r.kind == ownRelation && r.many {
-		matchField = "Id"
-	}
-
-	key, present := relationKey(pointer, matchField)
+	key, present := graphRelationTargetKey(r, pointer)
 	if !present {
 		return nodeKey{}, false, nil
 	}
 
-	target, found := model.targets[relationTargetKey{typ: r.target, field: matchField, value: key.Interface()}]
+	target, found := model.targets[key]
 	if target.duplicate {
 		return nodeKey{}, false, fmt.Errorf("%w: %s.%s does not uniquely identify a target", ErrRelationInvariant, r.owner, r.fieldName)
 	}
@@ -668,14 +686,37 @@ func resolveGraphTarget(model *relationModel, r relationSpec, pointer reflect.Va
 	return target.key, found, nil
 }
 
+func graphRelationTargetKey(r relationSpec, pointer reflect.Value) (relationTargetKey, bool) {
+	matchField := r.matchField
+	if r.kind == ownRelation && r.many {
+		matchField = "Id"
+	}
+
+	key, present := relationKey(pointer, matchField)
+	if !present {
+		return relationTargetKey{}, false
+	}
+
+	return relationTargetKey{typ: r.target, field: matchField, value: key.Interface()}, true
+}
+
 func buildRelationModel(nodes map[nodeKey]relationGraphNode) (*relationModel, error) {
-	targets, err := buildRelationTargetIndex(nodes)
+	fields, err := relationTargetFields(nodes)
 	if err != nil {
 		return nil, err
 	}
 
+	targets := buildRelationTargetIndexFromFields(nodes, fields)
+	return buildRelationModelFromTargets(nodes, targets, fields)
+}
+
+func buildRelationModelFromTargets(
+	nodes map[nodeKey]relationGraphNode,
+	targets map[relationTargetKey]indexedRelationTarget,
+	targetFields map[reflect.Type]map[string]struct{},
+) (*relationModel, error) {
 	model := &relationModel{
-		nodes: nodes, targets: targets,
+		nodes: nodes, targets: targets, targetFields: targetFields,
 		owners: make(map[nodeKey]nodeKey), outgoing: make(map[nodeKey][]nodeKey),
 	}
 	incoming := make(map[nodeKey][]incomingOwn)
@@ -700,7 +741,143 @@ func buildRelationModel(nodes map[nodeKey]relationGraphNode) (*relationModel, er
 	return model, nil
 }
 
-func buildRelationTargetIndex(nodes map[nodeKey]relationGraphNode) (map[relationTargetKey]indexedRelationTarget, error) {
+func buildRelationModelDelta(
+	committed *relationModel,
+	nodes map[nodeKey]relationGraphNode,
+	targets map[relationTargetKey]indexedRelationTarget,
+	rescan map[nodeKey]relationGraphNode,
+) (*relationModel, error) {
+	model := &relationModel{
+		nodes: nodes, targets: targets, targetFields: committed.targetFields,
+		owners: make(map[nodeKey]nodeKey, len(committed.owners)), outgoing: make(map[nodeKey][]nodeKey),
+		refs: make([]resolvedRelation, 0, len(committed.refs)),
+	}
+	for child, owner := range committed.owners {
+		model.owners[child] = owner
+	}
+
+	for _, unresolved := range committed.unresolved {
+		if _, resolved := targets[unresolved.lookup]; resolved {
+			rescan[unresolved.holder] = nodes[unresolved.holder]
+		}
+	}
+
+	for _, unresolved := range committed.unresolved {
+		if _, changed := rescan[unresolved.holder]; changed {
+			continue
+		}
+
+		model.unresolved = append(model.unresolved, unresolved)
+	}
+
+	affected := make(map[nodeKey]struct{})
+	for _, ref := range committed.refs {
+		if _, changed := rescan[ref.holder]; changed {
+			markOwnershipTarget(affected, ref)
+			continue
+		}
+
+		model.refs = append(model.refs, ref)
+	}
+
+	scannedIncoming := make(map[nodeKey][]incomingOwn)
+	scannedOwnedBy := make(map[nodeKey]incomingOwn)
+	for key, node := range rescan {
+		if _, exists := nodes[key]; !exists {
+			continue
+		}
+
+		if err := scanNodeRelations(model, node, scannedIncoming, scannedOwnedBy); err != nil {
+			return nil, err
+		}
+	}
+
+	for child := range scannedIncoming {
+		affected[child] = struct{}{}
+	}
+
+	for child := range scannedOwnedBy {
+		affected[child] = struct{}{}
+	}
+
+	incoming := make(map[nodeKey][]incomingOwn, len(affected))
+	ownedBy := make(map[nodeKey]incomingOwn, len(affected))
+	for _, ref := range model.refs {
+		if ref.spec.kind == ownRelation {
+			if _, changed := affected[ref.target]; changed {
+				incoming[ref.target] = append(incoming[ref.target], incomingOwn{owner: ref.holder, spec: ref.spec})
+			}
+		}
+
+		if ref.spec.kind == ownedByRelation {
+			if _, changed := affected[ref.holder]; changed {
+				ownedBy[ref.holder] = incomingOwn{owner: ref.target, spec: ref.spec}
+			}
+		}
+	}
+
+	for child := range affected {
+		delete(model.owners, child)
+		if err := attachNodeOwner(model, child, incoming[child], ownedBy); err != nil {
+			return nil, err
+		}
+	}
+
+	model.outgoing = make(map[nodeKey][]nodeKey)
+	for child, owner := range model.owners {
+		model.outgoing[owner] = append(model.outgoing[owner], child)
+	}
+
+	if err := validateChangedOwnershipCycles(model, affected); err != nil {
+		return nil, err
+	}
+
+	return model, nil
+}
+
+func markOwnershipTarget(affected map[nodeKey]struct{}, ref resolvedRelation) {
+	switch ref.spec.kind {
+	case ownRelation:
+		affected[ref.target] = struct{}{}
+	case ownedByRelation:
+		affected[ref.holder] = struct{}{}
+	}
+}
+
+func validateChangedOwnershipCycles(model *relationModel, changed map[nodeKey]struct{}) error {
+	for start := range changed {
+		seen := make(map[nodeKey]struct{})
+		for at := start; ; {
+			if _, duplicate := seen[at]; duplicate {
+				return fmt.Errorf("%w: ownership cycle involving %s", ErrRelationInvariant, at)
+			}
+
+			seen[at] = struct{}{}
+			owner, found := model.owners[at]
+			if !found {
+				break
+			}
+
+			at = owner
+		}
+	}
+
+	return nil
+}
+
+func buildRelationTargetIndexFromFields(
+	nodes map[nodeKey]relationGraphNode,
+	fieldsByType map[reflect.Type]map[string]struct{},
+) map[relationTargetKey]indexedRelationTarget {
+	targets := make(map[relationTargetKey]indexedRelationTarget)
+	for nodeKey, node := range nodes {
+		indexRelationNodeTargets(targets, node, fieldsByType[nodeKey.typ])
+	}
+
+	return targets
+}
+
+func relationTargetFields(nodes map[nodeKey]relationGraphNode) (map[reflect.Type]map[string]struct{}, error) {
 	fieldsByType := make(map[reflect.Type]map[string]struct{})
 	visitedTypes := make(map[reflect.Type]struct{})
 	for key := range nodes {
@@ -732,27 +909,26 @@ func buildRelationTargetIndex(nodes map[nodeKey]relationGraphNode) (map[relation
 		}
 	}
 
-	targets := make(map[relationTargetKey]indexedRelationTarget)
-	for nodeKey, node := range nodes {
-		for field := range fieldsByType[nodeKey.typ] {
-			value, present := relationKey(node.value, field)
-			if !present {
-				continue
-			}
+	return fieldsByType, nil
+}
 
-			key := relationTargetKey{typ: nodeKey.typ, field: field, value: value.Interface()}
-			target, duplicate := targets[key]
-			if duplicate {
-				target.duplicate = true
-				targets[key] = target
-				continue
-			}
-
-			targets[key] = indexedRelationTarget{key: nodeKey}
+func indexRelationNodeTargets(targets map[relationTargetKey]indexedRelationTarget, node relationGraphNode, fields map[string]struct{}) {
+	for field := range fields {
+		value, present := relationKey(node.value, field)
+		if !present {
+			continue
 		}
-	}
 
-	return targets, nil
+		key := relationTargetKey{typ: node.key.typ, field: field, value: value.Interface()}
+		target, duplicate := targets[key]
+		if duplicate {
+			target.duplicate = true
+			targets[key] = target
+			continue
+		}
+
+		targets[key] = indexedRelationTarget{key: node.key}
+	}
 }
 
 func scanNodeRelations(model *relationModel, node relationGraphNode, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
@@ -809,6 +985,12 @@ func scanRelationPointer(
 	}
 
 	if !found {
+		if lookup, present := graphRelationTargetKey(spec, pointer); present {
+			model.unresolved = append(model.unresolved, unresolvedRelation{
+				holder: node.key, spec: spec, lookup: lookup,
+			})
+		}
+
 		if relationMayBeMissing(spec) {
 			return nil
 		}

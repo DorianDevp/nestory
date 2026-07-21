@@ -21,6 +21,20 @@ type txChild struct {
 
 func (v txChild) GetId() int { return v.Id }
 
+type txKeyTarget struct {
+	Id  int `key:"primary"`
+	Key string
+}
+
+func (target txKeyTarget) GetId() int { return target.Id }
+
+type txKeyBorrower struct {
+	Id     int          `key:"primary"`
+	Target *txKeyTarget `rel:"borrow,Key"`
+}
+
+func (borrower txKeyBorrower) GetId() int { return borrower.Id }
+
 func TestTransactionEditsOwnershipTreeWithoutUpdate(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)
@@ -453,6 +467,83 @@ func findRTNode(root *rtNode, id int) *rtNode {
 	}
 
 	return nil
+}
+
+func TestTransactionRejectsOwnershipCycleFromDelta(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtNode](); err != nil {
+			t.Fatal(err)
+		}
+
+		db := Open[rtNode]()
+		root := &rtNode{Children: []*rtNode{{}}}
+		if err := db.Create(root); err != nil {
+			t.Fatal(err)
+		}
+
+		err := db.UpdateWithin(root.Id, func(current *rtNode) error {
+			current.Children[0].Children = []*rtNode{current}
+			return nil
+		})
+		if !errors.Is(err, ErrRelationInvariant) {
+			t.Fatalf("cycle error = %v, want %v", err, ErrRelationInvariant)
+		}
+	})
+}
+
+func TestTransactionRebuildsIndexWhenRelationKeyChanges(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txKeyTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txKeyBorrower](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[txKeyTarget]()
+		borrowerDB := Open[txKeyBorrower]()
+		target := &txKeyTarget{Key: "stable"}
+		targetDB.Unsafe().Create(target)
+		borrowerDB.Unsafe().Create(&txKeyBorrower{Target: target})
+		if err := targetDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		err := targetDB.UpdateWithin(target.Id, func(current *txKeyTarget) error {
+			current.Key = "changed"
+			return nil
+		})
+		if !errors.Is(err, ErrRelationInvariant) {
+			t.Fatalf("key change error = %v, want %v", err, ErrRelationInvariant)
+		}
+	})
+}
+
+func TestTransactionRejectsDuplicateRelationKeyOnCreate(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txKeyTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txKeyBorrower](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[txKeyTarget]()
+		borrowerDB := Open[txKeyBorrower]()
+		target := &txKeyTarget{Key: "duplicate"}
+		targetDB.Unsafe().Create(target)
+		borrowerDB.Unsafe().Create(&txKeyBorrower{Target: target})
+		if err := targetDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		err := targetDB.Create(&txKeyTarget{Key: "duplicate"})
+		if !errors.Is(err, ErrRelationInvariant) {
+			t.Fatalf("duplicate key error = %v, want %v", err, ErrRelationInvariant)
+		}
+	})
 }
 
 func TestJoinCombinesDifferentTypesInOneCommit(t *testing.T) {

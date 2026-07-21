@@ -125,6 +125,7 @@ func Open[T Entity]() *DB[T] {
 	initBase.seedCounter()
 
 	baseRegistry[name] = initBase
+	resetCommittedOwnership()
 
 	return initBase
 }
