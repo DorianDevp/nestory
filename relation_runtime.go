@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 type relationRuntime interface {
@@ -174,7 +175,7 @@ type incomingOwn struct {
 
 var committedOwnership = struct {
 	sync.RWMutex
-	ready    bool
+	ready    atomic.Bool
 	outgoing map[nodeKey][]nodeKey
 }{outgoing: make(map[nodeKey][]nodeKey)}
 
@@ -186,15 +187,12 @@ func resetCommittedOwnership() {
 	committedOwnership.Lock()
 	defer committedOwnership.Unlock()
 
-	committedOwnership.ready = false
+	committedOwnership.ready.Store(false)
 	committedOwnership.outgoing = make(map[nodeKey][]nodeKey)
 }
 
 func ensureCommittedOwnership() error {
-	committedOwnership.RLock()
-	ready := committedOwnership.ready
-	committedOwnership.RUnlock()
-	if ready {
+	if committedOwnership.ready.Load() {
 		return nil
 	}
 
@@ -228,9 +226,9 @@ func storeCommittedOwnership(model *relationModel) {
 	}
 
 	committedOwnership.Lock()
-	committedOwnership.ready = true
 	committedOwnership.outgoing = outgoing
 	committedOwnership.Unlock()
+	committedOwnership.ready.Store(true)
 }
 
 func committedChildren(owner nodeKey) []nodeKey {
