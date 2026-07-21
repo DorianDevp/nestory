@@ -230,15 +230,23 @@ func refreshCommittedOwnership() error {
 		return err
 	}
 
-	storeCommittedOwnership(model)
+	storeCommittedOwnership(model, nil)
 
 	return nil
 }
 
-func storeCommittedOwnership(model *relationModel) {
+func storeCommittedOwnership(model *relationModel, deleted map[nodeKey]struct{}) {
 	outgoing := make(map[nodeKey][]nodeKey, len(model.outgoing))
 	for owner, children := range model.outgoing {
-		outgoing[owner] = append([]nodeKey(nil), children...)
+		if _, dies := deleted[owner]; dies {
+			continue
+		}
+
+		for _, child := range children {
+			if _, dies := deleted[child]; !dies {
+				outgoing[owner] = append(outgoing[owner], child)
+			}
+		}
 	}
 
 	committedOwnership.Lock()
@@ -1177,9 +1185,7 @@ func flushRelations() error {
 		runtime.relationClearQueues()
 	}
 
-	if err := refreshCommittedOwnership(); err != nil {
-		return err
-	}
+	storeCommittedOwnership(model, deleted)
 
 	return nil
 }
