@@ -62,8 +62,14 @@ type transactionState struct {
 	hasResource bool
 	resource    touchedResource
 	resources   []touchedResource
+	resourcePos map[transactionResourceKey]int
 	creates     map[nodeKey]createdResource
 	deletes     map[nodeKey]stagedDelete
+}
+
+type transactionResourceKey struct {
+	dbName string
+	id     int
 }
 
 func (tx *transactionState) copyResources() []touchedResource {
@@ -149,14 +155,13 @@ func (en *transactionEngine) record(tx *transactionState, e touchedResource) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	if tx.hasResource && tx.resource.dbName == e.dbName && tx.resource.id == e.id {
-		return
-	}
-
-	for _, existing := range tx.resources {
-		if existing.dbName == e.dbName && existing.id == e.id {
+	key := transactionResourceKey{dbName: e.dbName, id: e.id}
+	if tx.resourcePos != nil {
+		if _, exists := tx.resourcePos[key]; exists {
 			return
 		}
+	} else if tx.hasResource && tx.resource.dbName == e.dbName && tx.resource.id == e.id {
+		return
 	}
 
 	if !tx.hasResource {
@@ -166,7 +171,14 @@ func (en *transactionEngine) record(tx *transactionState, e touchedResource) {
 		return
 	}
 
+	if tx.resourcePos == nil {
+		tx.resourcePos = map[transactionResourceKey]int{
+			{dbName: tx.resource.dbName, id: tx.resource.id}: 0,
+		}
+	}
+
 	tx.resources = append(tx.resources, e)
+	tx.resourcePos[key] = len(tx.resources)
 	en.bind[e.work] = tx
 }
 
@@ -174,14 +186,21 @@ func (en *transactionEngine) work(tx *transactionState, dbName string, id int) (
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	if tx.hasResource && tx.resource.dbName == dbName && tx.resource.id == id {
-		return tx.resource.work, true
+	if tx.resourcePos != nil {
+		position, found := tx.resourcePos[transactionResourceKey{dbName: dbName, id: id}]
+		if !found {
+			return nil, false
+		}
+
+		if position == 0 {
+			return tx.resource.work, true
+		}
+
+		return tx.resources[position-1].work, true
 	}
 
-	for _, resource := range tx.resources {
-		if resource.dbName == dbName && resource.id == id {
-			return resource.work, true
-		}
+	if tx.hasResource && tx.resource.dbName == dbName && tx.resource.id == id {
+		return tx.resource.work, true
 	}
 
 	return nil, false
@@ -590,6 +609,7 @@ func (en *transactionEngine) evict(tx *transactionState) {
 	tx.hasResource = false
 	tx.resource = touchedResource{}
 	tx.resources = nil
+	tx.resourcePos = nil
 	tx.creates = nil
 	tx.deletes = nil
 }
