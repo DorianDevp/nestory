@@ -16,7 +16,7 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 	})
 
 	resetRegistries()
-	Register[bqItem]()
+	registerForTest[bqItem](t)
 	db := Open[bqItem]()
 
 	first := &bqItem{Name: "first"}

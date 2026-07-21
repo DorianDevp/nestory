@@ -25,7 +25,7 @@ func TestRegression_BatchQueueAssignsDistinctIds(t *testing.T) {
 	})
 
 	resetRegistries()
-	Register[bqItem]()
+	registerForTest[bqItem](t)
 	db := Open[bqItem]()
 
 	items := []*bqItem{
@@ -77,7 +77,7 @@ func TestRegression_QueueRespectsExistingMaxId(t *testing.T) {
 	})
 
 	resetRegistries()
-	Register[bqItem]()
+	registerForTest[bqItem](t)
 	db := Open[bqItem]()
 
 	for i := 0; i < 3; i++ {
@@ -109,7 +109,7 @@ func TestRegression_CounterSeededAfterReload(t *testing.T) {
 
 	// persist ids 1, 2, 3
 	resetRegistries()
-	Register[bqItem]()
+	registerForTest[bqItem](t)
 	db := Open[bqItem]()
 	for i := 0; i < 3; i++ {
 		db.Unsafe().Create(&bqItem{Name: "seed"})
@@ -121,7 +121,7 @@ func TestRegression_CounterSeededAfterReload(t *testing.T) {
 
 	// reload from disk, insert one more
 	resetRegistries()
-	Register[bqItem]()
+	registerForTest[bqItem](t)
 	db2 := Open[bqItem]()
 
 	fresh := &bqItem{Name: "after-reload"}
@@ -151,7 +151,7 @@ func TestRegression_SaveIsAtomic_NoLeftoverTmp(t *testing.T) {
 	})
 
 	resetRegistries()
-	Register[bqItem]()
+	registerForTest[bqItem](t)
 	db := Open[bqItem]()
 
 	db.Unsafe().Create(&bqItem{Name: "ok"})
@@ -188,7 +188,7 @@ func TestRegression_SaveOverwritePreservesPrevOnNewWrite(t *testing.T) {
 	})
 
 	resetRegistries()
-	Register[bqItem]()
+	registerForTest[bqItem](t)
 	db := Open[bqItem]()
 
 	db.Unsafe().Create(&bqItem{Name: "v1"})

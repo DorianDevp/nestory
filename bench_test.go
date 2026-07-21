@@ -30,7 +30,7 @@ func quiet(tb testing.TB) {
 	log.SetOutput(io.Discard)
 	tb.Cleanup(func() {
 		os.Stdout = oldStdout
-		devnull.Close()
+		_ = devnull.Close()
 		log.SetOutput(os.Stderr)
 	})
 }
@@ -40,7 +40,7 @@ func newBenchDB(tb testing.TB, n int) *DB[benchItem] {
 	tb.Helper()
 	DataDir = tb.TempDir()
 	resetRegistries()
-	Register[benchItem]()
+	registerForTest[benchItem](tb)
 	db := Open[benchItem]()
 	for i := 0; i < n; i++ {
 		db.Unsafe().Create(&benchItem{
@@ -69,7 +69,7 @@ func BenchmarkBatchInsertFlush(b *testing.B) {
 				b.StopTimer()
 				DataDir = b.TempDir()
 				resetRegistries()
-				Register[benchItem]()
+				registerForTest[benchItem](b)
 				db := Open[benchItem]()
 				items := make([]*benchItem, n)
 				for j := range items {
