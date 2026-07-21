@@ -193,18 +193,32 @@ func (en *transactionEngine) commit(transactionId txId) error {
 		return ErrExpiredSnapshot
 	}
 
-	graphMu.Lock()
-	defer graphMu.Unlock()
-
 	touchedResources = changedResources(touchedResources)
 	if len(touchedResources) == 0 && len(createdResources) == 0 && len(stagedDeletes) == 0 {
 		en.evict(transactionId)
 		return nil
 	}
 
-	_, deleted, err := validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
+	structural := len(createdResources) > 0 || len(stagedDeletes) > 0
+	relationChanged, err := resourcesChangeRelationGraph(touchedResources)
 	if err != nil {
 		return err
+	}
+	graphChanged := structural || relationChanged
+	if graphChanged {
+		graphMu.Lock()
+		defer graphMu.Unlock()
+	} else {
+		graphMu.RLock()
+		defer graphMu.RUnlock()
+	}
+
+	deleted := make(map[nodeKey]struct{})
+	if graphChanged {
+		_, deleted, err = validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
+		if err != nil {
+			return err
+		}
 	}
 
 	for key := range createdResources {
@@ -256,7 +270,6 @@ func (en *transactionEngine) commit(transactionId txId) error {
 
 	// Relation checks see every changed branch at once, before either the WAL
 	// or live memory is changed.
-	structural := len(createdResources) > 0 || len(stagedDeletes) > 0
 	if !structural {
 		if err := logTransactionWrites(touchedResources); err != nil {
 			return err
@@ -270,6 +283,10 @@ func (en *transactionEngine) commit(transactionId txId) error {
 	for _, created := range createdResources {
 		runtime := baseRegistry[created.key.typ.Name()].(relationRuntime)
 		runtime.relationApplyCreate(created.work)
+	}
+	if !graphChanged {
+		en.evict(transactionId)
+		return nil
 	}
 
 	nodes, err := collectRelationNodes(false, nil)
@@ -303,6 +320,73 @@ func (en *transactionEngine) commit(transactionId txId) error {
 	en.evict(transactionId)
 
 	return nil
+}
+
+func resourcesChangeRelationGraph(resources []touchedResource) (bool, error) {
+	matchFields, err := registeredRelationMatchFields()
+	if err != nil {
+		return false, err
+	}
+
+	for _, resource := range resources {
+		before := reflect.ValueOf(resource.original).Elem()
+		after := reflect.ValueOf(resource.work).Elem()
+		if resource.original.(Entity).GetId() != resource.work.(Entity).GetId() {
+			return false, fmt.Errorf("%w: primary key of %s(%d) changed", ErrRelationInvariant, before.Type(), resource.id)
+		}
+
+		specs, err := relationSpecs(before.Type())
+		if err != nil {
+			return false, err
+		}
+
+		for _, spec := range specs {
+			if !relationValueEqual(before.Field(spec.fieldIndex), after.Field(spec.fieldIndex), spec.many) {
+				return true, nil
+			}
+		}
+
+		for fieldIndex := range matchFields[before.Type()] {
+			if !reflect.DeepEqual(before.Field(fieldIndex).Interface(), after.Field(fieldIndex).Interface()) {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+func registeredRelationMatchFields() (map[reflect.Type]map[int]struct{}, error) {
+	fields := make(map[reflect.Type]map[int]struct{})
+	for _, runtime := range relationRuntimes() {
+		typ := runtime.relationType()
+		idField, found := typ.FieldByName("Id")
+		if !found {
+			return nil, fmt.Errorf("%w: %s.Id does not exist", ErrRelationSchema, typ)
+		}
+
+		fields[typ] = map[int]struct{}{idField.Index[0]: {}}
+
+		specs, err := relationSpecs(typ)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, spec := range specs {
+			field, found := spec.target.FieldByName(spec.matchField)
+			if !found {
+				return nil, fmt.Errorf("%w: %s.%s does not exist", ErrRelationSchema, spec.target, spec.matchField)
+			}
+
+			if fields[spec.target] == nil {
+				fields[spec.target] = make(map[int]struct{})
+			}
+
+			fields[spec.target][field.Index[0]] = struct{}{}
+		}
+	}
+
+	return fields, nil
 }
 
 func logTransactionWrites(resources []touchedResource) error {
