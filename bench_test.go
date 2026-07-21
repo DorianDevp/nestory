@@ -151,7 +151,106 @@ func BenchmarkFindOneByID(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_, _ = db.FindOneBy("Id", target)
+				branch, err := db.FindOneBy("Id", target)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				// A safe Get is a branch lease. Update closes it; with no changes it
+				// performs no WAL write.
+				if err := db.Update(branch); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkSafeGetByID(b *testing.B) {
+	for _, n := range benchSizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			quiet(b)
+			db := newBenchDB(b, n)
+			target := n / 2
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				branch, err := db.Get(target)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if err := db.Update(branch); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkUnsafeGetByID(b *testing.B) {
+	for _, n := range benchSizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			quiet(b)
+			db := newBenchDB(b, n)
+			target := n / 2
+			unsafe := db.Unsafe()
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				item, err := unsafe.Get(target)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if item.Id != target {
+					b.Fatal("wrong entity")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkUnsafePointMutation(b *testing.B) {
+	for _, n := range benchSizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			quiet(b)
+			db := newBenchDB(b, n)
+			target := n / 2
+			unsafe := db.Unsafe()
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				item, err := unsafe.Get(target)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				item.Age = i % 90
+			}
+		})
+	}
+}
+
+func BenchmarkUnsafePointMutationFlush(b *testing.B) {
+	for _, n := range benchSizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			quiet(b)
+			db := newBenchDB(b, n)
+			target := n / 2
+			unsafe := db.Unsafe()
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				item, err := unsafe.Get(target)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				item.Age = i % 90
+				if err := unsafe.Flush(); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
