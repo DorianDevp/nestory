@@ -62,6 +62,46 @@ func TestUnsafeGetPersistsLiveMutation(t *testing.T) {
 	}
 }
 
+func TestUnsafeAllPersistsLiveMutation(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	resetRegistries()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	if err := Register[bqItem](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[bqItem]()
+	item := &bqItem{Name: "cold"}
+	db.Unsafe().Create(item)
+	if err := db.Unsafe().Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Unsafe().All()[0].Name = "hot"
+	if err := db.Unsafe().Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	resetRegistries()
+	if err := Register[bqItem](); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := Open[bqItem]().FindOneBy("Id", item.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if reloaded.Name != "hot" {
+		t.Fatalf("reloaded name = %q, want hot", reloaded.Name)
+	}
+}
+
 func TestUnsafeGetValidatesRelationsAtFlush(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)

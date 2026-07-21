@@ -65,6 +65,15 @@ func (s *chunkStore[T]) markDirty(ci int) {
 	s.dirtyMu.Unlock()
 }
 
+func (s *chunkStore[T]) markAllDirty() {
+	s.dirtyMu.Lock()
+	for i := range s.dirty {
+		s.dirty[i] = true
+	}
+
+	s.dirtyMu.Unlock()
+}
+
 func (s *chunkStore[T]) dirtyIndices() []int {
 	s.dirtyMu.Lock()
 	defer s.dirtyMu.Unlock()

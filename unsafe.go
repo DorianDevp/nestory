@@ -24,8 +24,12 @@ func (unsafe UnsafeDB[T]) Get(id int) (*T, error) {
 	return resource.item, nil
 }
 
-// All returns every stable live pointer.
-func (unsafe UnsafeDB[T]) All() []*T { return unsafe.db.store.StorePointers() }
+// All returns every stable live pointer and marks every chunk dirty.
+func (unsafe UnsafeDB[T]) All() []*T {
+	unsafe.db.store.markAllDirty()
+
+	return unsafe.db.store.StorePointers()
+}
 
 // Create stages an entity for the next Flush without transaction isolation.
 func (unsafe UnsafeDB[T]) Create(entity *T) { unsafe.db.queueCreate(entity) }
