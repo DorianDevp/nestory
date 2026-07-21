@@ -2,6 +2,7 @@ package nestory
 
 import (
 	"errors"
+	"reflect"
 	"sort"
 	"sync"
 )
@@ -148,6 +149,19 @@ func (en *Engine) commit(transactionId txId) error {
 		}
 	}
 
+	// Relation checks see the transaction's final snapshots, before either the
+	// WAL or live memory is changed.
+	for _, e := range touchedResources {
+		runtime, ok := baseRegistry[e.dbName].(relationRuntime)
+		if !ok {
+			continue
+		}
+
+		if err := validateRelationUpdate(runtime.relationType(), e.id, reflect.ValueOf(e.work)); err != nil {
+			return err
+		}
+	}
+
 	// Log before mutating memory: a crash replays the whole tx or none of it.
 	// One fsync per type.
 	byDbName := map[string][]pendingWrite{}
@@ -169,6 +183,15 @@ func (en *Engine) commit(transactionId txId) error {
 
 	for _, e := range touchedResources {
 		committerFor(e.dbName).applyWrite(e.id, e.work)
+	}
+
+	if nodes, err := collectRelationNodes(false, nil); err == nil {
+		if model, modelErr := buildRelationModel(nodes); modelErr == nil {
+			reconcileRelations(model, nil)
+			for _, runtime := range relationRuntimes() {
+				runtime.relationRewire()
+			}
+		}
 	}
 
 	en.evict(transactionId)
