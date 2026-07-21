@@ -3,6 +3,7 @@ package nestory
 import (
 	"fmt"
 	"reflect"
+	"sync"
 )
 
 // isScalarKey reports whether a foreign-key column type is a string or any int.
@@ -19,9 +20,22 @@ func isScalarKey(k reflect.Kind) bool {
 // dbCreator is the untyped sibling of DB, used while loading before T is bound.
 type dbCreator struct{}
 
+type cachedSpecsByField struct {
+	specs map[string]relationSpec
+	err   error
+}
+
+var specsByFieldCache sync.Map
+
 func specsByField(t reflect.Type) (map[string]relationSpec, error) {
+	if cached, ok := specsByFieldCache.Load(t); ok {
+		result := cached.(cachedSpecsByField)
+		return result.specs, result.err
+	}
+
 	specs, err := relationSpecs(t)
 	if err != nil {
+		specsByFieldCache.Store(t, cachedSpecsByField{err: err})
 		return nil, err
 	}
 
@@ -30,6 +44,7 @@ func specsByField(t reflect.Type) (map[string]relationSpec, error) {
 		out[r.fieldName] = r
 	}
 
+	specsByFieldCache.Store(t, cachedSpecsByField{specs: out})
 	return out, nil
 }
 
