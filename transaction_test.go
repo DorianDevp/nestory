@@ -319,6 +319,64 @@ func TestShortCreateAndDeleteOwnCompleteTree(t *testing.T) {
 	})
 }
 
+func TestCreateUsesWALAndRehydratesScalarOwnership(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtChild](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[rtParent](); err != nil {
+			t.Fatal(err)
+		}
+
+		parentDB := Open[rtParent]()
+		Open[rtChild]()
+		child := &rtChild{}
+		parent := &rtParent{Children: []*rtChild{child}}
+		if err := parentDB.Create(parent); err != nil {
+			t.Fatal(err)
+		}
+
+		if child.ParentID != parent.Id {
+			t.Fatalf("child ParentID = %d, want %d", child.ParentID, parent.Id)
+		}
+
+		for _, typeName := range []string{"rtParent", "rtChild"} {
+			chunks, err := sortedChunkFiles(chunkDirFor(typeName))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(chunks) != 0 {
+				t.Fatalf("%s create wrote snapshot chunks: %v", typeName, chunks)
+			}
+		}
+
+		resetRegistries()
+		if err := Register[rtChild](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[rtParent](); err != nil {
+			t.Fatal(err)
+		}
+
+		Open[rtChild]()
+		reloadedParent, err := Open[rtParent]().Get(parent.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(reloadedParent.Children) != 1 || reloadedParent.Children[0].Id != child.Id {
+			t.Fatalf("reloaded children = %#v", reloadedParent.Children)
+		}
+
+		if reloadedParent.Children[0].ParentID != parent.Id {
+			t.Fatalf("reloaded child ParentID = %d, want %d", reloadedParent.Children[0].ParentID, parent.Id)
+		}
+	})
+}
+
 func TestJoinCombinesDifferentTypesInOneCommit(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)
