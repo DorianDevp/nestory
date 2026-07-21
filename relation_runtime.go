@@ -203,7 +203,8 @@ var committedOwnership = struct {
 	sync.RWMutex
 	ready    atomic.Bool
 	outgoing map[nodeKey][]nodeKey
-}{outgoing: make(map[nodeKey][]nodeKey)}
+	branches map[nodeKey][]nodeKey
+}{outgoing: make(map[nodeKey][]nodeKey), branches: make(map[nodeKey][]nodeKey)}
 
 // graphMu protects live relation pointers while a branch is copied or a commit
 // publishes and rewires a new graph. User callbacks run entirely outside it.
@@ -215,6 +216,7 @@ func resetCommittedOwnership() {
 
 	committedOwnership.ready.Store(false)
 	committedOwnership.outgoing = make(map[nodeKey][]nodeKey)
+	committedOwnership.branches = make(map[nodeKey][]nodeKey)
 }
 
 func ensureCommittedOwnership() error {
@@ -261,6 +263,7 @@ func storeCommittedOwnership(model *relationModel, deleted map[nodeKey]struct{})
 
 	committedOwnership.Lock()
 	committedOwnership.outgoing = outgoing
+	committedOwnership.branches = make(map[nodeKey][]nodeKey)
 	committedOwnership.Unlock()
 	committedOwnership.ready.Store(true)
 }
@@ -281,28 +284,35 @@ func committedOwnerHasChildren(owner nodeKey) bool {
 
 func committedOwnershipKeys(root nodeKey) []nodeKey {
 	committedOwnership.RLock()
-	defer committedOwnership.RUnlock()
-
-	if len(committedOwnership.outgoing[root]) == 0 {
-		return []nodeKey{root}
+	keys := committedOwnership.branches[root]
+	committedOwnership.RUnlock()
+	if keys != nil {
+		return keys
 	}
 
-	seen := map[nodeKey]struct{}{root: {}}
+	committedOwnership.Lock()
+	defer committedOwnership.Unlock()
+	if keys = committedOwnership.branches[root]; keys != nil {
+		return keys
+	}
+
 	out := []nodeKey{root}
-	queue := []nodeKey{root}
-	for len(queue) > 0 {
-		owner := queue[0]
-		queue = queue[1:]
-		for _, child := range committedOwnership.outgoing[owner] {
-			if _, duplicate := seen[child]; duplicate {
-				continue
+	for position := 0; position < len(out); position++ {
+		owner := out[position]
+		out = append(out, committedOwnership.outgoing[owner]...)
+	}
+
+	if len(out) > 1 {
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].typ.Name() != out[j].typ.Name() {
+				return out[i].typ.Name() < out[j].typ.Name()
 			}
 
-			seen[child] = struct{}{}
-			out = append(out, child)
-			queue = append(queue, child)
-		}
+			return out[i].id < out[j].id
+		})
 	}
+
+	committedOwnership.branches[root] = out
 
 	return out
 }
@@ -385,15 +395,6 @@ func cloneOwnershipAggregate(root nodeKey, record func(touchedResource)) (any, e
 	}
 
 	ordered := committedOwnershipKeys(root)
-	if len(ordered) > 1 {
-		sort.Slice(ordered, func(i, j int) bool {
-			if ordered[i].typ.Name() != ordered[j].typ.Name() {
-				return ordered[i].typ.Name() < ordered[j].typ.Name()
-			}
-
-			return ordered[i].id < ordered[j].id
-		})
-	}
 
 	for _, key := range ordered {
 		committerFor(key.typ.Name()).lockResource(key.id)

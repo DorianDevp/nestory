@@ -131,6 +131,28 @@ func BenchmarkRelationBranchLifecycle(b *testing.B) {
 	}
 }
 
+func BenchmarkRelationView(b *testing.B) {
+	for _, children := range relationBranchSizes {
+		b.Run(fmt.Sprintf("children=%d", children), func(b *testing.B) {
+			quiet(b)
+			ownerDB, _, id := newRelationBenchDB(b, children)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for range b.N {
+				if err := ownerDB.View(id, func(owner *relationBenchOwner) error {
+					if len(owner.Children) != children {
+						b.Fatal("wrong ownership branch")
+					}
+
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkRelationOneToOneLifecycle(b *testing.B) {
 	quiet(b)
 	ownerDB, id := newOneToOneBenchDB(b)

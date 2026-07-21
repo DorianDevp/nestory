@@ -47,6 +47,22 @@ u.Profile.Theme = "dark"
 err := users.Update(u)
 ```
 
+For a zero-copy read of the live ownership tree, `View` holds read locks for
+the callback and never marks chunks dirty:
+
+```go
+err := users.View(id, func(u *User) error {
+    render(u.Profile, u.Posts)
+    return nil
+})
+```
+
+The pointer is read-only by contract and must not be retained for synchronized
+use after the callback. Go cannot express a `const *T`, so mutating it is a
+caller error. `View` locks the `own` subtree; `borrow` and `option` targets
+outside that subtree remain navigation pointers without the same consistency
+window.
+
 For natural struct editing across several operations, `Transaction` detects
 changes automatically and commits the callback's final graph once:
 
