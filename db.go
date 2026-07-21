@@ -208,6 +208,18 @@ func (db *DB[T]) unlockResource(id int) {
 	}
 }
 
+func (db *DB[T]) readLockResource(id int) {
+	if resource, found := db.resource(id); found {
+		resource.mu.RLock()
+	}
+}
+
+func (db *DB[T]) readUnlockResource(id int) {
+	if resource, found := db.resource(id); found {
+		resource.mu.RUnlock()
+	}
+}
+
 func (db *DB[T]) resourceVersion(id int) (int, bool) {
 	if r, ok := db.resource(id); ok {
 		return r.version, true
