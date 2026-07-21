@@ -161,7 +161,8 @@ func decodeSlice(path string, sliceType reflect.Type) (reflect.Value, error) {
 	if err != nil {
 		return reflect.Value{}, fmt.Errorf("nestory: open %s: %w", path, err)
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -246,24 +247,24 @@ func (db *DB[T]) saveChunk(dir string, ci int, sliceType reflect.Type) error {
 	}
 
 	if err := gob.NewEncoder(file).Encode(contents); err != nil {
-		file.Close()
-		os.Remove(tmpPath)
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("nestory: encode %s: %w", tmpPath, err)
 	}
 
 	if err := file.Sync(); err != nil {
-		file.Close()
-		os.Remove(tmpPath)
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("nestory: fsync %s: %w", tmpPath, err)
 	}
 
 	if err := file.Close(); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("nestory: close %s: %w", tmpPath, err)
 	}
 
 	if err := os.Rename(tmpPath, finalPath); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("nestory: rename %s -> %s: %w", tmpPath, finalPath, err)
 	}
 
