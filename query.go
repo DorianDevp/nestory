@@ -119,8 +119,9 @@ func (db *DB[T]) FilterPtr(filterFn func(*T) bool) ([]*T, error) {
 // Get returns a detached snapshot of id and opens a contract around it. Mutate
 // the returned *T (it's a copy), then hand it to Update.
 //
-// The snapshot is a shallow value copy: relation pointer fields still alias the
-// live store, so mutate only scalar fields until the cascade layer lands.
+// The snapshot clones slice headers and backing arrays, but relation targets
+// still point at live entities. Reassign relation fields freely; do not mutate
+// a pointed-to entity through the snapshot.
 func (db *DB[T]) Get(id int) (*T, error) {
 	r, ok := db.resource(id)
 	if !ok {
@@ -149,6 +150,24 @@ func (db *DB[T]) Get(id int) (*T, error) {
 	engine.record(tx, touchedResource{dbName: db.name, id: id, ver: ver, work: work})
 
 	return work, nil
+}
+
+// UnsafeGet returns the live, stable store pointer for id and marks its chunk
+// dirty so a later Flush persists direct mutations. It performs no snapshot,
+// copy, transaction bookkeeping, row locking, or rollback.
+//
+// The caller must provide exclusive access until Flush completes. Mutations are
+// visible immediately, even when Flush later rejects the relation graph. After
+// such an error, repair the live value and call Flush again.
+func (db *DB[T]) UnsafeGet(id int) (*T, error) {
+	resource, ok := db.resource(id)
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	db.store.markDirty(resource.chunk)
+
+	return resource.item, nil
 }
 
 // Update commits the transaction that produced work. On conflict it returns
