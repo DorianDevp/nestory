@@ -165,3 +165,103 @@ func TestUpdateWithinRetriesNestedOwnershipConflict(t *testing.T) {
 		}
 	})
 }
+
+func TestTransactionCreatesAndDeletesOwnershipTreesOnce(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txChild](); err != nil {
+			t.Fatal(err)
+		}
+		if err := Register[txOwner](); err != nil {
+			t.Fatal(err)
+		}
+
+		ownerDB := Open[txOwner]()
+		childDB := Open[txChild]()
+		oldOwner := &txOwner{}
+		oldChild := &txChild{Owner: oldOwner}
+		oldOwner.Child = oldChild
+		ownerDB.AddToPersistQueue(oldOwner)
+		childDB.AddToPersistQueue(oldChild)
+		if err := ownerDB.Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		newOwner := &txOwner{}
+		newChild := &txChild{Owner: newOwner, N: 9}
+		newOwner.Child = newChild
+		err := ownerDB.Transaction(func(tx *Tx[txOwner]) error {
+			if err := tx.Create(newOwner); err != nil {
+				return err
+			}
+			created, err := tx.Get(newOwner.Id)
+			if err != nil {
+				return err
+			}
+			if created != newOwner {
+				t.Fatal("Get did not reuse the staged create pointer")
+			}
+			created.Child.N++
+
+			return tx.Delete(oldOwner.Id)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if ownerDB.Len() != 1 || childDB.Len() != 1 {
+			t.Fatalf("live counts = owners %d, children %d", ownerDB.Len(), childDB.Len())
+		}
+		storedOwner, err := ownerDB.FindOneBy("Id", newOwner.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		storedChild, err := childDB.FindOneBy("Id", newChild.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if storedChild.N != 10 || storedOwner.Child != storedChild || storedChild.Owner != storedOwner {
+			t.Fatal("transaction did not persist and canonicalize the new ownership tree")
+		}
+
+		resetRegistries()
+		if err := Register[txChild](); err != nil {
+			t.Fatal(err)
+		}
+		if err := Register[txOwner](); err != nil {
+			t.Fatal(err)
+		}
+		if Open[txOwner]().Len() != 1 || Open[txChild]().Len() != 1 {
+			t.Fatal("structural transaction did not survive reload")
+		}
+	})
+}
+
+func TestTransactionErrorDiscardsCreatedTree(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txChild](); err != nil {
+			t.Fatal(err)
+		}
+		if err := Register[txOwner](); err != nil {
+			t.Fatal(err)
+		}
+
+		ownerDB := Open[txOwner]()
+		Open[txChild]()
+		owner := &txOwner{}
+		child := &txChild{Owner: owner}
+		owner.Child = child
+		stop := errors.New("stop")
+		err := ownerDB.Transaction(func(tx *Tx[txOwner]) error {
+			if err := tx.Create(owner); err != nil {
+				return err
+			}
+			return stop
+		})
+		if !errors.Is(err, stop) {
+			t.Fatalf("error = %v, want %v", err, stop)
+		}
+		if ownerDB.Len() != 0 || Open[txChild]().Len() != 0 {
+			t.Fatal("rolled back create reached the live store")
+		}
+	})
+}

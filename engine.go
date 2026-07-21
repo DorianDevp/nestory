@@ -2,6 +2,7 @@ package nestory
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"sync"
@@ -47,6 +48,16 @@ type pendingWrite struct {
 	work any
 }
 
+type createdResource struct {
+	key  nodeKey
+	work reflect.Value // *struct
+}
+
+type stagedDelete struct {
+	key nodeKey
+	ver int
+}
+
 func committerFor(dbName string) committer {
 	return baseRegistry[dbName].(committer)
 }
@@ -54,16 +65,20 @@ func committerFor(dbName string) committer {
 // Engine sits above every DB, owns the live contracts and serialises commits.
 // It stays generic — reaches a type's resources only through baseRegistry.
 type Engine struct {
-	mu     sync.Mutex
-	nextTx txId
-	txs    map[txId][]touchedResource
-	bind   map[any]txId // snapshot *T → owning tx, for O(1) Get→Update
+	mu      sync.Mutex
+	nextTx  txId
+	txs     map[txId][]touchedResource
+	creates map[txId]map[nodeKey]createdResource
+	deletes map[txId]map[nodeKey]stagedDelete
+	bind    map[any]txId // snapshot *T → owning tx, for O(1) Get→Update
 }
 
 func newEngine() *Engine {
 	return &Engine{
-		txs:  make(map[txId][]touchedResource),
-		bind: make(map[any]txId),
+		txs:     make(map[txId][]touchedResource),
+		creates: make(map[txId]map[nodeKey]createdResource),
+		deletes: make(map[txId]map[nodeKey]stagedDelete),
+		bind:    make(map[any]txId),
 	}
 }
 
@@ -76,8 +91,45 @@ func (en *Engine) begin() txId {
 	en.nextTx++
 	id := en.nextTx
 	en.txs[id] = nil
+	en.creates[id] = make(map[nodeKey]createdResource)
+	en.deletes[id] = make(map[nodeKey]stagedDelete)
 
 	return id
+}
+
+func (en *Engine) created(tx txId, key nodeKey) (reflect.Value, bool) {
+	en.mu.Lock()
+	defer en.mu.Unlock()
+
+	created, ok := en.creates[tx][key]
+	return created.work, ok
+}
+
+func (en *Engine) stageCreate(tx txId, created createdResource) error {
+	en.mu.Lock()
+	defer en.mu.Unlock()
+
+	if _, active := en.txs[tx]; !active {
+		return ErrExpiredSnapshot
+	}
+	if _, duplicate := en.creates[tx][created.key]; duplicate {
+		return fmt.Errorf("%w: %s", ErrAlreadyExists, created.key)
+	}
+
+	en.creates[tx][created.key] = created
+	return nil
+}
+
+func (en *Engine) stageDelete(tx txId, deleted stagedDelete) error {
+	en.mu.Lock()
+	defer en.mu.Unlock()
+
+	if _, active := en.txs[tx]; !active {
+		return ErrExpiredSnapshot
+	}
+
+	en.deletes[tx][deleted.key] = deleted
+	return nil
 }
 
 func (en *Engine) record(tx txId, e touchedResource) {
@@ -131,10 +183,19 @@ func (en *Engine) discardByPtr(work any) {
 
 func (en *Engine) commit(transactionId txId) error {
 	en.mu.Lock()
-	touchedResources := append([]touchedResource(nil), en.txs[transactionId]...)
+	resources, active := en.txs[transactionId]
+	touchedResources := append([]touchedResource(nil), resources...)
+	createdResources := make(map[nodeKey]createdResource, len(en.creates[transactionId]))
+	for key, created := range en.creates[transactionId] {
+		createdResources[key] = created
+	}
+	stagedDeletes := make(map[nodeKey]stagedDelete, len(en.deletes[transactionId]))
+	for key, deleted := range en.deletes[transactionId] {
+		stagedDeletes[key] = deleted
+	}
 	en.mu.Unlock()
 
-	if touchedResources == nil {
+	if !active {
 		return ErrExpiredSnapshot
 	}
 
@@ -142,9 +203,19 @@ func (en *Engine) commit(transactionId txId) error {
 	defer graphMu.Unlock()
 
 	touchedResources = changedResources(touchedResources)
-	if len(touchedResources) == 0 {
+	if len(touchedResources) == 0 && len(createdResources) == 0 && len(stagedDeletes) == 0 {
 		en.evict(transactionId)
 		return nil
+	}
+
+	model, deleted, err := validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
+	if err != nil {
+		return err
+	}
+	for key := range createdResources {
+		if _, exists := committerFor(key.typ.Name()).resourceVersion(key.id); exists {
+			return fmt.Errorf("%w: %s", ErrAlreadyExists, key)
+		}
 	}
 
 	// Global (dbName,id) lock order: overlapping commits can't form a wait cycle.
@@ -177,28 +248,22 @@ func (en *Engine) commit(transactionId txId) error {
 			return ErrConflict
 		}
 	}
+	for key, deletedResource := range stagedDeletes {
+		if _, created := createdResources[key]; created {
+			continue
+		}
+
+		version, ok := committerFor(key.typ.Name()).resourceVersion(key.id)
+		if !ok || version != deletedResource.ver {
+			return ErrConflict
+		}
+	}
 
 	// Relation checks see every changed branch at once, before either the WAL
 	// or live memory is changed.
-	if err := validateRelationUpdates(touchedResources); err != nil {
-		return err
-	}
-
-	// Log before mutating memory: a crash replays the whole tx or none of it.
-	// One fsync per type.
-	byDbName := map[string][]pendingWrite{}
-	order := make([]string, 0)
-
-	for _, e := range touchedResources {
-		if _, seen := byDbName[e.dbName]; !seen {
-			order = append(order, e.dbName)
-		}
-
-		byDbName[e.dbName] = append(byDbName[e.dbName], pendingWrite{id: e.id, work: e.work})
-	}
-
-	for _, dbName := range order {
-		if err := committerFor(dbName).logWrites(byDbName[dbName]); err != nil {
+	structural := len(createdResources) > 0 || len(stagedDeletes) > 0
+	if !structural {
+		if err := logTransactionWrites(touchedResources); err != nil {
 			return err
 		}
 	}
@@ -206,19 +271,57 @@ func (en *Engine) commit(transactionId txId) error {
 	for _, e := range touchedResources {
 		committerFor(e.dbName).applyWrite(e.id, e.work)
 	}
+	for _, created := range createdResources {
+		runtime := baseRegistry[created.key.typ.Name()].(relationRuntime)
+		runtime.relationApplyCreate(created.work)
+	}
 
-	if nodes, err := collectRelationNodes(false, nil); err == nil {
-		if model, modelErr := buildRelationModel(nodes); modelErr == nil {
-			reconcileRelations(model, nil)
-			for _, runtime := range relationRuntimes() {
-				runtime.relationRewire()
+	nodes, err := collectRelationNodes(false, nil)
+	if err != nil {
+		return err
+	}
+	model, err = buildRelationModel(nodes)
+	if err != nil {
+		return err
+	}
+	reconcileRelations(model, deleted)
+	applyDeletedNodes(deleted)
+	for _, runtime := range relationRuntimes() {
+		runtime.relationRewire()
+	}
+
+	if structural {
+		for _, runtime := range relationRuntimes() {
+			if err := runtime.relationSave(); err != nil {
+				return err
 			}
-
-			storeCommittedOwnership(model)
 		}
 	}
 
+	if err := refreshCommittedOwnership(); err != nil {
+		return err
+	}
+
 	en.evict(transactionId)
+
+	return nil
+}
+
+func logTransactionWrites(resources []touchedResource) error {
+	byDBName := map[string][]pendingWrite{}
+	order := make([]string, 0)
+	for _, resource := range resources {
+		if _, seen := byDBName[resource.dbName]; !seen {
+			order = append(order, resource.dbName)
+		}
+		byDBName[resource.dbName] = append(byDBName[resource.dbName], pendingWrite{id: resource.id, work: resource.work})
+	}
+
+	for _, dbName := range order {
+		if err := committerFor(dbName).logWrites(byDBName[dbName]); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -283,8 +386,8 @@ func relationValueEqual(left, right reflect.Value, many bool) bool {
 	return true
 }
 
-func validateRelationUpdates(resources []touchedResource) error {
-	overrides := make(map[nodeKey]relationGraphNode, len(resources))
+func validateTransactionGraph(resources []touchedResource, creates map[nodeKey]createdResource, deletes map[nodeKey]stagedDelete) (*relationModel, map[nodeKey]struct{}, error) {
+	overrides := make(map[nodeKey]relationGraphNode, len(resources)+len(creates))
 	for _, resource := range resources {
 		runtime, ok := baseRegistry[resource.dbName].(relationRuntime)
 		if !ok {
@@ -294,18 +397,33 @@ func validateRelationUpdates(resources []touchedResource) error {
 		key := nodeKey{typ: runtime.relationType(), id: resource.id}
 		overrides[key] = relationGraphNode{key: key, value: reflect.ValueOf(resource.work)}
 	}
+	for key, created := range creates {
+		overrides[key] = relationGraphNode{key: key, value: created.work}
+	}
 
 	nodes, err := collectRelationNodesWithOverrides(false, overrides)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	model, err := buildRelationModel(nodes)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	return validateRequiredRelations(model, nil)
+	explicit := make(map[nodeKey]struct{}, len(deletes))
+	for key := range deletes {
+		explicit[key] = struct{}{}
+	}
+	deleted, err := deletionClosure(model, explicit)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateRequiredRelations(model, deleted); err != nil {
+		return nil, nil, err
+	}
+
+	return model, deleted, nil
 }
 
 // refresh pulls live state into every snapshot and re-stamps versions so the
@@ -341,4 +459,6 @@ func (en *Engine) evict(tx txId) {
 	}
 
 	delete(en.txs, tx)
+	delete(en.creates, tx)
+	delete(en.deletes, tx)
 }

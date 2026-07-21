@@ -1,9 +1,12 @@
 package nestory
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 )
+
+var ErrAlreadyExists = errors.New("nestory: entity already exists")
 
 // Add appends entity and points the Id index at the store's stable slot, not
 // the caller's pointer. Used by Flush; prefer AddToPersistQueue + Flush.
