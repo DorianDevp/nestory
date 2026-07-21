@@ -1196,6 +1196,26 @@ func registeredRelations(runtimes []relationRuntime) (bool, error) {
 	return false, nil
 }
 
+func registryHasRelations() (bool, error) {
+	for _, registered := range baseRegistry {
+		runtime, ok := registered.(relationRuntime)
+		if !ok {
+			continue
+		}
+
+		specs, err := relationSpecs(runtime.relationType())
+		if err != nil {
+			return false, err
+		}
+
+		if len(specs) > 0 {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func flushWithoutRelations(runtimes []relationRuntime) error {
 	for _, runtime := range runtimes {
 		if err := runtime.relationApplyPending(); err != nil {
