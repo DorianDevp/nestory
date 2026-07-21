@@ -240,21 +240,34 @@ func committedChildren(owner nodeKey) []nodeKey {
 	return append([]nodeKey(nil), committedOwnership.outgoing[owner]...)
 }
 
-func committedOwnershipClosure(root nodeKey) map[nodeKey]struct{} {
+func committedOwnerHasChildren(owner nodeKey) bool {
 	committedOwnership.RLock()
 	defer committedOwnership.RUnlock()
 
-	out := map[nodeKey]struct{}{root: {}}
+	return len(committedOwnership.outgoing[owner]) > 0
+}
+
+func committedOwnershipKeys(root nodeKey) []nodeKey {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	if len(committedOwnership.outgoing[root]) == 0 {
+		return []nodeKey{root}
+	}
+
+	seen := map[nodeKey]struct{}{root: {}}
+	out := []nodeKey{root}
 	queue := []nodeKey{root}
 	for len(queue) > 0 {
 		owner := queue[0]
 		queue = queue[1:]
 		for _, child := range committedOwnership.outgoing[owner] {
-			if _, seen := out[child]; seen {
+			if _, duplicate := seen[child]; duplicate {
 				continue
 			}
 
-			out[child] = struct{}{}
+			seen[child] = struct{}{}
+			out = append(out, child)
 			queue = append(queue, child)
 		}
 	}
@@ -327,27 +340,27 @@ func collectRelationNodesWithOverrides(includePending bool, overrides map[nodeKe
 // node it transitively owns. Relation pointers inside that aggregate are
 // rewired to the copies, preserving pointer identity without touching live
 // store objects.
-func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeKey]reflect.Value, map[nodeKey]int, error) {
+func cloneOwnershipAggregate(root nodeKey, record func(touchedResource)) (any, error) {
 	graphMu.RLock()
 	defer graphMu.RUnlock()
 
 	if err := ensureCommittedOwnership(); err != nil {
-		return nil, nil, nil, err
+		return nil, err
+	}
+	if !committedOwnerHasChildren(root) {
+		return cloneSingleOwnershipResource(root, record)
 	}
 
-	keys := committedOwnershipClosure(root)
-	ordered := make([]nodeKey, 0, len(keys))
-	for key := range keys {
-		ordered = append(ordered, key)
+	ordered := committedOwnershipKeys(root)
+	if len(ordered) > 1 {
+		sort.Slice(ordered, func(i, j int) bool {
+			if ordered[i].typ.Name() != ordered[j].typ.Name() {
+				return ordered[i].typ.Name() < ordered[j].typ.Name()
+			}
+
+			return ordered[i].id < ordered[j].id
+		})
 	}
-
-	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i].typ.Name() != ordered[j].typ.Name() {
-			return ordered[i].typ.Name() < ordered[j].typ.Name()
-		}
-
-		return ordered[i].id < ordered[j].id
-	})
 
 	for _, key := range ordered {
 		committerFor(key.typ.Name()).lockResource(key.id)
@@ -359,63 +372,148 @@ func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeK
 		}
 	}()
 
-	work := make(map[nodeKey]reflect.Value, len(keys))
-	original := make(map[nodeKey]reflect.Value, len(keys))
-	versions := make(map[nodeKey]int, len(keys))
+	resources := make([]touchedResource, 0, len(ordered))
+	var rootWork any
 	for _, key := range ordered {
 		workCopy, originalCopy, version, found := committerFor(key.typ.Name()).snapshotResource(key.id)
 		if !found {
-			return nil, nil, nil, ErrNotFound
+			return nil, ErrNotFound
 		}
 
-		work[key] = workCopy
-		original[key] = originalCopy
-		versions[key] = version
+		resource := touchedResource{
+			dbName: key.typ.Name(), id: key.id, ver: version,
+			work: workCopy.Interface(), original: originalCopy.Interface(),
+		}
+		resources = append(resources, resource)
+		if key == root {
+			rootWork = resource.work
+		}
 	}
 
-	if err := rewireOwnershipCopies(work); err != nil {
-		return nil, nil, nil, err
+	if err := rewireOwnershipResources(resources); err != nil {
+		return nil, err
 	}
 
-	if err := rewireOwnershipCopies(original); err != nil {
-		return nil, nil, nil, err
+	for _, resource := range resources {
+		record(resource)
 	}
 
-	return work, original, versions, nil
+	return rootWork, nil
 }
 
-func rewireOwnershipCopies(copies map[nodeKey]reflect.Value) error {
-	for key, holder := range copies {
-		specs, err := relationSpecs(key.typ)
+func cloneSingleOwnershipResource(root nodeKey, record func(touchedResource)) (any, error) {
+	committer := committerFor(root.typ.Name())
+	committer.lockResource(root.id)
+	defer committer.unlockResource(root.id)
+
+	work, original, version, found := committer.snapshotResource(root.id)
+	if !found {
+		return nil, ErrNotFound
+	}
+
+	resource := touchedResource{
+		dbName: root.typ.Name(), id: root.id, ver: version,
+		work: work.Interface(), original: original.Interface(),
+	}
+	if err := rewireSingleOwnershipResource(root, &resource); err != nil {
+		return nil, err
+	}
+
+	record(resource)
+
+	return resource.work, nil
+}
+
+func rewireSingleOwnershipResource(key nodeKey, resource *touchedResource) error {
+	specs, err := relationSpecs(key.typ)
+	if err != nil {
+		return err
+	}
+
+	for _, spec := range specs {
+		rewireSelfRelationField(reflect.ValueOf(resource.work).Elem().Field(spec.fieldIndex), spec, key, resource.work)
+		rewireSelfRelationField(reflect.ValueOf(resource.original).Elem().Field(spec.fieldIndex), spec, key, resource.original)
+	}
+
+	return nil
+}
+
+func rewireSelfRelationField(field reflect.Value, spec relationSpec, key nodeKey, target any) {
+	if !spec.many {
+		rewireSelfRelationPointer(field, spec.target, key, target)
+		return
+	}
+
+	for i := range field.Len() {
+		rewireSelfRelationPointer(field.Index(i), spec.target, key, target)
+	}
+}
+
+func rewireSelfRelationPointer(pointer reflect.Value, targetType reflect.Type, key nodeKey, target any) {
+	id, ok := valueID(pointer)
+	if ok && targetType == key.typ && id == key.id {
+		pointer.Set(reflect.ValueOf(target))
+	}
+}
+
+func rewireOwnershipResources(resources []touchedResource) error {
+	var positions map[nodeKey]int
+	if len(resources) > 1 {
+		positions = make(map[nodeKey]int, len(resources))
+		for i, resource := range resources {
+			typ := baseRegistry[resource.dbName].(relationRuntime).relationType()
+			positions[nodeKey{typ: typ, id: resource.id}] = i
+		}
+	}
+
+	for i := range resources {
+		resource := &resources[i]
+		typ := baseRegistry[resource.dbName].(relationRuntime).relationType()
+		specs, err := relationSpecs(typ)
 		if err != nil {
 			return err
 		}
 
 		for _, spec := range specs {
-			field := holder.Elem().Field(spec.fieldIndex)
-			if !spec.many {
-				rewireAggregatePointer(field, spec.target, copies)
-				continue
-			}
-
-			for i := range field.Len() {
-				rewireAggregatePointer(field.Index(i), spec.target, copies)
-			}
+			rewireResourceField(reflect.ValueOf(resource.work).Elem().Field(spec.fieldIndex), spec, resources, positions, false)
+			rewireResourceField(reflect.ValueOf(resource.original).Elem().Field(spec.fieldIndex), spec, resources, positions, true)
 		}
 	}
 
 	return nil
 }
 
-func rewireAggregatePointer(pointer reflect.Value, targetType reflect.Type, copies map[nodeKey]reflect.Value) {
+func rewireResourceField(field reflect.Value, spec relationSpec, resources []touchedResource, positions map[nodeKey]int, original bool) {
+	if !spec.many {
+		rewireResourcePointer(field, spec.target, resources, positions, original)
+		return
+	}
+
+	for i := range field.Len() {
+		rewireResourcePointer(field.Index(i), spec.target, resources, positions, original)
+	}
+}
+
+func rewireResourcePointer(pointer reflect.Value, targetType reflect.Type, resources []touchedResource, positions map[nodeKey]int, original bool) {
 	id, ok := valueID(pointer)
 	if !ok {
 		return
 	}
 
-	if target, copied := copies[nodeKey{typ: targetType, id: id}]; copied {
-		pointer.Set(target)
+	position, copied := positions[nodeKey{typ: targetType, id: id}]
+	if positions == nil {
+		copied = len(resources) == 1 && resources[0].dbName == targetType.Name() && resources[0].id == id
 	}
+
+	if !copied {
+		return
+	}
+
+	target := resources[position].work
+	if original {
+		target = resources[position].original
+	}
+	pointer.Set(reflect.ValueOf(target))
 }
 
 func ownershipClosure(model *relationModel, root nodeKey) map[nodeKey]struct{} {

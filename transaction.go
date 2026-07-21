@@ -9,35 +9,35 @@ import (
 // Get are detached branches; all mutations are detected and committed when the
 // Transaction callback returns nil.
 type Tx[T Entity] struct {
-	db *DB[T]
-	id txId
+	db    *DB[T]
+	state *transactionState
 }
 
 // TransactionContext is implemented by a live Tx. Join uses it to expose a
 // differently typed DB inside the same commit context.
 type TransactionContext interface {
-	transactionID() txId
+	transactionContext() *transactionState
 }
 
-func (tx *Tx[T]) transactionID() txId { return tx.id }
+func (tx *Tx[T]) transactionContext() *transactionState { return tx.state }
 
 // Join binds db to an existing transaction without opening a nested commit.
 func (db *DB[T]) Join(context TransactionContext) *Tx[T] {
-	return &Tx[T]{db: db, id: context.transactionID()}
+	return &Tx[T]{db: db, state: context.transactionContext()}
 }
 
 // Transaction runs fn against one shared transaction context and commits every
 // changed branch once. Returning an error discards the complete working set.
 func (db *DB[T]) Transaction(fn func(*Tx[T]) error) error {
-	id := engine.begin()
-	tx := &Tx[T]{db: db, id: id}
+	state := engine.begin()
+	tx := &Tx[T]{db: db, state: state}
 	if err := fn(tx); err != nil {
-		engine.evict(id)
+		engine.evict(state)
 		return err
 	}
 
-	if err := engine.commit(id); err != nil {
-		engine.evict(id)
+	if err := engine.commit(state); err != nil {
+		engine.evict(state)
 		return err
 	}
 
@@ -48,11 +48,11 @@ func (db *DB[T]) Transaction(fn func(*Tx[T]) error) error {
 // of the same node return the same transaction-local pointer.
 func (tx *Tx[T]) Get(id int) (*T, error) {
 	key := nodeKey{typ: reflect.TypeFor[T](), id: id}
-	if created, ok := engine.created(tx.id, key); ok {
+	if created, ok := engine.created(tx.state, key); ok {
 		return created.Interface().(*T), nil
 	}
 
-	return tx.db.getInTransaction(tx.id, id)
+	return tx.db.getInTransaction(tx.state, id)
 }
 
 // Create stages entity and its new ownership subtree in this transaction.
@@ -61,14 +61,14 @@ func (tx *Tx[T]) Create(entity *T) error {
 		return fmt.Errorf("nestory: create: nil entity")
 	}
 
-	return stageCreatedOwnershipTree(tx.id, reflect.ValueOf(entity))
+	return stageCreatedOwnershipTree(tx.state, reflect.ValueOf(entity))
 }
 
 // Delete stages id and its committed ownership subtree for deletion.
 func (tx *Tx[T]) Delete(id int) error {
 	key := nodeKey{typ: reflect.TypeFor[T](), id: id}
-	if _, created := engine.created(tx.id, key); created {
-		return engine.stageDelete(tx.id, stagedDelete{key: key})
+	if _, created := engine.created(tx.state, key); created {
+		return engine.stageDelete(tx.state, stagedDelete{key: key})
 	}
 
 	resource, found := tx.db.resource(id)
@@ -80,7 +80,7 @@ func (tx *Tx[T]) Delete(id int) error {
 	version := resource.version
 	resource.mu.RUnlock()
 
-	return engine.stageDelete(tx.id, stagedDelete{key: key, ver: version})
+	return engine.stageDelete(tx.state, stagedDelete{key: key, ver: version})
 }
 
 // UpdateWithin mutates id inside this transaction. It joins the current context
@@ -94,7 +94,7 @@ func (tx *Tx[T]) UpdateWithin(id int, fn func(*T) error) error {
 	return fn(entity)
 }
 
-func stageCreatedOwnershipTree(tx txId, root reflect.Value) error {
+func stageCreatedOwnershipTree(tx *transactionState, root reflect.Value) error {
 	seen := make(map[uintptr]struct{})
 	var stage func(reflect.Value) error
 	stage = func(value reflect.Value) error {

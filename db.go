@@ -16,6 +16,12 @@ type Entity interface {
 
 type indexMap[T any] map[string]map[any]T
 
+type detachedRoot[T Entity] struct {
+	id       int
+	version  int
+	original T
+}
+
 // DB is the in-memory state for one entity type. Construct via [Open].
 type DB[T Entity] struct {
 	name         string
@@ -30,6 +36,8 @@ type DB[T Entity] struct {
 	mu           sync.RWMutex
 	resById      map[int]*resourceSlot[T] // id → stable resourceSlot slot
 	wal          *wal                     // durability log for commits
+	snapshotMu   sync.Mutex
+	snapshots    map[*T]detachedRoot[T]
 }
 
 var _ committer = (*DB[Entity])(nil)
@@ -92,6 +100,7 @@ func Open[T Entity]() *DB[T] {
 	initBase.indices = make(indexMap[[]*T])
 	initBase.index = make(indexMap[*T])
 	initBase.resById = make(map[int]*resourceSlot[T])
+	initBase.snapshots = make(map[*T]detachedRoot[T])
 	initBase.schemaFields = initBase.createSchemaFields()
 
 	if entity, ok := storeRegistry[name]; ok {

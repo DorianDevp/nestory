@@ -18,8 +18,6 @@ var ErrExpiredSnapshot = errors.New("nestory: expired snapshot")
 
 var ErrNotFound = errors.New("nestory: entity not found")
 
-type txId uint64
-
 // touchedResource is one resource a transaction touched — pure, type-erased
 // data. The live resourceSlot and the typed write-back resolve at commit via
 // baseRegistry[typ].
@@ -59,6 +57,27 @@ type stagedDelete struct {
 	ver int
 }
 
+type transactionState struct {
+	active      bool
+	hasResource bool
+	resource    touchedResource
+	resources   []touchedResource
+	creates     map[nodeKey]createdResource
+	deletes     map[nodeKey]stagedDelete
+}
+
+func (tx *transactionState) copyResources() []touchedResource {
+	if !tx.hasResource {
+		return nil
+	}
+
+	resources := make([]touchedResource, 1+len(tx.resources))
+	resources[0] = tx.resource
+	copy(resources[1:], tx.resources)
+
+	return resources
+}
+
 func committerFor(dbName string) committer {
 	return baseRegistry[dbName].(committer)
 }
@@ -66,93 +85,100 @@ func committerFor(dbName string) committer {
 // transactionEngine sits above every DB, owns the live contracts and serialises commits.
 // It stays generic — reaches a type's resources only through baseRegistry.
 type transactionEngine struct {
-	mu      sync.Mutex
-	nextTx  txId
-	txs     map[txId][]touchedResource
-	creates map[txId]map[nodeKey]createdResource
-	deletes map[txId]map[nodeKey]stagedDelete
-	bind    map[any]txId // snapshot *T → owning tx, for O(1) Get→Update
+	mu   sync.Mutex
+	bind map[any]*transactionState // snapshot *T → owning transaction
 }
 
 func newEngine() *transactionEngine {
 	return &transactionEngine{
-		txs:     make(map[txId][]touchedResource),
-		creates: make(map[txId]map[nodeKey]createdResource),
-		deletes: make(map[txId]map[nodeKey]stagedDelete),
-		bind:    make(map[any]txId),
+		bind: make(map[any]*transactionState),
 	}
 }
 
 var engine = newEngine()
 
-func (en *transactionEngine) begin() txId {
-	en.mu.Lock()
-	defer en.mu.Unlock()
-
-	en.nextTx++
-	id := en.nextTx
-	en.txs[id] = nil
-	en.creates[id] = make(map[nodeKey]createdResource)
-	en.deletes[id] = make(map[nodeKey]stagedDelete)
-
-	return id
+func (en *transactionEngine) begin() *transactionState {
+	return &transactionState{active: true}
 }
 
-func (en *transactionEngine) created(tx txId, key nodeKey) (reflect.Value, bool) {
+func (en *transactionEngine) created(tx *transactionState, key nodeKey) (reflect.Value, bool) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	created, ok := en.creates[tx][key]
+	created, ok := tx.creates[key]
 	return created.work, ok
 }
 
-func (en *transactionEngine) stageCreate(tx txId, created createdResource) error {
+func (en *transactionEngine) stageCreate(tx *transactionState, created createdResource) error {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	if _, active := en.txs[tx]; !active {
+	if !tx.active {
 		return ErrExpiredSnapshot
 	}
 
-	if _, duplicate := en.creates[tx][created.key]; duplicate {
+	if _, duplicate := tx.creates[created.key]; duplicate {
 		return fmt.Errorf("%w: %s", ErrAlreadyExists, created.key)
 	}
 
-	en.creates[tx][created.key] = created
+	if tx.creates == nil {
+		tx.creates = make(map[nodeKey]createdResource)
+	}
+
+	tx.creates[created.key] = created
 	return nil
 }
 
-func (en *transactionEngine) stageDelete(tx txId, deleted stagedDelete) error {
+func (en *transactionEngine) stageDelete(tx *transactionState, deleted stagedDelete) error {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	if _, active := en.txs[tx]; !active {
+	if !tx.active {
 		return ErrExpiredSnapshot
 	}
 
-	en.deletes[tx][deleted.key] = deleted
+	if tx.deletes == nil {
+		tx.deletes = make(map[nodeKey]stagedDelete)
+	}
+
+	tx.deletes[deleted.key] = deleted
 	return nil
 }
 
-func (en *transactionEngine) record(tx txId, e touchedResource) {
+func (en *transactionEngine) record(tx *transactionState, e touchedResource) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	for _, existing := range en.txs[tx] {
+	if tx.hasResource && tx.resource.dbName == e.dbName && tx.resource.id == e.id {
+		return
+	}
+
+	for _, existing := range tx.resources {
 		if existing.dbName == e.dbName && existing.id == e.id {
 			return
 		}
 	}
 
-	en.txs[tx] = append(en.txs[tx], e)
+	if !tx.hasResource {
+		tx.hasResource = true
+		tx.resource = e
+		en.bind[e.work] = tx
+		return
+	}
+
+	tx.resources = append(tx.resources, e)
 	en.bind[e.work] = tx
 }
 
-func (en *transactionEngine) work(tx txId, dbName string, id int) (any, bool) {
+func (en *transactionEngine) work(tx *transactionState, dbName string, id int) (any, bool) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	for _, resource := range en.txs[tx] {
+	if tx.hasResource && tx.resource.dbName == dbName && tx.resource.id == id {
+		return tx.resource.work, true
+	}
+
+	for _, resource := range tx.resources {
 		if resource.dbName == dbName && resource.id == id {
 			return resource.work, true
 		}
@@ -173,18 +199,24 @@ func (en *transactionEngine) commitByPtr(work any) error {
 	return en.commit(tx)
 }
 
-func (en *transactionEngine) commit(transactionId txId) error {
+func (en *transactionEngine) commit(tx *transactionState) error {
 	en.mu.Lock()
-	resources, active := en.txs[transactionId]
-	touchedResources := append([]touchedResource(nil), resources...)
-	createdResources := make(map[nodeKey]createdResource, len(en.creates[transactionId]))
-	for key, created := range en.creates[transactionId] {
-		createdResources[key] = created
+	active := tx.active
+	touchedResources := tx.copyResources()
+	var createdResources map[nodeKey]createdResource
+	if len(tx.creates) > 0 {
+		createdResources = make(map[nodeKey]createdResource, len(tx.creates))
+		for key, created := range tx.creates {
+			createdResources[key] = created
+		}
 	}
 
-	stagedDeletes := make(map[nodeKey]stagedDelete, len(en.deletes[transactionId]))
-	for key, deleted := range en.deletes[transactionId] {
-		stagedDeletes[key] = deleted
+	var stagedDeletes map[nodeKey]stagedDelete
+	if len(tx.deletes) > 0 {
+		stagedDeletes = make(map[nodeKey]stagedDelete, len(tx.deletes))
+		for key, deleted := range tx.deletes {
+			stagedDeletes[key] = deleted
+		}
 	}
 
 	en.mu.Unlock()
@@ -195,7 +227,7 @@ func (en *transactionEngine) commit(transactionId txId) error {
 
 	touchedResources = changedResources(touchedResources)
 	if len(touchedResources) == 0 && len(createdResources) == 0 && len(stagedDeletes) == 0 {
-		en.evict(transactionId)
+		en.evict(tx)
 		return nil
 	}
 
@@ -252,7 +284,7 @@ func (en *transactionEngine) commit(transactionId txId) error {
 	for _, e := range touchedResources {
 		v, ok := committerFor(e.dbName).resourceVersion(e.id)
 		if !ok || v != e.ver {
-			en.refresh(transactionId)
+			en.refresh(tx)
 
 			return ErrConflict
 		}
@@ -285,7 +317,7 @@ func (en *transactionEngine) commit(transactionId txId) error {
 		runtime.relationApplyCreate(created.work)
 	}
 	if !graphChanged {
-		en.evict(transactionId)
+		en.evict(tx)
 		return nil
 	}
 
@@ -317,7 +349,7 @@ func (en *transactionEngine) commit(transactionId txId) error {
 		return err
 	}
 
-	en.evict(transactionId)
+	en.evict(tx)
 
 	return nil
 }
@@ -410,7 +442,7 @@ func logTransactionWrites(resources []touchedResource) error {
 }
 
 func changedResources(resources []touchedResource) []touchedResource {
-	changed := make([]touchedResource, 0, len(resources))
+	var changed []touchedResource
 	for _, resource := range resources {
 		if !entityStateEqual(resource.original, resource.work) {
 			changed = append(changed, resource)
@@ -515,12 +547,13 @@ func validateTransactionGraph(resources []touchedResource, creates map[nodeKey]c
 // refresh pulls live state into every snapshot and re-stamps versions so the
 // caller can retry. Caller holds every touched lock (commit does); en.mu is
 // only ever taken after resource locks, never the reverse, so no deadlock.
-func (en *transactionEngine) refresh(tx txId) {
+func (en *transactionEngine) refresh(tx *transactionState) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	for i := range en.txs[tx] {
-		e := &en.txs[tx][i]
+	resources := tx.copyResources()
+	for i := range resources {
+		e := &resources[i]
 		c := committerFor(e.dbName)
 
 		v, ok := c.resourceVersion(e.id)
@@ -533,18 +566,30 @@ func (en *transactionEngine) refresh(tx txId) {
 		e.ver = v
 	}
 
-	rewireTouchedCopies(en.txs[tx])
+	if len(resources) > 0 {
+		tx.resource = resources[0]
+		copy(tx.resources, resources[1:])
+	}
+
+	rewireTouchedCopies(resources)
 }
 
-func (en *transactionEngine) evict(tx txId) {
+func (en *transactionEngine) evict(tx *transactionState) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	for _, e := range en.txs[tx] {
+	if tx.hasResource {
+		delete(en.bind, tx.resource.work)
+	}
+
+	for _, e := range tx.resources {
 		delete(en.bind, e.work)
 	}
 
-	delete(en.txs, tx)
-	delete(en.creates, tx)
-	delete(en.deletes, tx)
+	tx.active = false
+	tx.hasResource = false
+	tx.resource = touchedResource{}
+	tx.resources = nil
+	tx.creates = nil
+	tx.deletes = nil
 }
