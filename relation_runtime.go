@@ -896,30 +896,40 @@ func validateRequiredRelations(model *relationModel, deleted map[nodeKey]struct{
 }
 
 func validateOwnershipCycles(model *relationModel) error {
+	state := make(map[nodeKey]uint8, len(model.nodes))
+	path := make([]nodeKey, 0)
 	for start := range model.nodes {
-		if ownershipChainCycles(model.owners, start) {
-			return fmt.Errorf("%w: ownership cycle involving %s", ErrRelationInvariant, start)
+		if state[start] != 0 {
+			continue
+		}
+
+		path = path[:0]
+	walk:
+		for at := start; ; {
+			switch state[at] {
+			case 1:
+				return fmt.Errorf("%w: ownership cycle involving %s", ErrRelationInvariant, at)
+			case 2:
+				break walk
+			}
+
+			state[at] = 1
+			path = append(path, at)
+			owner, found := model.owners[at]
+			if found {
+				at = owner
+				continue
+			}
+
+			break walk
+		}
+
+		for _, key := range path {
+			state[key] = 2
 		}
 	}
 
 	return nil
-}
-
-func ownershipChainCycles(owners map[nodeKey]nodeKey, start nodeKey) bool {
-	seen := make(map[nodeKey]struct{})
-	for at := start; ; {
-		owner, found := owners[at]
-		if !found {
-			return false
-		}
-
-		if _, duplicate := seen[owner]; duplicate || owner == start {
-			return true
-		}
-
-		seen[owner] = struct{}{}
-		at = owner
-	}
 }
 
 func explicitDeletes() map[nodeKey]struct{} {
