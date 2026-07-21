@@ -4,6 +4,14 @@ Persistent in-memory object graph for Go. The whole dataset lives in RAM as
 real structs; relations are real `*T` pointers, rewired from disk on `Open`.
 No queries, no joins — you walk the graph.
 
+I built this to make backend setup faster and painless.
+
+Instead of creating a database, configuring an ORM, and wiring everything together, 
+you can simply define your structs, describe their relationships, register them, 
+and start coding.
+
+
+
 ```go
 type User struct {
     Id      int      `key:"primary"`
