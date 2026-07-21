@@ -56,10 +56,15 @@ var (
 // type, before any [Open] — fillRelation needs every type registered to wire
 // pointers.
 func Register[T Entity]() error {
-	name := reflect.TypeFor[T]().Name()
+	t := reflect.TypeFor[T]()
+	name := t.Name()
 
 	if _, ok := storeRegistry[name]; ok {
-		return fmt.Errorf("Base for that type already exist")
+		return fmt.Errorf("nestory: base for %s is already registered", t)
+	}
+
+	if _, err := buildRelationSchema(t); err != nil {
+		return err
 	}
 
 	store, err := loadStore[T]()
@@ -73,7 +78,7 @@ func Register[T Entity]() error {
 }
 
 // Open returns a typed [DB] over the entities loaded by [Register]. Call after
-// every type used by relto / mapby has been registered.
+// every type used by rel has been registered.
 func Open[T Entity]() *DB[T] {
 	name := reflect.TypeFor[T]().Name()
 
@@ -201,7 +206,7 @@ func (db *DB[T]) resourceVersion(id int) (int, bool) {
 
 func (db *DB[T]) applyWrite(id int, work any) {
 	if r, ok := db.resource(id); ok {
-		*r.item = *(work.(*T)) // write through the stable pointer — never moves
+		*r.item = *work.(*T) // write through the stable pointer — never moves
 		r.version++
 		db.store.markDirty(r.chunk)
 	}
@@ -209,7 +214,7 @@ func (db *DB[T]) applyWrite(id int, work any) {
 
 func (db *DB[T]) refreshSnapshot(id int, work any) {
 	if r, ok := db.resource(id); ok {
-		*(work.(*T)) = *r.item
+		*work.(*T) = *r.item
 	}
 }
 
@@ -217,7 +222,7 @@ func (db *DB[T]) logWrites(items []pendingWrite) error {
 	rec := walFrame{Rows: make([]walRow, 0, len(items))}
 
 	for _, it := range items {
-		rowBytes, err := encodeRow(db.NormalizeToSchema(*(it.work.(*T))))
+		rowBytes, err := encodeRow(db.NormalizeToSchema(*it.work.(*T)))
 		if err != nil {
 			return err
 		}

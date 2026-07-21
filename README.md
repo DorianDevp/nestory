@@ -8,8 +8,8 @@ No queries, no joins — you walk the graph.
 type User struct {
     Id      int      `key:"primary"`
     Name    string
-    Profile *Profile `own:"Id"`     // o2o / m2o
-    Posts   []*Post  `mapby:"UserId"` // o2m
+    Profile *Profile `rel:"own,Id"`
+    Posts   []*Post  `rel:"own,User"`
 }
 
 // register every type in the graph before Open
@@ -89,7 +89,7 @@ complement (`borrow`, `option`); it is never stored and never authoritative.
 A `*T` field always declares its own bond — there is no neutral pointer, because
 a pointer must say what happens when its target dies. A `[]*T` is either an
 authoritative `own` (I own this list) or a computed `inverse` (filled from the
-holders' FKs on load, exactly like `mapby` today).
+holders' FKs on load).
 
 ### The own ↔ ownedby symbiosis
 
@@ -98,7 +98,7 @@ tag is required on one side; the complement appears only when the other side
 needs a field of its own. Every edge shape has exactly one spelling:
 
 ```go
-// to-one, one-sided — the owner holds the only field (today's relto shape):
+// to-one, one-sided — the owner holds the only field:
 type User struct {
     Id      int      `key:"primary"`
     Profile *Profile `rel:"own,Id"`
@@ -446,8 +446,9 @@ SQL's double-CASCADE — the link auto-dying with *either* side — is deliberat
 unspellable: it would need two owners, and I4 forbids that. The cost is deleting
 links explicitly; the payoff is a forest that never has shared subtrees.
 
-Status: not wired yet. Today relations are spelled `relto`/`mapby`, and deleting
-a referenced parent panics on the next `Open`.
+The relation grammar is enforced at `Register`, persisted as foreign keys and
+rehydrated into stable pointers on `Open`. Lifecycle invariants are checked at
+commit, including cascades, borrow vetoes and option set-null.
 
 ## Embed or relate?
 
@@ -463,14 +464,14 @@ own `Id`). When it has no identity of its own, **embed it by value**:
 ```go
 type User struct {
     Id      int     `key:"primary"`
-    Account Account            // not *Account, no relto
+    Account Account            // a value, not a relation
 }
 
 u.Account.Balance // plain field access — nothing to wire, nothing to look up
 ```
 
 For something the User exclusively owns, the embedded form is strictly better
-than `Account *Account` + `relto`:
+than `Account *Account` + a relation:
 
 - **Lifecycle is free.** The Account lives inside the User's row, so it's created,
   copied, persisted and deleted with its owner — no dangling FK, no cascade rule.
@@ -481,8 +482,8 @@ than `Account *Account` + `relto`:
 
 The deciding question is identity, not how you read the data. Wanting to scan
 every account and compare two of its fields is *not* a reason to relate — you
-just iterate the users and read `u.Account`. Reach for `relto`/`mapby` only when
-the inner type must be addressed or referenced on its own.
+just iterate the users and read `u.Account`. Reach for `rel` only when the inner
+type must be addressed or referenced on its own.
 
 (A relation *inside* an embedded value isn't wired on load yet — see TODO — so
 for now embed only leaf data.)
@@ -507,5 +508,4 @@ your weekend project
   single goroutine.
 - Dataset must fit in RAM (target < 100 MB).
 - Non-`Id` queries are full scans.
-- Deleting a referenced parent panics on the next `Open` (no cascade / null-FK).
 - Field rename breaks the gob files until schema migration lands.
