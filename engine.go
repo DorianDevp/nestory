@@ -374,16 +374,20 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 }
 
 func resourcesChangeRelationGraph(resources []touchedResource) (bool, error) {
-	matchFields, err := registeredRelationMatchFields()
+	hasRelations, err := registryHasRelations()
 	if err != nil {
 		return false, err
 	}
 
+	var matchFields map[reflect.Type]map[int]struct{}
 	for _, resource := range resources {
 		before := reflect.ValueOf(resource.original).Elem()
 		after := reflect.ValueOf(resource.work).Elem()
 		if resource.original.(Entity).GetId() != resource.work.(Entity).GetId() {
 			return false, fmt.Errorf("%w: primary key of %s(%d) changed", ErrRelationInvariant, before.Type(), resource.id)
+		}
+		if !hasRelations {
+			continue
 		}
 
 		specs, err := relationSpecs(before.Type())
@@ -394,6 +398,13 @@ func resourcesChangeRelationGraph(resources []touchedResource) (bool, error) {
 		for _, spec := range specs {
 			if !relationValueEqual(before.Field(spec.fieldIndex), after.Field(spec.fieldIndex), spec.many) {
 				return true, nil
+			}
+		}
+
+		if matchFields == nil {
+			matchFields, err = registeredRelationMatchFields()
+			if err != nil {
+				return false, err
 			}
 		}
 
@@ -441,6 +452,13 @@ func registeredRelationMatchFields() (map[reflect.Type]map[int]struct{}, error) 
 }
 
 func logTransactionWrites(resources []touchedResource) error {
+	if len(resources) == 1 {
+		resource := resources[0]
+		write := [1]pendingWrite{{id: resource.id, work: resource.work}}
+
+		return committerFor(resource.dbName).logWrites(write[:])
+	}
+
 	byDBName := map[string][]pendingWrite{}
 	order := make([]string, 0)
 	for _, resource := range resources {
@@ -477,6 +495,9 @@ func entityStateEqual(before, after any) bool {
 	specs, err := specsByField(a.Type())
 	if err != nil {
 		return false
+	}
+	if len(specs) == 0 {
+		return reflect.DeepEqual(a.Interface(), b.Interface())
 	}
 
 	for i := range a.NumField() {
