@@ -1161,14 +1161,7 @@ func flushRelations() error {
 		}
 	}
 
-	// Rebuild the model with canonical store slots after inserts/patches.
-	nodes, err = collectRelationNodes(false, nil)
-	if err != nil {
-		return err
-	}
-
-	model, err = buildRelationModel(nodes)
-	if err != nil {
+	if err := bindPendingRelationModelToLive(model, runtimes); err != nil {
 		return err
 	}
 
@@ -1204,6 +1197,27 @@ func flushRelations() error {
 	}
 
 	storeCommittedOwnership(model, deleted)
+
+	return nil
+}
+
+func bindPendingRelationModelToLive(model *relationModel, runtimes []relationRuntime) error {
+	for _, runtime := range runtimes {
+		for _, pending := range runtime.relationPending() {
+			id, present := valueID(pending)
+			if !present {
+				return fmt.Errorf("%w: pending %s has no id", ErrRelationInvariant, runtime.relationType())
+			}
+
+			key := nodeKey{typ: runtime.relationType(), id: id}
+			value, found := runtime.relationValue(id)
+			if !found {
+				return fmt.Errorf("%w: pending node %s is missing", ErrRelationInvariant, key)
+			}
+
+			model.nodes[key] = relationGraphNode{key: key, value: value}
+		}
+	}
 
 	return nil
 }
