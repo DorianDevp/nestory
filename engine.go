@@ -37,6 +37,7 @@ type touchedResource struct {
 type committer interface {
 	lockResource(id int)
 	unlockResource(id int)
+	snapshotResource(id int) (work, original reflect.Value, version int, found bool)
 	resourceVersion(id int) (int, bool)
 	applyWrite(id int, work any)
 	refreshSnapshot(id int, work any)

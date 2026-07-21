@@ -240,6 +240,28 @@ func committedChildren(owner nodeKey) []nodeKey {
 	return append([]nodeKey(nil), committedOwnership.outgoing[owner]...)
 }
 
+func committedOwnershipClosure(root nodeKey) map[nodeKey]struct{} {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	out := map[nodeKey]struct{}{root: {}}
+	queue := []nodeKey{root}
+	for len(queue) > 0 {
+		owner := queue[0]
+		queue = queue[1:]
+		for _, child := range committedOwnership.outgoing[owner] {
+			if _, seen := out[child]; seen {
+				continue
+			}
+
+			out[child] = struct{}{}
+			queue = append(queue, child)
+		}
+	}
+
+	return out
+}
+
 func valueID(v reflect.Value) (int, bool) {
 	if !v.IsValid() || v.Kind() == reflect.Pointer && v.IsNil() {
 		return 0, false
@@ -309,21 +331,11 @@ func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeK
 	graphMu.RLock()
 	defer graphMu.RUnlock()
 
-	nodes, err := collectRelationNodes(false, nil)
-	if err != nil {
+	if err := ensureCommittedOwnership(); err != nil {
 		return nil, nil, nil, err
 	}
 
-	model, err := buildRelationModel(nodes)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	if _, found := nodes[root]; !found {
-		return nil, nil, nil, ErrNotFound
-	}
-
-	keys := ownershipClosure(model, root)
+	keys := committedOwnershipClosure(root)
 	ordered := make([]nodeKey, 0, len(keys))
 	for key := range keys {
 		ordered = append(ordered, key)
@@ -351,20 +363,59 @@ func cloneOwnershipAggregate(root nodeKey) (map[nodeKey]reflect.Value, map[nodeK
 	original := make(map[nodeKey]reflect.Value, len(keys))
 	versions := make(map[nodeKey]int, len(keys))
 	for _, key := range ordered {
-		work[key] = cloneEntityPointer(nodes[key].value)
-		original[key] = cloneEntityPointer(nodes[key].value)
-		version, found := committerFor(key.typ.Name()).resourceVersion(key.id)
+		workCopy, originalCopy, version, found := committerFor(key.typ.Name()).snapshotResource(key.id)
 		if !found {
 			return nil, nil, nil, ErrNotFound
 		}
 
+		work[key] = workCopy
+		original[key] = originalCopy
 		versions[key] = version
 	}
 
-	rewireAggregateCopies(model, work)
-	rewireAggregateCopies(model, original)
+	if err := rewireOwnershipCopies(work); err != nil {
+		return nil, nil, nil, err
+	}
+
+	if err := rewireOwnershipCopies(original); err != nil {
+		return nil, nil, nil, err
+	}
 
 	return work, original, versions, nil
+}
+
+func rewireOwnershipCopies(copies map[nodeKey]reflect.Value) error {
+	for key, holder := range copies {
+		specs, err := relationSpecs(key.typ)
+		if err != nil {
+			return err
+		}
+
+		for _, spec := range specs {
+			field := holder.Elem().Field(spec.fieldIndex)
+			if !spec.many {
+				rewireAggregatePointer(field, spec.target, copies)
+				continue
+			}
+
+			for i := range field.Len() {
+				rewireAggregatePointer(field.Index(i), spec.target, copies)
+			}
+		}
+	}
+
+	return nil
+}
+
+func rewireAggregatePointer(pointer reflect.Value, targetType reflect.Type, copies map[nodeKey]reflect.Value) {
+	id, ok := valueID(pointer)
+	if !ok {
+		return
+	}
+
+	if target, copied := copies[nodeKey{typ: targetType, id: id}]; copied {
+		pointer.Set(target)
+	}
 }
 
 func ownershipClosure(model *relationModel, root nodeKey) map[nodeKey]struct{} {
