@@ -98,8 +98,11 @@ func (w *wal) truncate() error {
 	defer w.mu.Unlock()
 
 	if w.f != nil {
-		w.f.Close()
+		file := w.f
 		w.f = nil
+		if err := file.Close(); err != nil {
+			return err
+		}
 	}
 
 	if err := os.Remove(w.path); err != nil && !os.IsNotExist(err) {
@@ -126,7 +129,7 @@ func replayWAL(path string, rowType reflect.Type) ([]recoveredRow, error) {
 		return nil, err
 	}
 
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var out []recoveredRow
 
