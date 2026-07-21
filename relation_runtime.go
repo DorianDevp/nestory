@@ -13,6 +13,7 @@ type relationRuntime interface {
 	relationLive() []reflect.Value
 	relationPending() []reflect.Value
 	relationDeleteIDs() []int
+	relationValue(int) (reflect.Value, bool)
 	relationApplyPending() error
 	relationPrepareCreate(reflect.Value) error
 	relationApplyCreate(reflect.Value)
@@ -51,6 +52,15 @@ func (db *DB[T]) relationDeleteIDs() []int {
 	}
 
 	return out
+}
+
+func (db *DB[T]) relationValue(id int) (reflect.Value, bool) {
+	resource, found := db.resource(id)
+	if !found {
+		return reflect.Value{}, false
+	}
+
+	return reflect.ValueOf(resource.item), true
 }
 
 func (db *DB[T]) relationApplyPending() error {

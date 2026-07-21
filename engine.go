@@ -351,13 +351,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		return nil
 	}
 
-	nodes, err := collectRelationNodes(false, nil)
-	if err != nil {
-		return err
-	}
-
-	model, err = buildRelationModel(nodes)
-	if err != nil {
+	if err := bindRelationModelToLiveNodes(model, touchedResources, createdResources); err != nil {
 		return err
 	}
 
@@ -376,6 +370,35 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	storeCommittedOwnership(model, deleted)
 
 	en.evict(tx)
+
+	return nil
+}
+
+func bindRelationModelToLiveNodes(model *relationModel, resources []touchedResource, creates map[nodeKey]createdResource) error {
+	for _, resource := range resources {
+		runtime, ok := baseRegistry[resource.dbName].(relationRuntime)
+		if !ok {
+			continue
+		}
+
+		key := nodeKey{typ: runtime.relationType(), id: resource.id}
+		value, found := runtime.relationValue(resource.id)
+		if !found {
+			return fmt.Errorf("%w: committed node %s is missing", ErrRelationInvariant, key)
+		}
+
+		model.nodes[key] = relationGraphNode{key: key, value: value}
+	}
+
+	for key := range creates {
+		runtime := baseRegistry[key.typ.Name()].(relationRuntime)
+		value, found := runtime.relationValue(key.id)
+		if !found {
+			return fmt.Errorf("%w: created node %s is missing", ErrRelationInvariant, key)
+		}
+
+		model.nodes[key] = relationGraphNode{key: key, value: value}
+	}
 
 	return nil
 }
