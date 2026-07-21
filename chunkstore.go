@@ -17,10 +17,11 @@ type pointerStoreIterator interface {
 }
 
 type resourceSlot[T any] struct {
-	item    *T
-	version int
-	chunk   int // owning block index; drives per-chunk dirty marking
-	mu      sync.RWMutex
+	item     *T
+	version  int
+	chunk    int // owning block index; drives per-chunk dirty marking
+	mu       sync.RWMutex
+	updateMu sync.Mutex // serializes short UpdateWithin calls for this root
 }
 
 type chunkBlock[T any] struct {

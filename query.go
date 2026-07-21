@@ -103,6 +103,14 @@ func (db *DB[T]) Update(branch *T) error {
 // UpdateWithin retries a short transaction on conflict. fn may run more than
 // once and must therefore express intent without external side effects.
 func (db *DB[T]) UpdateWithin(id int, fn func(*T) error) error {
+	resource, found := db.resource(id)
+	if !found {
+		return ErrNotFound
+	}
+
+	resource.updateMu.Lock()
+	defer resource.updateMu.Unlock()
+
 	for {
 		err := db.Transaction(func(tx *Tx[T]) error {
 			return tx.UpdateWithin(id, fn)
