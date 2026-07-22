@@ -361,14 +361,14 @@ func (db *DB[T]) prepareIndexes(items []pendingWrite) {
 		return
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
 	if len(items) >= secondaryIndexBatchThreshold {
 		db.prepareIndexBatch(items)
 
 		return
 	}
 
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	for _, item := range items {
 		if resource, found := db.resById[item.id]; found {
 			db.removeSecondaryIndices(resource.item)
@@ -378,11 +378,22 @@ func (db *DB[T]) prepareIndexes(items []pendingWrite) {
 
 func (db *DB[T]) prepareIndexBatch(items []pendingWrite) {
 	changed := make(map[int]struct{}, len(items))
+	removed := make([]*T, 0, len(items))
 	for _, item := range items {
-		changed[item.id] = struct{}{}
 		if resource, found := db.resById[item.id]; found {
-			db.removeSecondaryIndexLookups(resource.item)
+			changed[item.id] = struct{}{}
+			removed = append(removed, resource.item)
 		}
+	}
+
+	if len(removed) == 0 {
+		return
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, entity := range removed {
+		db.removeSecondaryIndexLookups(entity)
 	}
 
 	for _, index := range db.secondary {
@@ -399,14 +410,14 @@ func (db *DB[T]) finishIndexes(items []pendingWrite) {
 		return
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
 	if len(items) >= secondaryIndexBatchThreshold {
 		db.finishIndexBatch(items)
 
 		return
 	}
 
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	for _, item := range items {
 		if item.deleted {
 			continue
@@ -431,13 +442,26 @@ func (db *DB[T]) finishIndexBatch(items []pendingWrite) {
 		}
 
 		additions = append(additions, resource.item)
-		db.addSecondaryIndexLookups(resource.item)
 	}
 
-	for _, index := range db.secondary {
+	// structureMu excludes other index writers and range readers. Build the
+	// ordered slices without db.mu so point lookups can keep using the previous
+	// lookup maps until the short publication section below.
+	merged := make(map[string][]*T, len(db.secondary))
+	for name, index := range db.secondary {
 		ordered := append([]*T(nil), additions...)
 		slices.SortFunc(ordered, index.compare)
-		index.entries = mergeSecondaryIndexEntries(index, ordered)
+		merged[name] = mergeSecondaryIndexEntries(index, ordered)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, entity := range additions {
+		db.addSecondaryIndexLookups(entity)
+	}
+
+	for name, entries := range merged {
+		db.secondary[name].entries = entries
 	}
 }
 

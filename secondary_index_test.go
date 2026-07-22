@@ -3,8 +3,10 @@ package nestory
 import (
 	"errors"
 	"reflect"
+	"sort"
 	"strconv"
 	"testing"
+	"time"
 )
 
 type indexedMessage struct {
@@ -657,6 +659,88 @@ func BenchmarkIndexedRangeView(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkScalarLookupDuringIndexedHydration(b *testing.B) {
+	originalDir := DataDir
+	b.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	for range b.N {
+		b.StopTimer()
+		resetRegistries()
+		DataDir = b.TempDir()
+		if err := Register[indexedMessage](); err != nil {
+			b.Fatal(err)
+		}
+
+		db := Open[indexedMessage]()
+		stable := &indexedMessage{MessageID: "stable", SessionID: "stable", Seq: 1}
+		if err := db.Create(stable); err != nil {
+			b.Fatal(err)
+		}
+
+		if err := createIndexedBatch(db, "seed", 100_000); err != nil {
+			b.Fatal(err)
+		}
+
+		done := make(chan error, 1)
+		start := make(chan struct{})
+		go func() {
+			close(start)
+			done <- createIndexedBatch(db, "hydrate", 50_000)
+		}()
+		<-start
+
+		latencies := make([]int64, 0, 16_384)
+		b.StartTimer()
+	benchmarkLoop:
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				break benchmarkLoop
+			default:
+			}
+
+			started := time.Now()
+			if _, err := db.FindOneBy("MessageID", "stable"); err != nil {
+				b.Fatal(err)
+			}
+
+			latencies = append(latencies, time.Since(started).Nanoseconds())
+		}
+
+		b.StopTimer()
+
+		sort.Slice(latencies, func(left, right int) bool {
+			return latencies[left] < latencies[right]
+		})
+		b.ReportMetric(float64(nearestRank(latencies, 50)), "p50-ns/op")
+		b.ReportMetric(float64(nearestRank(latencies, 95)), "p95-ns/op")
+		b.ReportMetric(float64(nearestRank(latencies, 99)), "p99-ns/op")
+	}
+}
+
+func createIndexedBatch(db *DB[indexedMessage], prefix string, size int) error {
+	return db.Transaction(func(tx *Tx[indexedMessage]) error {
+		for sequence := 1; sequence <= size; sequence++ {
+			if err := tx.Create(&indexedMessage{
+				MessageID: prefix + "-" + strconv.Itoa(sequence),
+				SessionID: prefix,
+				Seq:       sequence,
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 func benchmarkIndexedBatch(
