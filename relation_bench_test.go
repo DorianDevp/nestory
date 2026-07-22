@@ -3,8 +3,10 @@ package nestory
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type relationBenchOwner struct {
@@ -476,36 +478,117 @@ func BenchmarkDialogTreeTargetedReparent(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for iteration := range b.N {
-				fromID, toID := world.leftID, world.rightID
-				if iteration%2 == 1 {
-					fromID, toID = toID, fromID
-				}
-
-				err := world.db.Transaction(func(tx *Tx[dialogBenchNode]) error {
-					from, getErr := tx.Get(fromID)
-					if getErr != nil {
-						return getErr
-					}
-
-					to, getErr := tx.Get(toID)
-					if getErr != nil {
-						return getErr
-					}
-
-					if len(from.Children) != 1 || from.Children[0].Id != world.branchID {
-						return fmt.Errorf("branch %d is not owned by %d", world.branchID, fromID)
-					}
-
-					to.Children = append(to.Children, from.Children[0])
-					from.Children = nil
-					return nil
-				})
-				if err != nil {
+				if err := reparentDialogBranch(world, iteration); err != nil {
 					b.Fatal(err)
 				}
 			}
 		})
 	}
+}
+
+func BenchmarkDialogTreeScalarLatencyUnderReparent(b *testing.B) {
+	for _, nodes := range []int{100, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
+			quiet(b)
+			world := newWideDialogBenchDB(b, nodes)
+			stop := make(chan struct{})
+			ready := make(chan error, 1)
+			done := make(chan error, 1)
+			go continuouslyReparentDialog(world, stop, ready, done)
+			if err := <-ready; err != nil {
+				b.Fatal(err)
+			}
+
+			latencies := make([]int64, b.N)
+			b.ResetTimer()
+			for iteration := range b.N {
+				started := time.Now()
+				err := world.db.UpdateWithin(world.scalarID, func(node *dialogBenchNode) error {
+					if iteration%2 == 0 {
+						node.Text = "scalar-even"
+					} else {
+						node.Text = "scalar-odd"
+					}
+
+					return nil
+				})
+				latencies[iteration] = time.Since(started).Nanoseconds()
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.StopTimer()
+
+			close(stop)
+			if err := <-done; err != nil {
+				b.Fatal(err)
+			}
+
+			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+			b.ReportMetric(float64(nearestRank(latencies, 50)), "p50-ns/op")
+			b.ReportMetric(float64(nearestRank(latencies, 95)), "p95-ns/op")
+			b.ReportMetric(float64(nearestRank(latencies, 99)), "p99-ns/op")
+		})
+	}
+}
+
+func continuouslyReparentDialog(world wideDialogBench, stop <-chan struct{}, ready, done chan<- error) {
+	for iteration := 0; ; iteration++ {
+		select {
+		case <-stop:
+			done <- nil
+			return
+		default:
+		}
+
+		err := reparentDialogBranch(world, iteration)
+		if iteration == 0 {
+			ready <- err
+		}
+
+		if err != nil {
+			done <- err
+			return
+		}
+	}
+}
+
+func reparentDialogBranch(world wideDialogBench, iteration int) error {
+	fromID, toID := world.leftID, world.rightID
+	if iteration%2 == 1 {
+		fromID, toID = toID, fromID
+	}
+
+	return world.db.Transaction(func(tx *Tx[dialogBenchNode]) error {
+		from, err := tx.Get(fromID)
+		if err != nil {
+			return err
+		}
+
+		to, err := tx.Get(toID)
+		if err != nil {
+			return err
+		}
+
+		if len(from.Children) != 1 || from.Children[0].Id != world.branchID {
+			return fmt.Errorf("branch %d is not owned by %d", world.branchID, fromID)
+		}
+
+		to.Children = append(to.Children, from.Children[0])
+		from.Children = nil
+
+		return nil
+	})
+}
+
+func nearestRank(samples []int64, percentile int) int64 {
+	index := (len(samples)*percentile+99)/100 - 1
+	if index < 0 {
+		return 0
+	}
+
+	return samples[index]
 }
 
 func BenchmarkUnsafeMutationBatchFlush(b *testing.B) {
