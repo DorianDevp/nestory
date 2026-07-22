@@ -754,9 +754,9 @@ func registeredRelationMatchFields() (map[reflect.Type]map[int]struct{}, error) 
 	fields := make(map[reflect.Type]map[int]struct{})
 	for _, runtime := range relationRuntimes() {
 		typ := runtime.relationType()
-		idField, found := typ.FieldByName("Id")
+		idField, found := typ.FieldByName(entityIDField)
 		if !found {
-			return nil, fmt.Errorf("%w: %s.Id does not exist", ErrRelationSchema, typ)
+			return nil, fmt.Errorf("%w: %s.%s does not exist", ErrRelationSchema, typ, entityIDField)
 		}
 
 		if fields[typ] == nil {
@@ -910,7 +910,7 @@ func ownSliceBackReferencePersists(model *relationModel, ref resolvedRelation) b
 	}
 
 	owner := model.nodes[ref.holder]
-	id := owner.value.Elem().FieldByName("Id")
+	id := owner.value.Elem().FieldByName(entityIDField)
 	return scalarEqual(back, id)
 }
 

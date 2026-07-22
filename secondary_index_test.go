@@ -10,7 +10,7 @@ import (
 )
 
 type indexedMessage struct {
-	Id        int
+	Id        int    `key:"primary"`
 	MessageID string `key:"unique"`
 	SessionID string `index:"session_seq,1,unique"`
 	Seq       int    `index:"session_seq,2,unique"`
@@ -20,11 +20,82 @@ type indexedMessage struct {
 func (message indexedMessage) GetId() int { return message.Id }
 
 type invalidIndexedMessage struct {
-	Id      int
+	Id      int    `key:"primary"`
 	Payload []byte `key:"unique"`
 }
 
 func (message invalidIndexedMessage) GetId() int { return message.Id }
+
+type typedUniqueEntity struct {
+	Id       int    `key:"primary"`
+	Label    string `key:"unique"`
+	Signed   int64  `key:"unique"`
+	Unsigned uint32 `key:"unique"`
+	Flag     bool   `key:"unique"`
+}
+
+func (entity typedUniqueEntity) GetId() int { return entity.Id }
+
+func TestTypedUniqueLookupsShareValidationIndex(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[typedUniqueEntity](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[typedUniqueEntity]()
+	first := &typedUniqueEntity{Label: "first", Signed: -7, Unsigned: 7, Flag: false}
+	second := &typedUniqueEntity{Label: "second", Signed: 8, Unsigned: 8, Flag: true}
+	if err := db.Transaction(func(tx *Tx[typedUniqueEntity]) error {
+		if err := tx.Create(first); err != nil {
+			return err
+		}
+
+		return tx.Create(second)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	lookups := []struct {
+		field string
+		value any
+		id    int
+	}{
+		{field: "Label", value: "second", id: second.Id},
+		{field: "Signed", value: int64(-7), id: first.Id},
+		{field: "Unsigned", value: uint32(8), id: second.Id},
+		{field: "Flag", value: false, id: first.Id},
+	}
+	for _, lookup := range lookups {
+		found, err := db.FindOneBy(lookup.field, lookup.value)
+		if err != nil {
+			t.Fatalf("FindOneBy(%s): %v", lookup.field, err)
+		}
+
+		if found.Id != lookup.id {
+			t.Fatalf("FindOneBy(%s) id = %d, want %d", lookup.field, found.Id, lookup.id)
+		}
+	}
+
+	duplicate := &typedUniqueEntity{Label: "third", Signed: -7, Unsigned: 9, Flag: true}
+	if err := db.Create(duplicate); !errors.Is(err, ErrUniqueViolation) {
+		t.Fatalf("duplicate typed key error = %v, want ErrUniqueViolation", err)
+	}
+
+	if err := db.Delete(first.Id); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.FindOneBy("Signed", int64(-7)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted typed key error = %v, want ErrNotFound", err)
+	}
+}
 
 func TestUniqueAndCompositeIndexesTrackTransactions(t *testing.T) {
 	originalDir := DataDir

@@ -14,7 +14,6 @@ func (db *DB[T]) add(entity *T) {
 
 	resource := db.store.Append(*entity)
 	id := (*resource.item).GetId()
-	db.index["Id"][id] = resource.item
 	db.resById[id] = resource
 }
 
@@ -93,7 +92,7 @@ func (db *DB[T]) queueCreate(entity *T) {
 		return
 	}
 
-	if existing := db.index[db.identifier][id]; existing != nil {
+	if _, exists := db.resById[id]; exists {
 		return
 	}
 
@@ -109,7 +108,7 @@ func (db *DB[T]) queueCreate(entity *T) {
 func (db *DB[T]) resetPersistQueue() { db.persistQueue = []*T{} }
 
 func (db *DB[T]) queueDelete(id int) error {
-	instance, ok := db.index["Id"][id]
+	resource, ok := db.resById[id]
 	if !ok {
 		return fmt.Errorf("%w: %s(%d)", ErrNotFound, db.name, id)
 	}
@@ -120,7 +119,7 @@ func (db *DB[T]) queueDelete(id int) error {
 		}
 	}
 
-	db.deleteQueue = append(db.deleteQueue, instance)
+	db.deleteQueue = append(db.deleteQueue, resource.item)
 	return nil
 }
 

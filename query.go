@@ -27,13 +27,31 @@ func (db *DB[T]) findID(field string, value any) (int, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	if index := db.index[field]; index != nil {
-		entity, found := index[value]
+	if field == db.identifier {
+		id, valid := value.(int)
+		if !valid {
+			return 0, ErrNotFound
+		}
+
+		_, found := db.resById[id]
 		if !found {
 			return 0, ErrNotFound
 		}
 
-		return (*entity).GetId(), nil
+		return id, nil
+	}
+
+	for _, index := range db.secondary {
+		if index.spec.lookupField != field {
+			continue
+		}
+
+		id, found := index.lookup(value)
+		if !found {
+			return 0, ErrNotFound
+		}
+
+		return id, nil
 	}
 
 	var id int

@@ -171,15 +171,37 @@ func validateSecondaryIndexField(owner reflect.Type, field reflect.StructField) 
 }
 
 type secondaryIndex[T Entity] struct {
-	spec    secondaryIndexSpec
-	entries []*T
-	keys    map[string]int
+	spec          secondaryIndexSpec
+	entries       []*T
+	compositeKeys map[string]int
+	stringKeys    map[string]int
+	signedKeys    map[int64]int
+	unsignedKeys  map[uint64]int
+	boolKeys      [2]int
 }
 
 func newSecondaryIndex[T Entity](spec secondaryIndexSpec) *secondaryIndex[T] {
 	index := &secondaryIndex[T]{spec: spec}
-	if spec.unique {
-		index.keys = make(map[string]int)
+	if !spec.unique {
+		return index
+	}
+
+	if spec.lookupField == "" {
+		index.compositeKeys = make(map[string]int)
+
+		return index
+	}
+
+	switch spec.fields[0].typ.Kind() {
+	case reflect.Bool:
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		index.signedKeys = make(map[int64]int)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		index.unsignedKeys = make(map[uint64]int)
+	case reflect.String:
+		index.stringKeys = make(map[string]int)
+	default:
+		panic("nestory: unsupported unique index field")
 	}
 
 	return index
@@ -211,24 +233,6 @@ func (db *DB[T]) rebuildSecondaryIndices() error {
 	}
 
 	db.secondary = indices
-	for field := range db.index {
-		if field != "Id" {
-			delete(db.index, field)
-		}
-	}
-
-	for _, index := range db.secondary {
-		if index.spec.lookupField == "" {
-			continue
-		}
-
-		lookup := make(map[any]*T, len(index.entries))
-		for _, entity := range index.entries {
-			lookup[reflect.ValueOf(*entity).Field(index.spec.fields[0].index).Interface()] = entity
-		}
-
-		db.index[index.spec.lookupField] = lookup
-	}
 
 	return nil
 }
@@ -239,13 +243,23 @@ func (index *secondaryIndex[T]) rebuildKeys() error {
 	}
 
 	for _, entity := range index.entries {
-		key := index.key(entity)
 		id := (*entity).GetId()
-		if existing, duplicate := index.keys[key]; duplicate && existing != id {
+		if index.spec.lookupField == "" {
+			key := index.key(entity)
+			if existing, duplicate := index.compositeKeys[key]; duplicate && existing != id {
+				return fmt.Errorf("%w: index %s", ErrUniqueViolation, index.spec.name)
+			}
+
+			index.compositeKeys[key] = id
+
+			continue
+		}
+
+		if existing, duplicate := index.uniqueID(entity); duplicate && existing != id {
 			return fmt.Errorf("%w: index %s", ErrUniqueViolation, index.spec.name)
 		}
 
-		index.keys[key] = id
+		index.setUnique(entity, id)
 	}
 
 	return nil
@@ -338,8 +352,9 @@ func (db *DB[T]) validateIndexes(items []pendingWrite) error {
 			}
 
 			entity := item.work.(*T)
-			key := index.key(entity)
-			if existing, found := index.keys[key]; found && existing != item.id {
+			key := index.pendingKey(entity)
+			existing, found := index.uniqueIDForValidation(entity, key)
+			if found && existing != item.id {
 				if _, moving := changed[existing]; !moving {
 					return fmt.Errorf("%w: index %s", ErrUniqueViolation, index.spec.name)
 				}
@@ -354,6 +369,24 @@ func (db *DB[T]) validateIndexes(items []pendingWrite) error {
 	}
 
 	return nil
+}
+
+func (index *secondaryIndex[T]) pendingKey(entity *T) string {
+	if index.spec.lookupField != "" && index.spec.fields[0].typ.Kind() == reflect.String {
+		return reflect.ValueOf(*entity).Field(index.spec.fields[0].index).String()
+	}
+
+	return index.key(entity)
+}
+
+func (index *secondaryIndex[T]) uniqueIDForValidation(entity *T, key string) (int, bool) {
+	if index.spec.lookupField == "" {
+		id, found := index.compositeKeys[key]
+
+		return id, found
+	}
+
+	return index.uniqueID(entity)
 }
 
 func (db *DB[T]) prepareIndexes(items []pendingWrite) {
@@ -515,12 +548,7 @@ func (db *DB[T]) removeSecondaryIndices(entity *T) {
 func (db *DB[T]) removeSecondaryIndexLookups(entity *T) {
 	for _, index := range db.secondary {
 		if index.spec.unique {
-			delete(index.keys, index.key(entity))
-		}
-
-		if index.spec.lookupField != "" {
-			value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index).Interface()
-			delete(db.index[index.spec.lookupField], value)
+			index.deleteUnique(entity)
 		}
 	}
 }
@@ -538,13 +566,100 @@ func (db *DB[T]) addSecondaryIndices(entity *T) {
 func (db *DB[T]) addSecondaryIndexLookups(entity *T) {
 	for _, index := range db.secondary {
 		if index.spec.unique {
-			index.keys[index.key(entity)] = (*entity).GetId()
+			index.setUnique(entity, (*entity).GetId())
 		}
+	}
+}
 
-		if index.spec.lookupField != "" {
-			value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index).Interface()
-			db.index[index.spec.lookupField][value] = entity
-		}
+func (index *secondaryIndex[T]) lookup(raw any) (int, bool) {
+	if index.spec.lookupField == "" || raw == nil {
+		return 0, false
+	}
+
+	value := reflect.ValueOf(raw)
+	if value.Type() != index.spec.fields[0].typ {
+		return 0, false
+	}
+
+	return index.uniqueValueID(value)
+}
+
+func (index *secondaryIndex[T]) uniqueID(entity *T) (int, bool) {
+	if index.spec.lookupField == "" {
+		id, found := index.compositeKeys[index.key(entity)]
+
+		return id, found
+	}
+
+	value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index)
+
+	return index.uniqueValueID(value)
+}
+
+func (index *secondaryIndex[T]) uniqueValueID(value reflect.Value) (int, bool) {
+	switch value.Kind() {
+	case reflect.Bool:
+		id := index.boolKeys[boolByte(value.Bool())]
+
+		return id, id != 0
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		id, found := index.signedKeys[value.Int()]
+
+		return id, found
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		id, found := index.unsignedKeys[value.Uint()]
+
+		return id, found
+	case reflect.String:
+		id, found := index.stringKeys[value.String()]
+
+		return id, found
+	default:
+		panic("nestory: unsupported unique index field")
+	}
+}
+
+func (index *secondaryIndex[T]) setUnique(entity *T, id int) {
+	if index.spec.lookupField == "" {
+		index.compositeKeys[index.key(entity)] = id
+
+		return
+	}
+
+	value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index)
+	switch value.Kind() {
+	case reflect.Bool:
+		index.boolKeys[boolByte(value.Bool())] = id
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		index.signedKeys[value.Int()] = id
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		index.unsignedKeys[value.Uint()] = id
+	case reflect.String:
+		index.stringKeys[value.String()] = id
+	default:
+		panic("nestory: unsupported unique index field")
+	}
+}
+
+func (index *secondaryIndex[T]) deleteUnique(entity *T) {
+	if index.spec.lookupField == "" {
+		delete(index.compositeKeys, index.key(entity))
+
+		return
+	}
+
+	value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index)
+	switch value.Kind() {
+	case reflect.Bool:
+		index.boolKeys[boolByte(value.Bool())] = 0
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		delete(index.signedKeys, value.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		delete(index.unsignedKeys, value.Uint())
+	case reflect.String:
+		delete(index.stringKeys, value.String())
+	default:
+		panic("nestory: unsupported unique index field")
 	}
 }
 

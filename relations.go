@@ -506,7 +506,7 @@ func canonicalSliceElement(element reflect.Value, spec relationSpec, index *rela
 }
 
 func wireIndexedSlice(owner, field reflect.Value, spec relationSpec, index *relationWireIndex) {
-	key, present := relationKey(owner, "Id")
+	key, present := relationKey(owner, entityIDField)
 	if !present {
 		field.Set(reflect.MakeSlice(field.Type(), 0, 0))
 		return
@@ -619,7 +619,7 @@ func indexOwnSlice(index *relationWireIndex, spec relationSpec) {
 		key := backValue
 		if backValue.Kind() == reflect.Pointer {
 			var present bool
-			key, present = relationKey(backValue, "Id")
+			key, present = relationKey(backValue, entityIDField)
 			if !present {
 				continue
 			}

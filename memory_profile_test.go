@@ -18,7 +18,7 @@ const (
 )
 
 type memoryProfileEntry struct {
-	Id        int
+	Id        int    `key:"primary"`
 	MessageID string `key:"unique"`
 	SessionID int    `index:"session_seq,1,unique"`
 	Seq       int    `index:"session_seq,2,unique"`
@@ -48,7 +48,7 @@ func TestIndexedMemoryProfile(t *testing.T) {
 		t.Skip("set NESTORY_MEMORY_PROFILE=1 to run the indexed memory profile")
 	}
 
-	variants := []string{"runtime", "store", "resource", "id", "ordered", "unique", "full"}
+	variants := []string{"runtime", "store", "primary", "ordered", "unique"}
 	samples := make([]memoryProfileSample, 0, len(variants))
 	for _, variant := range variants {
 		samples = append(samples, memoryProfileSubprocess(t, variant))
@@ -134,6 +134,7 @@ func runMemoryProfileWorker(t *testing.T, variant string) {
 			if len(payload) > 0 {
 				payload[0] = byte(position)
 			}
+
 			entry := &memoryProfileEntry{
 				Id:        position + 1,
 				MessageID: fmt.Sprintf("msg-%016x", position),
@@ -177,31 +178,22 @@ func pruneMemoryProfileVariant(db *DB[memoryProfileEntry], variant string) {
 	switch variant {
 	case "store":
 		db.resById = nil
-		db.index = nil
 		db.secondary = nil
-	case "resource":
-		db.index = nil
-		db.secondary = nil
-	case "id":
-		keepOnlyPrimaryIndex(db)
+	case "primary":
 		db.secondary = nil
 	case "ordered":
-		keepOnlyPrimaryIndex(db)
 		for _, index := range db.secondary {
-			index.keys = nil
+			index.compositeKeys = nil
+			index.stringKeys = nil
+			index.signedKeys = nil
+			index.unsignedKeys = nil
+			index.boolKeys = [2]int{}
 		}
 	case "unique":
-		keepOnlyPrimaryIndex(db)
-	case "full":
 	case "runtime":
 	default:
 		panic("unknown memory profile variant: " + variant)
 	}
-}
-
-func keepOnlyPrimaryIndex(db *DB[memoryProfileEntry]) {
-	primary := db.index["Id"]
-	db.index = indexMap[*memoryProfileEntry]{"Id": primary}
 }
 
 func processRSS() uint64 {
