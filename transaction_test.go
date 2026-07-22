@@ -35,6 +35,35 @@ type txKeyBorrower struct {
 
 func (borrower txKeyBorrower) GetId() int { return borrower.Id }
 
+type txList struct {
+	Id      int        `key:"primary"`
+	Entries []*txEntry `rel:"own,List"`
+}
+
+func (list txList) GetId() int { return list.Id }
+
+type txEntry struct {
+	Id   int     `key:"primary"`
+	List *txList `rel:"ownedby,Id"`
+	Text string
+}
+
+func (entry txEntry) GetId() int { return entry.Id }
+
+type txOptionalTarget struct {
+	Id  int `key:"primary"`
+	Key string
+}
+
+func (target txOptionalTarget) GetId() int { return target.Id }
+
+type txOptionalHolder struct {
+	Id     int               `key:"primary"`
+	Target *txOptionalTarget `rel:"option,Key"`
+}
+
+func (holder txOptionalHolder) GetId() int { return holder.Id }
+
 func TestTransactionEditsOwnershipTreeWithoutUpdate(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		world := seedRuntime(t)
@@ -387,6 +416,305 @@ func TestCreateUsesWALAndRehydratesScalarOwnership(t *testing.T) {
 
 		if reloadedParent.Children[0].ParentID != parent.Id {
 			t.Fatalf("reloaded child ParentID = %d, want %d", reloadedParent.Children[0].ParentID, parent.Id)
+		}
+	})
+}
+
+func TestCreatePublishesRelationIndexDelta(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txEntry](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txList](); err != nil {
+			t.Fatal(err)
+		}
+
+		entryDB := Open[txEntry]()
+		listDB := Open[txList]()
+		list := &txList{}
+		first := &txEntry{List: list, Text: "first"}
+		list.Entries = []*txEntry{first}
+		if err := listDB.Create(list); err != nil {
+			t.Fatal(err)
+		}
+
+		before := committedRelationIndexSnapshot()
+		second := &txEntry{Text: "second"}
+		err := listDB.Transaction(func(tx *Tx[txList]) error {
+			current, err := tx.Get(list.Id)
+			if err != nil {
+				return err
+			}
+
+			second.List = current
+			current.Entries = append(current.Entries, second)
+			return entryDB.Join(tx).Create(second)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if after := committedRelationIndexSnapshot(); after != before {
+			t.Fatal("create rebuilt the committed relation index")
+		}
+
+		storedList, err := listDB.Unsafe().Get(list.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		storedEntry, err := entryDB.Unsafe().Get(second.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(storedList.Entries) != 2 {
+			t.Fatalf("stored entries = %d, want 2", len(storedList.Entries))
+		}
+
+		if storedList.Entries[1] != storedEntry || storedEntry.List != storedList {
+			t.Fatalf(
+				"create pointers: entries=%d appended=%p stored=%p back=%p owner=%p",
+				len(storedList.Entries), storedList.Entries[1], storedEntry, storedEntry.List, storedList,
+			)
+		}
+
+		resetRegistries()
+		if err := Register[txEntry](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txList](); err != nil {
+			t.Fatal(err)
+		}
+
+		Open[txEntry]()
+		reloaded, err := Open[txList]().Get(list.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(reloaded.Entries) != 2 || reloaded.Entries[1].Text != "second" || reloaded.Entries[1].List != reloaded {
+			t.Fatal("incremental create did not survive WAL replay")
+		}
+	})
+}
+
+func TestCreateIndexesOptionToExistingTarget(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txOptionalTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txOptionalHolder](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[txOptionalTarget]()
+		holderDB := Open[txOptionalHolder]()
+		target := &txOptionalTarget{Key: "present"}
+		targetDB.Unsafe().Create(target)
+		holderDB.Unsafe().Create(&txOptionalHolder{Target: target})
+		if err := holderDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		canonicalTarget, err := targetDB.Unsafe().Get(target.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		before := committedRelationIndexSnapshot()
+		holder := &txOptionalHolder{Target: canonicalTarget}
+		if err := holderDB.Create(holder); err != nil {
+			t.Fatal(err)
+		}
+
+		if after := committedRelationIndexSnapshot(); after != before {
+			t.Fatal("option create rebuilt the committed relation index")
+		}
+
+		stored, err := holderDB.Unsafe().Get(holder.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if stored.Target != canonicalTarget {
+			t.Fatalf("option target = %p, canonical = %p", stored.Target, canonicalTarget)
+		}
+	})
+}
+
+func TestCreateRewiresBorrowInverseIncrementally(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtIndexedTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[rtIndexedHolder](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[rtIndexedTarget]()
+		holderDB := Open[rtIndexedHolder]()
+		target := &rtIndexedTarget{}
+		targetDB.Unsafe().Create(target)
+		holderDB.Unsafe().Create(&rtIndexedHolder{Targets: []*rtIndexedTarget{target}})
+		if err := holderDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		canonicalTarget, err := targetDB.Unsafe().Get(target.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		before := committedRelationIndexSnapshot()
+		created := &rtIndexedHolder{Targets: []*rtIndexedTarget{canonicalTarget}}
+		if err := holderDB.Create(created); err != nil {
+			t.Fatal(err)
+		}
+
+		if after := committedRelationIndexSnapshot(); after != before {
+			t.Fatal("borrow create rebuilt the committed relation index")
+		}
+
+		stored, err := holderDB.Unsafe().Get(created.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(canonicalTarget.Holders) != 2 || canonicalTarget.Holders[1] != stored {
+			t.Fatalf("inverse holders = %#v, want created holder last", canonicalTarget.Holders)
+		}
+	})
+}
+
+func TestCreateDeltaRejectsMissingRequiredRelation(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txEntry](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txList](); err != nil {
+			t.Fatal(err)
+		}
+
+		entryDB := Open[txEntry]()
+		listDB := Open[txList]()
+		list := &txList{}
+		entry := &txEntry{List: list}
+		list.Entries = []*txEntry{entry}
+		if err := listDB.Create(list); err != nil {
+			t.Fatal(err)
+		}
+
+		before := committedRelationIndexSnapshot()
+		err := entryDB.Create(&txEntry{Text: "orphan"})
+		if !errors.Is(err, ErrRelationInvariant) {
+			t.Fatalf("error = %v, want ErrRelationInvariant", err)
+		}
+
+		if entryDB.Len() != 1 || committedRelationIndexSnapshot() != before {
+			t.Fatal("invalid create changed live state")
+		}
+	})
+}
+
+func TestCreateDeltaRejectsOwnershipCycle(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtNode](); err != nil {
+			t.Fatal(err)
+		}
+
+		db := Open[rtNode]()
+		if err := db.Create(&rtNode{}); err != nil {
+			t.Fatal(err)
+		}
+
+		before := committedRelationIndexSnapshot()
+		cycle := &rtNode{}
+		cycle.Children = []*rtNode{cycle}
+		err := db.Create(cycle)
+		if !errors.Is(err, ErrRelationInvariant) {
+			t.Fatalf("error = %v, want ErrRelationInvariant", err)
+		}
+
+		if db.Len() != 1 || committedRelationIndexSnapshot() != before {
+			t.Fatal("cyclic create changed live state")
+		}
+	})
+}
+
+func TestConcurrentCreatesPublishIntoOneRelationIndex(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txEntry](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txList](); err != nil {
+			t.Fatal(err)
+		}
+
+		entryDB := Open[txEntry]()
+		listDB := Open[txList]()
+		lists := []*txList{{}, {}}
+		for _, list := range lists {
+			entry := &txEntry{List: list, Text: "seed"}
+			list.Entries = []*txEntry{entry}
+			if err := listDB.Create(list); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		before := committedRelationIndexSnapshot()
+		start := make(chan struct{})
+		var ready sync.WaitGroup
+		ready.Add(len(lists))
+		errors := make(chan error, len(lists))
+		for _, list := range lists {
+			go func() {
+				ready.Done()
+				<-start
+				errors <- listDB.Transaction(func(tx *Tx[txList]) error {
+					current, err := tx.Get(list.Id)
+					if err != nil {
+						return err
+					}
+
+					entry := &txEntry{List: current, Text: "concurrent"}
+					current.Entries = append(current.Entries, entry)
+					if err := entryDB.Join(tx).Create(entry); err != nil {
+						return err
+					}
+
+					return nil
+				})
+			}()
+		}
+
+		ready.Wait()
+		close(start)
+		for range lists {
+			if err := <-errors; err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if after := committedRelationIndexSnapshot(); after != before {
+			t.Fatal("concurrent creates replaced the committed relation index")
+		}
+
+		for _, list := range lists {
+			stored, err := listDB.Unsafe().Get(list.Id)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(stored.Entries) != 2 || stored.Entries[1].List != stored {
+				t.Fatal("concurrent create did not publish canonical ownership")
+			}
 		}
 	})
 }

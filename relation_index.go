@@ -147,6 +147,8 @@ func (keys *nodeKeySet) at(index int) nodeKey {
 
 type relationIndexDelta struct {
 	index          *committedRelationIndex
+	created        map[nodeKey]createdResource
+	targets        map[relationTargetKey]indexedRelationTarget
 	overrides      []relationIndexOverride
 	overrideInline [2]relationIndexOverride
 	fields         relationFieldDeltas
@@ -163,15 +165,29 @@ type relationIndexOverride struct {
 }
 
 func buildRelationIndexDelta(resources []touchedResource) (*relationIndexDelta, error) {
+	return buildRelationIndexDeltaWithCreates(resources, nil)
+}
+
+func buildRelationCreateIndexDelta(
+	resources []touchedResource,
+	creates map[nodeKey]createdResource,
+) (*relationIndexDelta, error) {
+	return buildRelationIndexDeltaWithCreates(resources, creates)
+}
+
+func buildRelationIndexDeltaWithCreates(
+	resources []touchedResource,
+	creates map[nodeKey]createdResource,
+) (*relationIndexDelta, error) {
 	index := committedRelationIndexSnapshot()
 	if index == nil {
 		return nil, nil
 	}
 
-	delta := &relationIndexDelta{index: index}
+	delta := &relationIndexDelta{index: index, created: creates}
 	overrides := delta.overrideInline[:0]
-	if len(resources) > cap(overrides) {
-		overrides = make([]relationIndexOverride, 0, len(resources))
+	if len(resources)+len(creates) > cap(overrides) {
+		overrides = make([]relationIndexOverride, 0, len(resources)+len(creates))
 	}
 
 	fieldCount := 0
@@ -202,6 +218,31 @@ func buildRelationIndexDelta(resources []touchedResource) (*relationIndexDelta, 
 		fieldCount += len(specs)
 	}
 
+	supported, err := delta.indexCreatedTargets(creates)
+	if err != nil {
+		return nil, err
+	}
+
+	if !supported {
+		return nil, nil
+	}
+
+	for key, created := range creates {
+		if _, exists := index.nodes[key]; exists {
+			return nil, nil
+		}
+
+		specs, err := relationSpecs(key.typ)
+		if err != nil {
+			return nil, err
+		}
+
+		overrides = append(overrides, relationIndexOverride{
+			node: relationGraphNode{key: key, value: created.work}, specs: specs,
+		})
+		fieldCount += len(specs)
+	}
+
 	delta.overrides = overrides
 	delta.fields.init(delta.fieldInline[:], fieldCount)
 	delta.ownerChanges = delta.ownerInline[:0]
@@ -222,6 +263,14 @@ func buildRelationIndexDelta(resources []touchedResource) (*relationIndexDelta, 
 			fieldKey := relationHolderField{holder: key, field: spec.fieldIndex}
 			committed, exists := index.fields[fieldKey]
 			if !exists {
+				if _, created := creates[key]; created {
+					committed = indexedRelationField{spec: spec}
+				} else {
+					return nil, nil
+				}
+			}
+
+			if committed.spec == nil {
 				return nil, nil
 			}
 
@@ -233,7 +282,7 @@ func buildRelationIndexDelta(resources []touchedResource) (*relationIndexDelta, 
 
 			delta.fields.add(fieldKey, replacement)
 			field, _ := delta.fields.find(fieldKey)
-			if err := scanIndexedRelationField(index, override.node, field); err != nil {
+			if err := scanIndexedRelationField(delta, override.node, field); err != nil {
 				return nil, err
 			}
 		}
@@ -252,10 +301,67 @@ func buildRelationIndexDelta(resources []touchedResource) (*relationIndexDelta, 
 	return delta, nil
 }
 
-func scanIndexedRelationField(index *committedRelationIndex, holder relationGraphNode, field *indexedRelationField) error {
+func (delta *relationIndexDelta) indexCreatedTargets(creates map[nodeKey]createdResource) (bool, error) {
+	if len(creates) == 0 {
+		return true, nil
+	}
+
+	for key := range creates {
+		specs, err := relationSpecs(key.typ)
+		if err != nil {
+			return false, err
+		}
+
+		for _, spec := range specs {
+			if spec.kind == inverseRelation {
+				continue
+			}
+
+			field := spec.matchField
+			if spec.kind == ownRelation && spec.many {
+				field = "Id"
+			}
+
+			if _, indexed := delta.index.targetFields[spec.target][field]; !indexed {
+				return false, nil
+			}
+		}
+	}
+
+	delta.targets = make(map[relationTargetKey]indexedRelationTarget, len(creates))
+	for key, created := range creates {
+		for field := range delta.index.targetFields[key.typ] {
+			value, present := relationKey(created.work, field)
+			if !present {
+				continue
+			}
+
+			lookup := relationTargetKey{typ: key.typ, field: field, value: value.Interface()}
+			if _, duplicate := delta.index.targets[lookup]; duplicate {
+				return false, fmt.Errorf("%w: duplicate relation target %s.%s", ErrRelationInvariant, key.typ, field)
+			}
+
+			if _, duplicate := delta.targets[lookup]; duplicate {
+				return false, fmt.Errorf("%w: duplicate relation target %s.%s", ErrRelationInvariant, key.typ, field)
+			}
+
+			delta.targets[lookup] = indexedRelationTarget{key: key}
+		}
+	}
+
+	return true, nil
+}
+
+func (delta *relationIndexDelta) bindCreatedNode(key nodeKey, live reflect.Value) {
+	created := delta.created[key]
+	created.work = live
+	delta.created[key] = created
+}
+
+func scanIndexedRelationField(delta *relationIndexDelta, holder relationGraphNode, field *indexedRelationField) error {
 	value := holder.value.Elem().Field(field.spec.fieldIndex)
 	if !field.spec.many {
-		target, found, err := resolveIndexedRelationTarget(index, holder.key, value, *field.spec)
+		target, found, err := resolveIndexedRelationTarget(delta, holder.key, value, *field.spec)
 		if found {
 			field.targets = append(field.targets, target)
 		}
@@ -269,7 +375,7 @@ func scanIndexedRelationField(index *committedRelationIndex, holder relationGrap
 	}
 
 	for position := range value.Len() {
-		target, found, err := resolveIndexedRelationTarget(index, holder.key, value.Index(position), *field.spec)
+		target, found, err := resolveIndexedRelationTarget(delta, holder.key, value.Index(position), *field.spec)
 		if err != nil {
 			return err
 		}
@@ -296,13 +402,17 @@ func scanIndexedRelationField(index *committedRelationIndex, holder relationGrap
 }
 
 func resolveIndexedRelationTarget(
-	index *committedRelationIndex,
+	delta *relationIndexDelta,
 	holder nodeKey,
 	pointer reflect.Value,
 	spec relationSpec,
 ) (nodeKey, bool, error) {
 	lookup, present := graphRelationTargetKey(spec, pointer)
-	target, found := index.targets[lookup]
+	target, found := delta.targets[lookup]
+	if !found {
+		target, found = delta.index.targets[lookup]
+	}
+
 	if target.duplicate {
 		return nodeKey{}, false, fmt.Errorf("%w: %s.%s does not uniquely identify a target", ErrRelationInvariant, spec.owner, spec.fieldName)
 	}
@@ -341,6 +451,7 @@ func relationIndexKeyChanged(index *committedRelationIndex, key nodeKey, after r
 func (delta *relationIndexDelta) materializeOwnBackReferences(
 	transactionResources []touchedResource,
 	changed []touchedResource,
+	creates map[nodeKey]createdResource,
 ) ([]touchedResource, error) {
 	for _, entry := range delta.fields.values {
 		if entry.field.spec.kind != ownRelation || !entry.field.spec.many {
@@ -349,6 +460,14 @@ func (delta *relationIndexDelta) materializeOwnBackReferences(
 
 		owner := delta.overrideValue(entry.key.holder)
 		for _, target := range entry.field.targets {
+			if created, exists := creates[target]; exists {
+				if !indexedOwnBackReferenceMatches(owner, created.work, *entry.field.spec) {
+					setIndexedOwnBackReference(owner, created.work, *entry.field.spec)
+				}
+
+				continue
+			}
+
 			resource, alreadyChanged, err := delta.ownershipTargetResource(target, owner, *entry.field.spec, transactionResources, changed)
 			if err != nil {
 				return nil, err
@@ -670,6 +789,14 @@ func (delta *relationIndexDelta) publishAndRewire() {
 	if index != delta.index {
 		committedOwnership.Unlock()
 		panic("nestory: committed relation index changed under graph lock")
+	}
+
+	for key, created := range delta.created {
+		index.nodes[key] = created.work
+	}
+
+	for lookup, target := range delta.targets {
+		index.targets[lookup] = target
 	}
 
 	for _, entry := range delta.fields.values {

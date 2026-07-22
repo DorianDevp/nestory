@@ -406,6 +406,62 @@ func BenchmarkDialogTreeAddBranch(b *testing.B) {
 	}
 }
 
+func BenchmarkRelationIndexedCreate(b *testing.B) {
+	for _, graphChildren := range []int{100, 1_000, 10_000} {
+		b.Run(fmt.Sprintf("graph-children=%d", graphChildren), func(b *testing.B) {
+			quiet(b)
+			DataDir = b.TempDir()
+			resetRegistries()
+			if err := Register[relationBenchChild](); err != nil {
+				b.Fatal(err)
+			}
+
+			if err := Register[relationBenchOwner](); err != nil {
+				b.Fatal(err)
+			}
+
+			childDB := Open[relationBenchChild]()
+			ownerDB := Open[relationBenchOwner]()
+			target := &relationBenchOwner{Name: "target"}
+			filler := &relationBenchOwner{Name: "filler"}
+			ownerDB.Unsafe().Create(target)
+			ownerDB.Unsafe().Create(filler)
+			for index := range graphChildren {
+				owner := filler
+				if index < 10 {
+					owner = target
+				}
+
+				child := &relationBenchChild{OwnerID: owner.Id, Value: index}
+				childDB.Unsafe().Create(child)
+				owner.Children = append(owner.Children, child)
+			}
+
+			if err := ownerDB.Unsafe().Flush(); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := range b.N {
+				child := &relationBenchChild{Value: graphChildren + iteration}
+				err := ownerDB.Transaction(func(tx *Tx[relationBenchOwner]) error {
+					owner, err := tx.Get(target.Id)
+					if err != nil {
+						return err
+					}
+
+					owner.Children = append(owner.Children, child)
+					return childDB.Join(tx).Create(child)
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkDialogTreeReparentBranch(b *testing.B) {
 	for _, nodes := range []int{50, 100} {
 		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
