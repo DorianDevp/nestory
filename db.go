@@ -270,9 +270,23 @@ func cloneSliceFields(value reflect.Value) {
 }
 
 func (db *DB[T]) logWrites(items []pendingWrite) error {
-	rec := walFrame{Rows: make([]walRow, 0, len(items))}
+	rows, err := db.encodeWrites(items)
+	if err != nil {
+		return err
+	}
+
+	return db.wal.appendFrame(walFrame{Rows: rows})
+}
+
+func (db *DB[T]) encodeWrites(items []pendingWrite) ([]walRow, error) {
+	rows := make([]walRow, 0, len(items))
 
 	for _, it := range items {
+		if it.deleted {
+			rows = append(rows, walRow{Id: -int64(it.id)})
+			continue
+		}
+
 		entity := *it.work.(*T)
 		row := reflect.ValueOf(entity)
 		if !db.directSchema {
@@ -281,11 +295,11 @@ func (db *DB[T]) logWrites(items []pendingWrite) error {
 
 		rowBytes, err := encodeRow(row)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		rec.Rows = append(rec.Rows, walRow{Id: int64(it.id), Row: rowBytes})
+		rows = append(rows, walRow{Id: int64(it.id), Row: rowBytes})
 	}
 
-	return db.wal.appendFrame(rec)
+	return rows, nil
 }

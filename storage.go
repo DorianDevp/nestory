@@ -85,6 +85,17 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 		return nil, werr
 	}
 
+	transactionRows, terr := replayTransactionWAL(
+		filepath.Join(DataDir, transactionWALName),
+		reflect.TypeFor[T]().Name(),
+		rowType,
+	)
+	if terr != nil {
+		return nil, terr
+	}
+
+	walRows = append(walRows, transactionRows...)
+
 	if err := applyRecoveredRows(store, creator, sliceType, walRows); err != nil {
 		return nil, err
 	}

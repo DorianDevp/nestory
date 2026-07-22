@@ -3,6 +3,7 @@ package nestory
 import (
 	"encoding/binary"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -268,6 +269,136 @@ type walTestEntity struct {
 }
 
 func (entity walTestEntity) GetId() int { return entity.Id }
+
+type walAtomicLeft struct {
+	Id   int
+	Name string
+}
+
+func (entity walAtomicLeft) GetId() int { return entity.Id }
+
+type walAtomicRight struct {
+	Id   int
+	Name string
+}
+
+func (entity walAtomicRight) GetId() int { return entity.Id }
+
+func TestTransactionWALReplaysAllTypesFromOneFrame(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[walAtomicLeft](); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Register[walAtomicRight](); err != nil {
+		t.Fatal(err)
+	}
+
+	leftDB := Open[walAtomicLeft]()
+	rightDB := Open[walAtomicRight]()
+	err := leftDB.Transaction(func(left *Tx[walAtomicLeft]) error {
+		if err := left.Create(&walAtomicLeft{Id: 1, Name: "left"}); err != nil {
+			return err
+		}
+
+		return rightDB.Join(left).Create(&walAtomicRight{Id: 2, Name: "right"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(DataDir, transactionWALName)); err != nil {
+		t.Fatalf("transaction WAL: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(DataDir, "walAtomicLeft", "wal.log")); !os.IsNotExist(err) {
+		t.Fatalf("left type WAL exists after multi-type commit: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(DataDir, "walAtomicRight", "wal.log")); !os.IsNotExist(err) {
+		t.Fatalf("right type WAL exists after multi-type commit: %v", err)
+	}
+
+	resetRegistries()
+	if err := Register[walAtomicLeft](); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Register[walAtomicRight](); err != nil {
+		t.Fatal(err)
+	}
+
+	left, err := Open[walAtomicLeft]().Get(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	right, err := Open[walAtomicRight]().Get(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if left.Name != "left" || right.Name != "right" {
+		t.Fatalf("replayed transaction = %#v, %#v", left, right)
+	}
+}
+
+func TestTransactionWALIgnoresEveryTypeInTornFrame(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	left := walAtomicLeft{Id: 1, Name: "left"}
+	right := walAtomicRight{Id: 2, Name: "right"}
+	leftRow, err := encodeRow(reflect.ValueOf(left))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rightRow, err := encodeRow(reflect.ValueOf(right))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err := encodeTransactionWALFrame(transactionWALFrame{Rows: []transactionWALRow{
+		{Type: reflect.TypeFor[walAtomicLeft]().Name(), walRow: walRow{Id: 1, Row: leftRow}},
+		{Type: reflect.TypeFor[walAtomicRight]().Name(), walRow: walRow{Id: 2, Row: rightRow}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(DataDir, transactionWALName), frame[:len(frame)-1], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resetRegistries()
+	if err := Register[walAtomicLeft](); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Register[walAtomicRight](); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := Open[walAtomicLeft]().Len(); got != 0 {
+		t.Fatalf("left rows after torn transaction = %d, want 0", got)
+	}
+
+	if got := Open[walAtomicRight]().Len(); got != 0 {
+		t.Fatalf("right rows after torn transaction = %d, want 0", got)
+	}
+}
 
 func TestComplexDirectSchemaWALSurvivesReload(t *testing.T) {
 	originalDir := DataDir
