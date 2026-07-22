@@ -43,12 +43,14 @@ type committer interface {
 	resourceVersion(id int) (int, bool)
 	applyWrite(id int, work any)
 	refreshSnapshot(id int, work any)
+	encodeWrites(items []pendingWrite) ([]walRow, error)
 	logWrites(items []pendingWrite) error
 }
 
 type pendingWrite struct {
-	id   int
-	work any
+	id      int
+	work    any
+	deleted bool
 }
 
 type createdResource struct {
@@ -368,16 +370,18 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	logStructuralCreate := structural && len(stagedDeletes) == 0 &&
+	durableDeletes := deleted
+	if durableDeletes == nil && len(stagedDeletes) > 0 {
+		durableDeletes = make(map[nodeKey]struct{}, len(stagedDeletes))
+		for key := range stagedDeletes {
+			durableDeletes[key] = struct{}{}
+		}
+	}
+
+	walBackedStructural := structural && len(stagedDeletes) == 0 &&
 		(indexDelta != nil || prepareStructuralCreateWAL(model, touchedResources, createdResources))
-	if !structural {
-		if err := logTransactionWrites(touchedResources); err != nil {
-			return err
-		}
-	} else if logStructuralCreate {
-		if err := logTransactionCreates(touchedResources, createdResources); err != nil {
-			return err
-		}
+	if err := logTransactionChanges(touchedResources, createdResources, durableDeletes); err != nil {
+		return err
 	}
 
 	for _, e := range touchedResources {
@@ -417,11 +421,15 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	applyDeletedNodes(deleted)
 	rewireRelations(relationRuntimes())
 
-	if structural && !logStructuralCreate {
+	if structural && !walBackedStructural {
 		for _, runtime := range relationRuntimes() {
 			if err := runtime.relationSave(); err != nil {
 				return err
 			}
+		}
+
+		if err := sharedTransactionWAL().truncate(); err != nil {
+			return err
 		}
 	}
 
@@ -640,51 +648,35 @@ func registeredRelationMatchFields() (map[reflect.Type]map[int]struct{}, error) 
 	return fields, nil
 }
 
-func logTransactionWrites(resources []touchedResource) error {
-	if len(resources) == 1 {
-		resource := resources[0]
-		write := [1]pendingWrite{{id: resource.id, work: resource.work}}
-
-		return committerFor(resource.dbName).logWrites(write[:])
-	}
-
-	var inline [4]pendingWrite
-	for start := 0; start < len(resources); {
-		end := start + 1
-		for end < len(resources) && resources[end].dbName == resources[start].dbName {
-			end++
-		}
-
-		count := end - start
-		var writes []pendingWrite
-		if count <= len(inline) {
-			writes = inline[:count]
-		} else {
-			writes = make([]pendingWrite, count)
-		}
-
-		for index, resource := range resources[start:end] {
-			writes[index] = pendingWrite{id: resource.id, work: resource.work}
-		}
-
-		if err := committerFor(resources[start].dbName).logWrites(writes); err != nil {
-			return err
-		}
-
-		start = end
-	}
-
-	return nil
-}
-
-func logTransactionCreates(resources []touchedResource, creates map[nodeKey]createdResource) error {
+func logTransactionChanges(
+	resources []touchedResource,
+	creates map[nodeKey]createdResource,
+	deletes map[nodeKey]struct{},
+) error {
 	byDBName := make(map[string][]pendingWrite)
 	for _, resource := range resources {
+		runtime := baseRegistry[resource.dbName].(relationRuntime)
+		if _, removed := deletes[nodeKey{typ: runtime.relationType(), id: resource.id}]; removed {
+			continue
+		}
+
 		byDBName[resource.dbName] = append(byDBName[resource.dbName], pendingWrite{id: resource.id, work: resource.work})
 	}
 
 	for key, created := range creates {
+		if _, removed := deletes[key]; removed {
+			continue
+		}
+
 		byDBName[key.typ.Name()] = append(byDBName[key.typ.Name()], pendingWrite{id: key.id, work: created.work.Interface()})
+	}
+
+	for key := range deletes {
+		if _, created := creates[key]; created {
+			continue
+		}
+
+		byDBName[key.typ.Name()] = append(byDBName[key.typ.Name()], pendingWrite{id: key.id, deleted: true})
 	}
 
 	dbNames := make([]string, 0, len(byDBName))
@@ -693,13 +685,23 @@ func logTransactionCreates(resources []touchedResource, creates map[nodeKey]crea
 	}
 
 	sort.Strings(dbNames)
+	if len(dbNames) == 1 {
+		return committerFor(dbNames[0]).logWrites(byDBName[dbNames[0]])
+	}
+
+	frame := transactionWALFrame{}
 	for _, dbName := range dbNames {
-		if err := committerFor(dbName).logWrites(byDBName[dbName]); err != nil {
+		rows, err := committerFor(dbName).encodeWrites(byDBName[dbName])
+		if err != nil {
 			return err
+		}
+
+		for _, row := range rows {
+			frame.Rows = append(frame.Rows, transactionWALRow{Type: dbName, walRow: row})
 		}
 	}
 
-	return nil
+	return sharedTransactionWAL().appendFrame(frame)
 }
 
 func prepareStructuralCreateWAL(model *relationModel, resources []touchedResource, creates map[nodeKey]createdResource) bool {

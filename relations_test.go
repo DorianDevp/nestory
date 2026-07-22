@@ -389,6 +389,7 @@ type rtIndexedHolder struct {
 func (v rtIndexedHolder) GetId() int { return v.Id }
 
 func resetRegistries() {
+	resetSharedTransactionWAL()
 	storeRegistry = make(map[string]any)
 	baseRegistry = make(map[string]any)
 	engine = newEngine()

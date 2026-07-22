@@ -1399,6 +1399,10 @@ func flushRelations() error {
 		}
 	}
 
+	if err := sharedTransactionWAL().truncate(); err != nil {
+		return err
+	}
+
 	for _, runtime := range runtimes {
 		runtime.relationClearQueues()
 	}
@@ -1489,6 +1493,10 @@ func flushWithoutRelations(runtimes []relationRuntime) error {
 		if err := runtime.relationSave(); err != nil {
 			return err
 		}
+	}
+
+	if err := sharedTransactionWAL().truncate(); err != nil {
+		return err
 	}
 
 	for _, runtime := range runtimes {

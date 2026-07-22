@@ -27,6 +27,15 @@ type walFrame struct {
 	Rows []walRow
 }
 
+type transactionWALRow struct {
+	Type string
+	walRow
+}
+
+type transactionWALFrame struct {
+	Rows []transactionWALRow
+}
+
 type wal struct {
 	mu   sync.Mutex
 	path string
@@ -88,6 +97,39 @@ func encodeWALFrame(rec walFrame) ([]byte, error) {
 		binary.BigEndian.PutUint32(frame[offset+8:], uint32(len(row.Row)))
 		copy(frame[offset+rowHeader:], row.Row)
 		offset += rowHeader + len(row.Row)
+	}
+
+	return frame, nil
+}
+
+func encodeTransactionWALFrame(rec transactionWALFrame) ([]byte, error) {
+	const (
+		frameHeader = 4
+		rowHeader   = 16
+		maxUint32   = uint64(^uint32(0))
+	)
+
+	bodySize := uint64(frameHeader)
+	for _, row := range rec.Rows {
+		bodySize += rowHeader + uint64(len(row.Type)) + uint64(len(row.Row))
+	}
+
+	if bodySize > maxUint32 || uint64(len(rec.Rows)) > maxUint32 {
+		return nil, fmt.Errorf("nestory: transaction WAL frame is too large")
+	}
+
+	frame := make([]byte, frameHeader+int(bodySize))
+	binary.BigEndian.PutUint32(frame, uint32(bodySize))
+	binary.BigEndian.PutUint32(frame[frameHeader:], uint32(len(rec.Rows)))
+
+	offset := frameHeader * 2
+	for _, row := range rec.Rows {
+		binary.BigEndian.PutUint32(frame[offset:], uint32(len(row.Type)))
+		binary.BigEndian.PutUint64(frame[offset+4:], uint64(row.Id))
+		binary.BigEndian.PutUint32(frame[offset+12:], uint32(len(row.Row)))
+		copy(frame[offset+rowHeader:], row.Type)
+		copy(frame[offset+rowHeader+len(row.Type):], row.Row)
+		offset += rowHeader + len(row.Type) + len(row.Row)
 	}
 
 	return frame, nil
@@ -200,6 +242,44 @@ func decodeWALFrame(body []byte) ([]walRow, bool) {
 		}
 
 		rows = append(rows, walRow{Id: id, Row: body[offset : offset+rowSize]})
+		offset += rowSize
+	}
+
+	return rows, offset == len(body)
+}
+
+func decodeTransactionWALFrame(body []byte) ([]transactionWALRow, bool) {
+	const rowHeader = 16
+	if len(body) < 4 {
+		return nil, false
+	}
+
+	count := int(binary.BigEndian.Uint32(body))
+	if count > (len(body)-4)/rowHeader {
+		return nil, false
+	}
+
+	rows := make([]transactionWALRow, 0, count)
+	offset := 4
+	for range count {
+		if len(body)-offset < rowHeader {
+			return nil, false
+		}
+
+		typeSize := int(binary.BigEndian.Uint32(body[offset:]))
+		id := int64(binary.BigEndian.Uint64(body[offset+4:]))
+		rowSize := int(binary.BigEndian.Uint32(body[offset+12:]))
+		offset += rowHeader
+		if typeSize > len(body)-offset || rowSize > len(body)-offset-typeSize {
+			return nil, false
+		}
+
+		typeName := string(body[offset : offset+typeSize])
+		offset += typeSize
+		rows = append(rows, transactionWALRow{
+			Type:   typeName,
+			walRow: walRow{Id: id, Row: body[offset : offset+rowSize]},
+		})
 		offset += rowSize
 	}
 
