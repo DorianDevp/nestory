@@ -360,6 +360,12 @@ func scalarValueSize(value reflect.Value) (int, bool) {
 		}
 
 		return 4 + value.Len(), true
+	case reflect.Slice:
+		if value.Type().Elem().Kind() != reflect.Uint8 || value.Len() >= math.MaxUint32 {
+			return 0, false
+		}
+
+		return 4 + value.Len(), true
 	case reflect.Array:
 		return scalarAggregateSize(value.Len(), value.Index)
 	case reflect.Struct:
@@ -414,6 +420,16 @@ func encodeScalarValue(out []byte, value reflect.Value) int {
 		text := value.String()
 		binary.BigEndian.PutUint32(out, uint32(len(text)))
 		return 4 + copy(out[4:], text)
+	case reflect.Slice:
+		if value.IsNil() {
+			binary.BigEndian.PutUint32(out, 0)
+
+			return 4
+		}
+
+		binary.BigEndian.PutUint32(out, uint32(value.Len()+1))
+
+		return 4 + copy(out[4:], value.Bytes())
 	case reflect.Array:
 		return encodeScalarAggregate(out, value.Len(), value.Index)
 	case reflect.Struct:
@@ -486,6 +502,28 @@ func decodeScalarValue(data []byte, value reflect.Value) (int, error) {
 		}
 
 		value.SetString(string(data[4 : 4+size]))
+		return 4 + size, nil
+	case reflect.Slice:
+		if len(data) < 4 || value.Type().Elem().Kind() != reflect.Uint8 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		encodedSize := binary.BigEndian.Uint32(data)
+		if encodedSize == 0 {
+			value.SetZero()
+
+			return 4, nil
+		}
+
+		size := int(encodedSize - 1)
+		if size > len(data)-4 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		decoded := reflect.MakeSlice(value.Type(), size, size)
+		reflect.Copy(decoded, reflect.ValueOf(data[4:4+size]))
+		value.Set(decoded)
+
 		return 4 + size, nil
 	case reflect.Array:
 		return decodeScalarAggregate(data, value.Len(), value.Index)
