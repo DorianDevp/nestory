@@ -102,6 +102,34 @@ func TestConcurrentRelationlessCreateRejectsDuplicateID(t *testing.T) {
 	}
 }
 
+func TestFindOneByScansNonIndexedField(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[walTestEntity](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[walTestEntity]()
+	if err := db.Create(&walTestEntity{Name: "needle"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entity, err := db.FindOneBy("Name", "needle")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if entity.Name != "needle" {
+		t.Fatalf("entity = %#v", entity)
+	}
+}
+
 func assertCompletesWhileGraphLocked(t *testing.T, action func() error) {
 	t.Helper()
 	graphMu.Lock()

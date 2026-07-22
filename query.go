@@ -24,6 +24,9 @@ func (db *DB[T]) FindOneBy(field string, value any) (*T, error) {
 }
 
 func (db *DB[T]) findID(field string, value any) (int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	if index := db.index[field]; index != nil {
 		entity, found := index[value]
 		if !found {
