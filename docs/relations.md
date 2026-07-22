@@ -20,19 +20,80 @@ Register every related type before opening any of them. Schema rules are
 checked during `Register`; instance rules and delete effects are checked against
 the final state of every safe commit and unsafe `Flush`.
 
-## The ownership forest
+## Why relations are lifetime contracts
 
-The graph has two layers:
+An ORM sits between two independently designed representations: the object
+model and the database schema. Mapping values is only the obvious part of its
+job. It must also translate what each representation means. Which side stores
+the association? Is the foreign key nullable? Does deleting one row cascade,
+set null, remove an orphan, or fail? Which constraints exist only in the
+database?
 
-1. `own` and `ownedby` form the ownership forest. Every node has at most one
-   owner and ownership cannot cycle. This is the lifecycle backbone: deleting
-   an owner deletes the complete subtree it owns.
-2. `borrow`, `option`, and `inverse` form a free reference graph over that
-   forest. These edges can be shared, point in either direction, and cycle.
+A fully explicit ORM mapping answers those questions with separate options for
+nullability, cascade behavior, owning side, foreign keys, and constraints. The
+result is accurate but verbose. A shorter mapping has the opposite problem: it
+leaves part of the contract in conventions or in a schema that must be
+inspected separately. With real pointers this gap is especially dangerous,
+because an object can still point at a resource whose database lifetime was
+described somewhere else.
 
-The forest is intentionally strict. It makes cascade deletion a bounded subtree
-walk and prevents shared owned subtrees. There is no orphan sweep or reference-
-counted lifetime.
+Nestory does not translate an object model into an external database model. It
+is both the object representation and the database, so it can choose one
+coherent contract instead of reproducing a collection of SQL and ORM switches.
+The Go field already states cardinality. A relation tag therefore answers the
+questions that the field type cannot answer:
+
+1. May this reference disappear while the holder remains alive?
+2. Who controls the lifetime of the referenced value?
+
+This is why Nestory relations describe **how values may exist over time**, not
+how a join should be configured.
+
+## The mental model
+
+The vocabulary is inspired by Rust's explicit ownership and borrowing model.
+Nestory does not implement Rust semantics or a compile-time borrow checker; Go
+cannot prove these rules statically. It adopts the useful part of that model as
+a runtime database contract:
+
+- `own` says that the target belongs to the holder's lifetime. The holder may
+  replace it, and deleting the holder deletes what it owns.
+- `borrow` says that the holder needs somebody else's value to stay alive. A
+  surviving borrower therefore prevents that value from being deleted.
+- `option` says that the reference makes no lifetime promise. The target may
+  disappear, in which case the reference becomes nil or drops from the slice.
+- `ownedby` names the same ownership edge from the owned value when backward
+  navigation is useful.
+- `inverse` is only a computed navigation view. It derives from `borrow` or
+  `option` and introduces no new lifetime rule.
+
+The role combines facts that would otherwise be spread across nullable,
+cascade, orphan-removal, and association settings. In particular, Nestory's
+`own` is stronger than an ORM's technical “owning side”: it is authority over a
+resource's lifecycle.
+
+For a to-one field, `own`, `ownedby`, and `borrow` are required contracts. The
+pointer cannot be nil while its holder survives. `option` is the explicit
+nullable contract. The same lifecycle vocabulary extends to collections, where
+an empty slice remains valid.
+
+Nestory validates the model at the boundaries where it can know the complete
+truth: structural rules at `Register`, and value lifetimes against the final
+state of a commit or unsafe `Flush`.
+
+## The ownership forest is a consequence
+
+If a value has at most one owner and ownership cannot cycle, all `own` and
+`ownedby` edges necessarily form a forest. This is not a separate project layer
+and users do not build a “forest graph” beside a “reference graph.” It is the
+mathematical shape produced by the ownership contract.
+
+That shape gives cascade deletion a precise meaning: deleting an owner deletes
+its complete ownership subtree, with no shared owned node, double delete,
+or orphan sweep. References that do not own values may freely cross ownership
+boundaries, be shared, point in either direction, and form cycles. Their role
+still determines the outcome: `borrow` vetoes deletion while its holder
+survives, and `option` yields to deletion.
 
 ## Roles
 

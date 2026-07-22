@@ -55,8 +55,8 @@ err := users.View(user.Id, func(user *User) error {
 - Detached branches and optimistic transactions for safe edits.
 - Zero-copy callback reads with `View`, `ViewMany`, and `ViewRange`.
 - Durable unique and ordered composite indexes.
-- A strict ownership forest with cascade delete, borrow vetoes, optional
-  references, and computed inverse views.
+- A value-lifetime model that derives cascade delete, borrow vetoes, optional
+  references, and computed inverse views from explicit ownership roles.
 - WAL-backed commits, including one crash-atomic frame for transactions that
   touch multiple entity types.
 - An explicitly unsafe live-pointer API for exclusive, allocation-sensitive
