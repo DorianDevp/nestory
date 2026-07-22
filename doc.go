@@ -5,6 +5,8 @@
 // Tags:
 //
 //	key:"primary"          int Id field (required).
+//	key:"unique"           unique scalar secondary index.
+//	index:"name,1,unique"  ordered/composite index field and position.
 //	rel:"own,Id"           required owning pointer.
 //	rel:"borrow,Id"        required non-owning pointer with delete veto.
 //	rel:"option,Id"        nullable non-owning pointer.

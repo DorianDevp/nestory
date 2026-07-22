@@ -30,12 +30,12 @@ type DB[T Entity] struct {
 	store        *chunkStore[T]
 	persistQueue []*T
 	deleteQueue  []*T
-	indices      indexMap[[]*T] // o2m index (not populated yet)
-	index        indexMap[*T]   // o2o index, keyed by field then value
+	index        indexMap[*T] // o2o index, keyed by field then value
+	secondary    map[string]*secondaryIndex[T]
 	schemaFields [][2]string
 	directSchema bool
 	mu           sync.RWMutex
-	structureMu  sync.Mutex
+	structureMu  sync.RWMutex
 	resById      map[int]*resourceSlot[T] // id → stable resourceSlot slot
 	wal          *wal                     // durability log for commits
 	snapshotMu   sync.Mutex
@@ -80,6 +80,10 @@ func Register[T Entity]() error {
 		return err
 	}
 
+	if _, err := secondaryIndexSpecs(t); err != nil {
+		return err
+	}
+
 	store, err := loadStore[T]()
 	if err != nil {
 		return err
@@ -104,7 +108,6 @@ func Open[T Entity]() *DB[T] {
 	initBase := &DB[T]{identifier: "Id"}
 
 	initBase.name = name
-	initBase.indices = make(indexMap[[]*T])
 	initBase.index = make(indexMap[*T])
 	initBase.resById = make(map[int]*resourceSlot[T])
 	initBase.snapshots = make(map[*T]detachedRoot[T])
@@ -128,7 +131,10 @@ func Open[T Entity]() *DB[T] {
 
 	initBase.fillRelation()
 	initBase.initIndices()
-	initBase.syncIdIndex()
+	if err := initBase.syncIndices(); err != nil {
+		panic(err)
+	}
+
 	initBase.syncResById()
 	initBase.seedCounter()
 
