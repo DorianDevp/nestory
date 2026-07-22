@@ -71,13 +71,19 @@ results.
 
 | operation | 1,000 rows | 10,000 rows | 100,000 rows |
 |---|---:|---:|---:|
-| indexed batch create | 2.53 ms | 28.7 ms | 384 ms |
-| indexed batch delete | 2.13 ms | 22.4 ms | 305 ms |
+| indexed batch create | 2.55 ms | 29.2 ms | 362 ms |
+| indexed batch delete | 2.44 ms | 24.6 ms | 278 ms |
 
 Batch index maintenance filters removals in one pass and sort-merges additions.
 Before that path, the same 100,000-row create and delete samples took 1.26 s and
 1.27 s because every row shifted the sorted index separately: the batch path is
-about 3.3× and 4.2× faster respectively.
+about 3.5× and 4.6× faster respectively.
+
+Index ordering for a pure-create batch is prepared outside the database mutex
+and published after the rows are live. In a diagnostic with 100,000 existing
+rows and a concurrent 50,000-row hydration, a stable single-field lookup
+measured 367 ns p50, 1.89 µs p95, and 3.43 µs p99 inside Nestory. This isolates
+engine lock latency; a sidecar still adds scheduling and protocol overhead.
 
 An indexed delta cursor changes the amount of work more fundamentally. On a
 100,000-row `(SessionID, Seq)` index:

@@ -149,7 +149,8 @@ maintained with each safe commit.
 Large safe transactions update ordered indexes in batches. Removed rows are
 filtered in one pass; additions are sorted and merged with the surviving index.
 This keeps bulk hydration and eviction from repeatedly shifting the same index
-slice.
+slice. A pure-create batch prepares the ordered slices before taking the short
+publication lock, so existing point lookups do not wait for sorting or merging.
 
 Live changes made through `Unsafe` bypass incremental index maintenance.
 `Unsafe().Flush` validates uniqueness and rebuilds affected index state before
