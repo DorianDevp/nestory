@@ -136,6 +136,11 @@ description of an ownership edge.
 - Transactional commits are durable via a per-type write-ahead log: append one
   fsynced frame, then mutate memory. `Open` replays the log over the snapshots;
   `Flush` compacts the chunks and truncates the log.
+- The committed relation graph keeps ordered field targets, incoming reference
+  counts, owners, and children in persistent indexes. A relation-only commit
+  validates and publishes a local delta under the graph write lock, then rewires
+  only changed fields and inverse targets. Creates, deletes, and relation-key
+  changes deliberately fall back to a complete rebuild.
 
 ## Architecture: the ownership forest
 

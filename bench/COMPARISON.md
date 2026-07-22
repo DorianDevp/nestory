@@ -104,15 +104,31 @@ two parents directly by ID.
 | operation | 100 total nodes | 1,000 total nodes | 10,000 total nodes |
 |---|---:|---:|---:|
 | scalar write | 5.24 µs | 5.30 µs | 5.23 µs |
-| reparent subtree | 130 µs | 1.21 ms | 12.25 ms |
+| reparent subtree, before indexes | 130 µs | 1.21 ms | 12.25 ms |
+| reparent subtree, indexed | 27.1 µs | 40.9 µs | 20.0 µs |
 
-The scalar control stays flat, proving that ID-targeted access already avoids
-copying unrelated ownership branches. Structural mutation remains linear in
-the complete registered graph: the current transaction model copies global
-node/owner/reference indexes and relation rewiring scans every live relation
-store. Persistent relation indexes and targeted rewiring therefore take
-priority over transparent object-level copy-on-write, which ordinary mutable
-Go pointers cannot intercept without changing Nestory's struct-first API.
+The scalar control stays flat, proving that ID-targeted access avoids copying
+unrelated ownership branches. Persistent ordered relation indexes now make the
+structural result independent of total graph size too: the same local reparent is
+about 4.8×, 30×, and 612× faster at 100, 1,000, and 10,000 nodes respectively.
+The non-monotonic default-GC numbers come from a fixed 10 KB/107 allocations per
+transaction interacting with different live-heap sizes; a diagnostic run with
+GC disabled measured 19.5–19.7 µs at all three sizes. Allocation reduction is
+therefore the remaining constant-factor opportunity, not a hidden graph scan.
+
+Relation-only commits still validate while holding the graph write lock. To
+measure its user-visible consequence, a second benchmark continuously reparents
+the branch while another goroutine performs scalar `UpdateWithin` calls:
+
+| total nodes | scalar p50 | scalar p95 | scalar p99 |
+|---:|---:|---:|---:|
+| 100 | 63–67 µs | 84–86 µs | 163–178 µs |
+| 10,000 | 51–59 µs | 74–78 µs | 93–100 µs |
+
+This intentionally keeps a structural writer pending almost continuously. Even
+under that pressure, scalar tail latency stays below 0.2 ms rather than inheriting
+the old multi-millisecond global scan. Moving validation outside the write lock
+with a graph-generation OCC check is therefore not justified by this result.
 
 ## Full scan + filter — time per scan (lower = better)
 
@@ -154,9 +170,9 @@ because every value is gob-decoded on read — inherent to a KV store of blobs.)
 
 For its niche — an in-RAM, pointer-native graph with WAL durability — nestory is
 the fastest measured engine on flat reads, scans, durable point writes and
-durable bulk inserts in this harness. Structural graph mutation now avoids a
-global reflective validation pass; detached branch copying remains its main
-size-dependent cost.
+durable bulk inserts in this harness. ID-targeted structural graph mutation now
+avoids both global validation and global rewiring; detached branch copying
+remains size-dependent only when the caller chooses a large ownership root.
 
 ## Reproduce
 
