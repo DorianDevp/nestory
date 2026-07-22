@@ -109,7 +109,8 @@ relation maintenance.
 - `Get` creates a mutable detached ownership branch.
 - `View` read-locks and exposes the stable live ownership branch.
 - `ViewMany` locks selected rows in ID order.
-- `ViewRange` resolves an ordered secondary-index prefix and locks those rows.
+- `ViewRange` resolves an ordered secondary-index prefix and locks those rows;
+  `ViewRangeAfter` starts after an exclusive cursor for incremental consumers.
 - `Unsafe.Get` exposes the live pointer without locks or copies.
 
 The benchmark report measures these paths separately because they provide

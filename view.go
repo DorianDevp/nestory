@@ -110,6 +110,32 @@ func (db *DB[T]) ViewRange(indexName string, prefix []any, fn func([]*T) error) 
 		return fmt.Errorf("nestory: ViewRange requires a callback")
 	}
 
+	return db.viewRange(indexName, prefix, nil, false, fn)
+}
+
+// ViewRangeAfter visits the part of an ordered index prefix whose next index
+// field is strictly greater than after. For an index on (SessionID, Seq), a
+// prefix containing SessionID and an after Seq form an efficient delta cursor.
+func (db *DB[T]) ViewRangeAfter(
+	indexName string,
+	prefix []any,
+	after any,
+	fn func([]*T) error,
+) error {
+	if fn == nil {
+		return fmt.Errorf("nestory: ViewRangeAfter requires a callback")
+	}
+
+	return db.viewRange(indexName, prefix, after, true, fn)
+}
+
+func (db *DB[T]) viewRange(
+	indexName string,
+	prefix []any,
+	after any,
+	hasCursor bool,
+	fn func([]*T) error,
+) error {
 	participant := relationGraphParticipant(reflect.TypeFor[T]())
 	if participant {
 		graphMu.RLock()
@@ -126,7 +152,14 @@ func (db *DB[T]) ViewRange(indexName string, prefix []any, fn func([]*T) error) 
 		return fmt.Errorf("nestory: index %q does not exist", indexName)
 	}
 
-	entries, err := index.rangePrefix(prefix)
+	var entries []*T
+	var err error
+	if hasCursor {
+		entries, err = index.rangeAfter(prefix, after)
+	} else {
+		entries, err = index.rangePrefix(prefix)
+	}
+
 	if err != nil {
 		db.mu.RUnlock()
 

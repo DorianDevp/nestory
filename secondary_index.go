@@ -16,6 +16,8 @@ import (
 
 var ErrUniqueViolation = errors.New("nestory: unique index violation")
 
+const secondaryIndexBatchThreshold = 64
+
 type secondaryIndexField struct {
 	name  string
 	index int
@@ -361,10 +363,34 @@ func (db *DB[T]) prepareIndexes(items []pendingWrite) {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if len(items) >= secondaryIndexBatchThreshold {
+		db.prepareIndexBatch(items)
+
+		return
+	}
+
 	for _, item := range items {
 		if resource, found := db.resById[item.id]; found {
 			db.removeSecondaryIndices(resource.item)
 		}
+	}
+}
+
+func (db *DB[T]) prepareIndexBatch(items []pendingWrite) {
+	changed := make(map[int]struct{}, len(items))
+	for _, item := range items {
+		changed[item.id] = struct{}{}
+		if resource, found := db.resById[item.id]; found {
+			db.removeSecondaryIndexLookups(resource.item)
+		}
+	}
+
+	for _, index := range db.secondary {
+		index.entries = slices.DeleteFunc(index.entries, func(entity *T) bool {
+			_, remove := changed[(*entity).GetId()]
+
+			return remove
+		})
 	}
 }
 
@@ -375,6 +401,12 @@ func (db *DB[T]) finishIndexes(items []pendingWrite) {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if len(items) >= secondaryIndexBatchThreshold {
+		db.finishIndexBatch(items)
+
+		return
+	}
+
 	for _, item := range items {
 		if item.deleted {
 			continue
@@ -386,18 +418,62 @@ func (db *DB[T]) finishIndexes(items []pendingWrite) {
 	}
 }
 
+func (db *DB[T]) finishIndexBatch(items []pendingWrite) {
+	additions := make([]*T, 0, len(items))
+	for _, item := range items {
+		if item.deleted {
+			continue
+		}
+
+		resource, found := db.resById[item.id]
+		if !found {
+			continue
+		}
+
+		additions = append(additions, resource.item)
+		db.addSecondaryIndexLookups(resource.item)
+	}
+
+	for _, index := range db.secondary {
+		ordered := append([]*T(nil), additions...)
+		slices.SortFunc(ordered, index.compare)
+		index.entries = mergeSecondaryIndexEntries(index, ordered)
+	}
+}
+
+func mergeSecondaryIndexEntries[T Entity](index *secondaryIndex[T], additions []*T) []*T {
+	if len(additions) == 0 {
+		return index.entries
+	}
+
+	if len(index.entries) == 0 {
+		return additions
+	}
+
+	merged := make([]*T, 0, len(index.entries)+len(additions))
+	existingPosition := 0
+	additionPosition := 0
+	for existingPosition < len(index.entries) && additionPosition < len(additions) {
+		if index.compare(index.entries[existingPosition], additions[additionPosition]) <= 0 {
+			merged = append(merged, index.entries[existingPosition])
+			existingPosition++
+			continue
+		}
+
+		merged = append(merged, additions[additionPosition])
+		additionPosition++
+	}
+
+	merged = append(merged, index.entries[existingPosition:]...)
+	merged = append(merged, additions[additionPosition:]...)
+
+	return merged
+}
+
 func (db *DB[T]) removeSecondaryIndices(entity *T) {
+	db.removeSecondaryIndexLookups(entity)
 	for _, index := range db.secondary {
 		id := (*entity).GetId()
-		if index.spec.unique {
-			delete(index.keys, index.key(entity))
-		}
-
-		if index.spec.lookupField != "" {
-			value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index).Interface()
-			delete(db.index[index.spec.lookupField], value)
-		}
-
 		position := sort.Search(len(index.entries), func(position int) bool {
 			return index.compare(index.entries[position], entity) >= 0
 		})
@@ -412,7 +488,30 @@ func (db *DB[T]) removeSecondaryIndices(entity *T) {
 	}
 }
 
+func (db *DB[T]) removeSecondaryIndexLookups(entity *T) {
+	for _, index := range db.secondary {
+		if index.spec.unique {
+			delete(index.keys, index.key(entity))
+		}
+
+		if index.spec.lookupField != "" {
+			value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index).Interface()
+			delete(db.index[index.spec.lookupField], value)
+		}
+	}
+}
+
 func (db *DB[T]) addSecondaryIndices(entity *T) {
+	db.addSecondaryIndexLookups(entity)
+	for _, index := range db.secondary {
+		position := sort.Search(len(index.entries), func(position int) bool {
+			return index.compare(index.entries[position], entity) >= 0
+		})
+		index.entries = slices.Insert(index.entries, position, entity)
+	}
+}
+
+func (db *DB[T]) addSecondaryIndexLookups(entity *T) {
 	for _, index := range db.secondary {
 		if index.spec.unique {
 			index.keys[index.key(entity)] = (*entity).GetId()
@@ -422,34 +521,61 @@ func (db *DB[T]) addSecondaryIndices(entity *T) {
 			value := reflect.ValueOf(*entity).Field(index.spec.fields[0].index).Interface()
 			db.index[index.spec.lookupField][value] = entity
 		}
-
-		position := sort.Search(len(index.entries), func(position int) bool {
-			return index.compare(index.entries[position], entity) >= 0
-		})
-		index.entries = slices.Insert(index.entries, position, entity)
 	}
 }
 
 func (index *secondaryIndex[T]) rangePrefix(prefix []any) ([]*T, error) {
+	start, end, err := index.prefixBounds(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	return index.entries[start:end], nil
+}
+
+func (index *secondaryIndex[T]) rangeAfter(prefix []any, after any) ([]*T, error) {
+	if len(prefix) >= len(index.spec.fields) {
+		return nil, fmt.Errorf(
+			"nestory: index %s has no cursor field after a %d-value prefix",
+			index.spec.name,
+			len(prefix),
+		)
+	}
+
+	cursor, err := index.indexValue(after, len(prefix), "cursor")
+	if err != nil {
+		return nil, err
+	}
+
+	start, end, err := index.prefixBounds(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	field := index.spec.fields[len(prefix)]
+	offset := sort.Search(end-start, func(position int) bool {
+		row := reflect.ValueOf(*index.entries[start+position])
+
+		return compareIndexValues(row.Field(field.index), cursor) > 0
+	})
+
+	return index.entries[start+offset : end], nil
+}
+
+func (index *secondaryIndex[T]) prefixBounds(prefix []any) (int, int, error) {
 	if len(prefix) > len(index.spec.fields) {
-		return nil, fmt.Errorf("nestory: index %s accepts at most %d prefix values", index.spec.name, len(index.spec.fields))
+		return 0, 0, fmt.Errorf(
+			"nestory: index %s accepts at most %d prefix values",
+			index.spec.name,
+			len(index.spec.fields),
+		)
 	}
 
 	values := make([]reflect.Value, len(prefix))
 	for position, raw := range prefix {
-		if raw == nil {
-			return nil, fmt.Errorf("nestory: index %s prefix %d is nil", index.spec.name, position)
-		}
-
-		value := reflect.ValueOf(raw)
-		if value.Type() != index.spec.fields[position].typ {
-			return nil, fmt.Errorf(
-				"nestory: index %s prefix %d has type %s, want %s",
-				index.spec.name,
-				position,
-				value.Type(),
-				index.spec.fields[position].typ,
-			)
+		value, err := index.indexValue(raw, position, "prefix")
+		if err != nil {
+			return 0, 0, err
 		}
 
 		values[position] = value
@@ -472,5 +598,26 @@ func (index *secondaryIndex[T]) rangePrefix(prefix []any) ([]*T, error) {
 		return comparePrefix(index.entries[position]) > 0
 	})
 
-	return index.entries[start:end], nil
+	return start, end, nil
+}
+
+func (index *secondaryIndex[T]) indexValue(raw any, position int, label string) (reflect.Value, error) {
+	if raw == nil {
+		return reflect.Value{}, fmt.Errorf("nestory: index %s %s %d is nil", index.spec.name, label, position)
+	}
+
+	value := reflect.ValueOf(raw)
+	want := index.spec.fields[position].typ
+	if value.Type() != want {
+		return reflect.Value{}, fmt.Errorf(
+			"nestory: index %s %s %d has type %s, want %s",
+			index.spec.name,
+			label,
+			position,
+			value.Type(),
+			want,
+		)
+	}
+
+	return value, nil
 }

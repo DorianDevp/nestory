@@ -61,6 +61,38 @@ non-durable MVCC batch is slower.
 for the callback without copying. `Unsafe.Get` is the exclusive-access floor;
 detached `Get` pays for a mutable branch copy.
 
+## Ordered hot-history operations
+
+This in-package diagnostic models the flat append log used by the OpenCode
+experiment: a unique message ID plus a unique ordered `(SessionID, Seq)` index.
+Create and delete are one durable transaction per complete batch. These are
+single `benchtime=1x` samples intended to expose scaling, not cross-engine
+results.
+
+| operation | 1,000 rows | 10,000 rows | 100,000 rows |
+|---|---:|---:|---:|
+| indexed batch create | 2.53 ms | 28.7 ms | 384 ms |
+| indexed batch delete | 2.13 ms | 22.4 ms | 305 ms |
+
+Batch index maintenance filters removals in one pass and sort-merges additions.
+Before that path, the same 100,000-row create and delete samples took 1.26 s and
+1.27 s because every row shifted the sorted index separately: the batch path is
+about 3.3× and 4.2× faster respectively.
+
+An indexed delta cursor changes the amount of work more fundamentally. On a
+100,000-row `(SessionID, Seq)` index:
+
+| safe view | time/op | bytes/op | allocs/op |
+|---|---:|---:|---:|
+| complete session | 14.37 ms | 2,408,448 | 3 |
+| 10 rows after `Seq=99,990` | 1.08 µs | 240 | 3 |
+
+Both paths return read-locked live pointers. The delta result measures only
+Nestory's index lookup and row locking; it does not include an application
+protocol, JSON encoding, or consumer-side schema decoding. A sidecar benefits
+only if its client retains a validated snapshot and transfers the delta instead
+of requesting the complete context again.
+
 ## Durable point write — µs/op (lower = better)
 
 | engine | n=100 | n=1,000 | n=10,000 | allocs/op at 10k |

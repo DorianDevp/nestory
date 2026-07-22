@@ -369,3 +369,319 @@ func TestDeleteByIndexPersistsAsOneTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSecondaryIndexBatchMaintainsOrderAndLookups(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[indexedMessage](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[indexedMessage]()
+	messages := make([]*indexedMessage, 128)
+	if err := db.Transaction(func(tx *Tx[indexedMessage]) error {
+		for index := range messages {
+			sequence := len(messages) - index
+			message := &indexedMessage{
+				MessageID: "batch-" + strconv.Itoa(sequence),
+				SessionID: "session",
+				Seq:       sequence,
+			}
+			messages[index] = message
+			if err := tx.Create(message); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertIndexedSequence(t, db, "session", 1, 128)
+	if _, err := db.FindOneBy("MessageID", "batch-64"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Transaction(func(tx *Tx[indexedMessage]) error {
+		for index, message := range messages {
+			if index%2 == 0 {
+				if err := tx.Delete(message.Id); err != nil {
+					return err
+				}
+
+				continue
+			}
+
+			updated, err := tx.Get(message.Id)
+			if err != nil {
+				return err
+			}
+
+			updated.MessageID = "updated-" + strconv.Itoa(updated.Seq)
+			updated.Seq += 1_000
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var sequences []int
+	if err := db.ViewRange("session_seq", []any{"session"}, func(entries []*indexedMessage) error {
+		for _, entry := range entries {
+			sequences = append(sequences, entry.Seq)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sequences) != 64 {
+		t.Fatalf("remaining rows = %d, want 64", len(sequences))
+	}
+
+	for index, sequence := range sequences {
+		if index > 0 && sequence <= sequences[index-1] {
+			t.Fatalf("sequence is not ordered: %v", sequences)
+		}
+
+		if _, err := db.FindOneBy("MessageID", "updated-"+strconv.Itoa(sequence-1_000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestViewRangeAfterUsesNextCompositeField(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[indexedMessage](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[indexedMessage]()
+	if err := db.Transaction(func(tx *Tx[indexedMessage]) error {
+		for sequence := 1; sequence <= 5; sequence++ {
+			if err := tx.Create(&indexedMessage{
+				MessageID: "s1-" + strconv.Itoa(sequence), SessionID: "s1", Seq: sequence,
+			}); err != nil {
+				return err
+			}
+
+			if err := tx.Create(&indexedMessage{
+				MessageID: "s2-" + strconv.Itoa(sequence), SessionID: "s2", Seq: sequence,
+			}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var sequences []int
+	if err := db.ViewRangeAfter("session_seq", []any{"s1"}, 2, func(entries []*indexedMessage) error {
+		for _, entry := range entries {
+			sequences = append(sequences, entry.Seq)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(sequences, []int{3, 4, 5}) {
+		t.Fatalf("sequence after cursor = %v, want [3 4 5]", sequences)
+	}
+
+	if err := db.ViewRangeAfter("session_seq", []any{"s1"}, "2", func([]*indexedMessage) error {
+		return nil
+	}); err == nil {
+		t.Fatal("ViewRangeAfter accepted a cursor with the wrong type")
+	}
+
+	if err := db.ViewRangeAfter("session_seq", []any{"s1", 2}, 3, func([]*indexedMessage) error {
+		return nil
+	}); err == nil {
+		t.Fatal("ViewRangeAfter accepted a cursor after a complete index key")
+	}
+}
+
+func assertIndexedSequence(t *testing.T, db *DB[indexedMessage], session string, first, last int) {
+	t.Helper()
+	position := first
+	if err := db.ViewRange("session_seq", []any{session}, func(entries []*indexedMessage) error {
+		for _, entry := range entries {
+			if entry.Seq != position {
+				t.Fatalf("sequence at %d = %d, want %d", position-first, entry.Seq, position)
+			}
+
+			position++
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if position != last+1 {
+		t.Fatalf("last sequence position = %d, want %d", position, last+1)
+	}
+}
+
+func BenchmarkIndexedBatchCreate(b *testing.B) {
+	benchmarkIndexedBatch(b, func(b *testing.B, db *DB[indexedMessage], size int) {
+		b.StartTimer()
+		err := db.Transaction(func(tx *Tx[indexedMessage]) error {
+			for sequence := 1; sequence <= size; sequence++ {
+				if err := tx.Create(&indexedMessage{
+					MessageID: "create-" + strconv.Itoa(sequence),
+					SessionID: "session",
+					Seq:       sequence,
+				}); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+		b.StopTimer()
+		if err != nil {
+			b.Fatal(err)
+		}
+	})
+}
+
+func BenchmarkIndexedBatchDelete(b *testing.B) {
+	benchmarkIndexedBatch(b, func(b *testing.B, db *DB[indexedMessage], size int) {
+		if err := db.Transaction(func(tx *Tx[indexedMessage]) error {
+			for sequence := 1; sequence <= size; sequence++ {
+				if err := tx.Create(&indexedMessage{
+					MessageID: "delete-" + strconv.Itoa(sequence),
+					SessionID: "session",
+					Seq:       sequence,
+				}); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+
+		b.StartTimer()
+		err := db.DeleteByIndex("session_seq", []any{"session"})
+		b.StopTimer()
+		if err != nil {
+			b.Fatal(err)
+		}
+	})
+}
+
+func BenchmarkIndexedRangeView(b *testing.B) {
+	type benchmarkCase struct {
+		name      string
+		hasCursor bool
+		after     int
+		want      int
+	}
+
+	for _, benchmark := range []benchmarkCase{
+		{name: "full", want: 100_000},
+		{name: "delta-10", hasCursor: true, after: 99_990, want: 10},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			originalDir := DataDir
+			DataDir = b.TempDir()
+			b.Cleanup(func() {
+				DataDir = originalDir
+				resetRegistries()
+			})
+
+			resetRegistries()
+			if err := Register[indexedMessage](); err != nil {
+				b.Fatal(err)
+			}
+
+			db := Open[indexedMessage]()
+			if err := db.Transaction(func(tx *Tx[indexedMessage]) error {
+				for sequence := 1; sequence <= 100_000; sequence++ {
+					if err := tx.Create(&indexedMessage{
+						MessageID: "range-" + strconv.Itoa(sequence),
+						SessionID: "session",
+						Seq:       sequence,
+					}); err != nil {
+						return err
+					}
+				}
+
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
+
+			visit := func(entries []*indexedMessage) error {
+				if len(entries) != benchmark.want {
+					b.Fatalf("entries = %d, want %d", len(entries), benchmark.want)
+				}
+
+				return nil
+			}
+			b.ResetTimer()
+			for b.Loop() {
+				var err error
+				if !benchmark.hasCursor {
+					err = db.ViewRange("session_seq", []any{"session"}, visit)
+				} else {
+					err = db.ViewRangeAfter("session_seq", []any{"session"}, benchmark.after, visit)
+				}
+
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func benchmarkIndexedBatch(
+	b *testing.B,
+	operation func(*testing.B, *DB[indexedMessage], int),
+) {
+	b.Helper()
+	originalDir := DataDir
+	b.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	for _, size := range []int{1_000, 10_000, 100_000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			for range b.N {
+				b.StopTimer()
+				resetRegistries()
+				DataDir = b.TempDir()
+				if err := Register[indexedMessage](); err != nil {
+					b.Fatal(err)
+				}
+
+				operation(b, Open[indexedMessage](), size)
+			}
+		})
+	}
+}

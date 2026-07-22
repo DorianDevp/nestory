@@ -79,6 +79,33 @@ must have exactly the declared Go types.
 Rows are stable live pointers, read-locked for the callback. They are read-only
 by contract and must not be retained for synchronized use afterward.
 
+### Delta views with an exclusive cursor
+
+`ViewRangeAfter` keeps the same prefix but returns only rows whose next indexed
+field is strictly greater than a cursor:
+
+```go
+err := messages.ViewRangeAfter(
+	"session_seq",
+	[]any{sessionID},
+	lastSeenSeq,
+	func(rows []*Message) error {
+		appendToDecodedContext(rows)
+		return nil
+	},
+)
+```
+
+For `(SessionID, Seq)`, this uses binary search and locks only rows
+with `Seq > lastSeenSeq`. It is intended for generation/high-water protocols
+that retain a validated local snapshot and request an ordered delta. It avoids
+turning an append-only history into a full transfer on every read.
+
+The prefix must leave at least one index field for the cursor. The cursor must
+have exactly the Go type of that next field. If more index fields follow it,
+every row with the same next-field value is excluded; use a unique monotonic
+cursor such as `Seq` when no row may be skipped.
+
 ## Batch reads by ID
 
 ```go
@@ -118,6 +145,11 @@ owners cascades, and an outsider `borrow` can veto the whole batch.
 Secondary indexes are derived in-memory structures. Durable entity rows and WAL
 frames are the source of truth; indexes are rebuilt on `Open` and then
 maintained with each safe commit.
+
+Large safe transactions update ordered indexes in batches. Removed rows are
+filtered in one pass; additions are sorted and merged with the surviving index.
+This keeps bulk hydration and eviction from repeatedly shifting the same index
+slice.
 
 Live changes made through `Unsafe` bypass incremental index maintenance.
 `Unsafe().Flush` validates uniqueness and rebuilds affected index state before
