@@ -3,6 +3,7 @@ package nestory
 import (
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 var ErrAlreadyExists = errors.New("nestory: entity already exists")
@@ -31,6 +32,54 @@ func (db *DB[T]) Delete(id int) error {
 	return db.Transaction(func(tx *Tx[T]) error {
 		return tx.Delete(id)
 	})
+}
+
+// DeleteMany removes ids in one transaction and one durable WAL frame.
+func (db *DB[T]) DeleteMany(ids []int) error {
+	return db.Transaction(func(tx *Tx[T]) error {
+		return tx.DeleteMany(ids)
+	})
+}
+
+// DeleteByIndex removes every row matching an ordered index prefix. The prefix
+// is resolved once; rows appended after that snapshot belong to a later state.
+func (db *DB[T]) DeleteByIndex(indexName string, prefix []any) error {
+	ids, err := db.idsByIndexPrefix(indexName, prefix)
+	if err != nil {
+		return err
+	}
+
+	return db.DeleteMany(ids)
+}
+
+func (db *DB[T]) idsByIndexPrefix(indexName string, prefix []any) ([]int, error) {
+	participant := relationGraphParticipant(reflect.TypeFor[T]())
+	if participant {
+		graphMu.RLock()
+		defer graphMu.RUnlock()
+	}
+
+	db.structureMu.RLock()
+	defer db.structureMu.RUnlock()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	index := db.secondary[indexName]
+	if index == nil {
+		return nil, fmt.Errorf("nestory: index %q does not exist", indexName)
+	}
+
+	entries, err := index.rangePrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]int, len(entries))
+	for position, entity := range entries {
+		ids[position] = (*entity).GetId()
+	}
+
+	return ids, nil
 }
 
 // The queue remains an internal adapter for unsafe Flush while that path is
