@@ -103,18 +103,18 @@ two parents directly by ID.
 
 | operation | 100 total nodes | 1,000 total nodes | 10,000 total nodes |
 |---|---:|---:|---:|
-| scalar write | 5.24 µs | 5.30 µs | 5.23 µs |
+| scalar write | 3.83 µs | 3.94 µs | 3.77 µs |
 | reparent subtree, before indexes | 130 µs | 1.21 ms | 12.25 ms |
-| reparent subtree, indexed | 27.1 µs | 40.9 µs | 20.0 µs |
+| reparent subtree, indexed | 11.0 µs | 11.4 µs | 11.0 µs |
 
 The scalar control stays flat, proving that ID-targeted access avoids copying
 unrelated ownership branches. Persistent ordered relation indexes now make the
 structural result independent of total graph size too: the same local reparent is
-about 4.8×, 30×, and 612× faster at 100, 1,000, and 10,000 nodes respectively.
-The non-monotonic default-GC numbers come from a fixed 10 KB/107 allocations per
-transaction interacting with different live-heap sizes; a diagnostic run with
-GC disabled measured 19.5–19.7 µs at all three sizes. Allocation reduction is
-therefore the remaining constant-factor opportunity, not a hidden graph scan.
+about 12×, 106×, and 1,117× faster at 100, 1,000, and 10,000 nodes respectively.
+The indexed commit uses a fixed 3,040 B and 43 allocations at all three sizes,
+down from 10,184 B and 107 allocations in the first persistent-index version.
+Its compact delta keeps small transactions inline, retains empty adjacency
+buckets for repeated moves, and avoids rebuilding a reflective relation model.
 
 Relation-only commits still validate while holding the graph write lock. To
 measure its user-visible consequence, a second benchmark continuously reparents
@@ -122,8 +122,8 @@ the branch while another goroutine performs scalar `UpdateWithin` calls:
 
 | total nodes | scalar p50 | scalar p95 | scalar p99 |
 |---:|---:|---:|---:|
-| 100 | 63–67 µs | 84–86 µs | 163–178 µs |
-| 10,000 | 51–59 µs | 74–78 µs | 93–100 µs |
+| 100 | 29–30 µs | 43–44 µs | 54–59 µs |
+| 10,000 | 29–30 µs | 42–44 µs | 51–55 µs |
 
 This intentionally keeps a structural writer pending almost continuously. Even
 under that pressure, scalar tail latency stays below 0.2 ms rather than inheriting
