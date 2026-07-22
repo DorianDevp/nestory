@@ -53,7 +53,8 @@ err := users.View(user.Id, func(user *User) error {
   setters.
 - Stable pointers in a chunked arena; inserts do not move existing objects.
 - Detached branches and optimistic transactions for safe edits.
-- Zero-copy callback reads with `View`, `ViewMany`, and `ViewRange`.
+- Zero-copy callback reads with `View`, `ViewMany`, `ViewRange`, and indexed
+  delta cursors.
 - Durable unique and ordered composite indexes.
 - A value-lifetime model that derives cascade delete, borrow vetoes, optional
   references, and computed inverse views from explicit ownership roles.
