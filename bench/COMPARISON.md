@@ -66,24 +66,52 @@ detached `Get` pays for a mutable branch copy.
 This in-package diagnostic models the flat append log used by the OpenCode
 experiment: a unique message ID plus a unique ordered `(SessionID, Seq)` index.
 Create and delete are one durable transaction per complete batch. These are
-single `benchtime=1x` samples intended to expose scaling, not cross-engine
-results.
+the medians of three `benchtime=1x` samples intended to expose scaling, not
+cross-engine results.
 
 | operation | 1,000 rows | 10,000 rows | 100,000 rows |
 |---|---:|---:|---:|
-| indexed batch create | 2.55 ms | 29.2 ms | 362 ms |
-| indexed batch delete | 2.44 ms | 24.6 ms | 278 ms |
+| indexed batch create | 2.12 ms | 26.5 ms | 342 ms |
+| indexed batch delete | 1.77 ms | 18.2 ms | 241 ms |
 
 Batch index maintenance filters removals in one pass and sort-merges additions.
 Before that path, the same 100,000-row create and delete samples took 1.26 s and
 1.27 s because every row shifted the sorted index separately: the batch path is
-about 3.5× and 4.6× faster respectively.
+about 3.7× and 5.3× faster respectively.
 
 Index ordering for a pure-create batch is prepared outside the database mutex
 and published after the rows are live. In a diagnostic with 100,000 existing
 rows and a concurrent 50,000-row hydration, a stable single-field lookup
-measured 367 ns p50, 1.89 µs p95, and 3.43 µs p99 inside Nestory. This isolates
+measured 399 ns p50, 1.87 µs p95, and 2.77 µs p99 inside Nestory. This isolates
 engine lock latency; a sidecar still adds scheduling and protocol overhead.
+
+### Indexed memory footprint
+
+The opt-in memory profile builds a real 100,000-row database in isolated test
+processes, forces collection and attributes retained memory cumulatively. Its
+fixture uses a 128-byte payload, a unique string key and a unique ordered
+two-field index.
+
+| retained component | incremental bytes/row |
+|---|---:|
+| chunk store, record, strings and 128-byte payload | 297 B |
+| primary resource lookup | 23 B |
+| two ordered pointer slices | 19 B |
+| single-field and composite uniqueness maps | 85 B |
+| **complete live heap, including fixed runtime cost** | **428 B** |
+
+The previous representation retained both a generic primary map and separate
+validation and lookup maps for a unique field. It used 626 B/row in the same
+profile. Sharing typed unique maps and using the resource map as the primary
+lookup reduces live heap by 31.6%. Stabilized test-process RSS fell from 73.2
+MiB to 54.7 MiB. This is a post-GC engine diagnostic, not a claim about peak
+sidecar RSS during hydration.
+
+Run it with:
+
+```sh
+NESTORY_MEMORY_PROFILE=1 go test -run '^TestIndexedMemoryProfile$' -count=1 -v
+```
 
 An indexed delta cursor changes the amount of work more fundamentally. On a
 100,000-row `(SessionID, Seq)` index:
