@@ -15,6 +15,18 @@ func (db *DB[T]) View(id int, fn func(*T) error) error {
 		return fmt.Errorf("nestory: View requires a callback")
 	}
 
+	if !relationGraphParticipant(reflect.TypeFor[T]()) {
+		resource, found := db.resource(id)
+		if !found {
+			return ErrNotFound
+		}
+
+		resource.mu.RLock()
+		defer resource.mu.RUnlock()
+
+		return fn(resource.item)
+	}
+
 	graphMu.RLock()
 	defer graphMu.RUnlock()
 

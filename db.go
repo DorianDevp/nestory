@@ -35,6 +35,7 @@ type DB[T Entity] struct {
 	schemaFields [][2]string
 	directSchema bool
 	mu           sync.RWMutex
+	structureMu  sync.Mutex
 	resById      map[int]*resourceSlot[T] // id → stable resourceSlot slot
 	wal          *wal                     // durability log for commits
 	snapshotMu   sync.Mutex
@@ -45,8 +46,13 @@ var _ committer = (*DB[Entity])(nil)
 
 // Len returns the number of live entities.
 func (db *DB[T]) Len() int {
-	graphMu.RLock()
-	defer graphMu.RUnlock()
+	if relationGraphParticipant(reflect.TypeFor[T]()) {
+		graphMu.RLock()
+		defer graphMu.RUnlock()
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 
 	return db.store.Len()
 }
@@ -107,6 +113,8 @@ func Open[T Entity]() *DB[T] {
 	if err != nil {
 		panic(err)
 	}
+
+	registerRelationParticipants(reflect.TypeFor[T](), specs)
 
 	initBase.directSchema = len(specs) == 0
 
@@ -208,6 +216,9 @@ func (db *DB[T]) unlockResource(id int) {
 		r.mu.Unlock()
 	}
 }
+
+func (db *DB[T]) lockStructure()   { db.structureMu.Lock() }
+func (db *DB[T]) unlockStructure() { db.structureMu.Unlock() }
 
 func (db *DB[T]) readLockResource(id int) {
 	if resource, found := db.resource(id); found {
