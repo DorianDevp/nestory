@@ -290,11 +290,15 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	var indexDelta *relationIndexDelta
 	var deleted map[nodeKey]struct{}
 	if graphChanged {
-		if len(createdResources) == 0 && len(stagedDeletes) == 0 {
+		switch {
+		case len(stagedDeletes) == 0 && len(createdResources) > 0:
+			indexDelta, err = buildRelationCreateIndexDelta(touchedResources, createdResources)
+		case len(stagedDeletes) == 0:
 			indexDelta, err = buildRelationIndexDelta(touchedResources)
-			if err != nil {
-				return err
-			}
+		}
+
+		if err != nil {
+			return err
 		}
 
 		if indexDelta == nil {
@@ -305,7 +309,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 
 		if indexDelta != nil {
-			touchedResources, err = indexDelta.materializeOwnBackReferences(transactionResources, touchedResources)
+			touchedResources, err = indexDelta.materializeOwnBackReferences(transactionResources, touchedResources, createdResources)
 		} else {
 			touchedResources, err = materializeOwnBackReferences(model, transactionResources, touchedResources, createdResources, deleted)
 		}
@@ -364,7 +368,8 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	logStructuralCreate := structural && len(stagedDeletes) == 0 && prepareStructuralCreateWAL(model, touchedResources, createdResources)
+	logStructuralCreate := structural && len(stagedDeletes) == 0 &&
+		(indexDelta != nil || prepareStructuralCreateWAL(model, touchedResources, createdResources))
 	if !structural {
 		if err := logTransactionWrites(touchedResources); err != nil {
 			return err
@@ -382,6 +387,14 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	for _, created := range createdResources {
 		runtime := baseRegistry[created.key.typ.Name()].(relationRuntime)
 		runtime.relationApplyCreate(created.work)
+		if indexDelta != nil {
+			live, found := runtime.relationValue(created.key.id)
+			if !found {
+				panic("nestory: created relation node is not live")
+			}
+
+			indexDelta.bindCreatedNode(created.key, live)
+		}
 	}
 
 	if !graphChanged {
