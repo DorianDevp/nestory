@@ -29,6 +29,11 @@ type walNestedRow struct {
 	Fingerprint walValueObject
 }
 
+type walBlobRow struct {
+	Id      int
+	Payload []byte
+}
+
 func TestWALRowCodecs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -44,6 +49,8 @@ func TestWALRowCodecs(t *testing.T) {
 			},
 			encoding: rowEncodingScalar,
 		},
+		{name: "byte slice", row: walBlobRow{Id: 8, Payload: []byte("payload")}, encoding: rowEncodingScalar},
+		{name: "nil byte slice", row: walBlobRow{Id: 8}, encoding: rowEncodingScalar},
 		{name: "gob fallback", row: walComplexRow{Id: 9, Values: []string{"a", "b"}}, encoding: rowEncodingGob},
 	}
 
@@ -93,6 +100,7 @@ func BenchmarkWALRowEncoding(b *testing.B) {
 	}{
 		{name: "flat", row: walTestRow{Id: -7, Name: "nestory"}},
 		{name: "nested", row: walNestedRow{Id: 7, Fingerprint: walValueObject{Bits: [4]uint64{1, 2, 3, 4}}}},
+		{name: "blob", row: walBlobRow{Id: 8, Payload: make([]byte, 4<<10)}},
 		{name: "gob", row: walComplexRow{Id: 9, Values: []string{"a", "b"}}},
 	}
 
