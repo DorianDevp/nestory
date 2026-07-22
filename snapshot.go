@@ -6,15 +6,17 @@ import "reflect"
 // allocating a general transaction context. Update promotes the snapshot into
 // the same commit engine used by larger ownership branches.
 func (db *DB[T]) getDetachedRoot(root nodeKey) (*T, bool, error) {
-	graphMu.RLock()
-	defer graphMu.RUnlock()
+	if relationGraphParticipant(root.typ) {
+		graphMu.RLock()
+		defer graphMu.RUnlock()
 
-	if err := ensureCommittedOwnership(); err != nil {
-		return nil, true, err
-	}
+		if err := ensureCommittedOwnership(); err != nil {
+			return nil, true, err
+		}
 
-	if committedOwnerHasChildren(root) {
-		return nil, false, nil
+		if committedOwnerHasChildren(root) {
+			return nil, false, nil
+		}
 	}
 
 	resource, found := db.resource(root.id)

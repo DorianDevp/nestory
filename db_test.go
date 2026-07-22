@@ -1,8 +1,11 @@
 package nestory
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 // tCounter is scalar-only, so its snapshot copy is fully detached.
@@ -12,6 +15,113 @@ type tCounter struct {
 }
 
 func (c tCounter) GetId() int { return c.Id }
+
+func TestRelationlessCreateAndDeleteIgnoreGraphWriter(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[tCounter](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[tCounter]()
+
+	assertCompletesWhileGraphLocked(t, func() error {
+		return db.Create(&tCounter{Id: 1, N: 7})
+	})
+	assertCompletesWhileGraphLocked(t, func() error {
+		_, err := db.Get(1)
+
+		return err
+	})
+	assertCompletesWhileGraphLocked(t, func() error {
+		return db.View(1, func(counter *tCounter) error {
+			if counter.N != 7 {
+				return fmt.Errorf("counter N = %d, want 7", counter.N)
+			}
+
+			return nil
+		})
+	})
+	assertCompletesWhileGraphLocked(t, func() error {
+		return db.Delete(1)
+	})
+	if got := db.Len(); got != 0 {
+		t.Fatalf("rows after delete = %d, want 0", got)
+	}
+}
+
+func TestConcurrentRelationlessCreateRejectsDuplicateID(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[tCounter](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[tCounter]()
+
+	const workers = 16
+	errs := make(chan error, workers)
+	var start sync.WaitGroup
+	start.Add(1)
+	for range workers {
+		go func() {
+			start.Wait()
+			errs <- db.Create(&tCounter{Id: 1})
+		}()
+	}
+
+	start.Done()
+
+	var committed int
+	for range workers {
+		err := <-errs
+		if err == nil {
+			committed++
+			continue
+		}
+
+		if !errors.Is(err, ErrAlreadyExists) {
+			t.Fatalf("create error = %v, want ErrAlreadyExists", err)
+		}
+	}
+
+	if committed != 1 {
+		t.Fatalf("successful creates = %d, want 1", committed)
+	}
+}
+
+func assertCompletesWhileGraphLocked(t *testing.T, action func() error) {
+	t.Helper()
+	graphMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- action()
+	}()
+
+	select {
+	case err := <-done:
+		graphMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		graphMu.Unlock()
+		<-done
+		t.Fatal("relationless commit waited for graphMu")
+	}
+}
 
 // Snapshot says N=10, a commit (no Flush) says N=99; after a reload the WAL must
 // have replayed it back to 99.

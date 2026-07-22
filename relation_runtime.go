@@ -117,6 +117,9 @@ func (db *DB[T]) relationDelete(ids map[int]struct{}) {
 		return
 	}
 
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	removed := db.store.DeleteFunc(func(p *T) bool {
 		_, ok := ids[(*p).GetId()]
 		return ok
@@ -126,6 +129,34 @@ func (db *DB[T]) relationDelete(ids map[int]struct{}) {
 		delete(db.index["Id"], id)
 		delete(db.resById, id)
 	}
+}
+
+var (
+	relationParticipantsMu sync.RWMutex
+	relationParticipants   = make(map[reflect.Type]struct{})
+)
+
+func registerRelationParticipants(holder reflect.Type, specs []relationSpec) {
+	if len(specs) == 0 {
+		return
+	}
+
+	relationParticipantsMu.Lock()
+	defer relationParticipantsMu.Unlock()
+
+	relationParticipants[holder] = struct{}{}
+	for _, spec := range specs {
+		relationParticipants[spec.target] = struct{}{}
+	}
+}
+
+func relationGraphParticipant(typ reflect.Type) bool {
+	relationParticipantsMu.RLock()
+	defer relationParticipantsMu.RUnlock()
+
+	_, found := relationParticipants[typ]
+
+	return found
 }
 
 func (db *DB[T]) relationMarkDirty(id int) {

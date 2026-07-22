@@ -37,6 +37,8 @@ type touchedResource struct {
 type committer interface {
 	lockResource(id int)
 	unlockResource(id int)
+	lockStructure()
+	unlockStructure()
 	readLockResource(id int)
 	readUnlockResource(id int)
 	snapshotResource(id int) (work, original reflect.Value, version int, found bool)
@@ -77,6 +79,14 @@ type transactionResourceKey struct {
 	dbName string
 	id     int
 }
+
+type graphAccess uint8
+
+const (
+	graphAccessNone graphAccess = iota
+	graphAccessRead
+	graphAccessWrite
+)
 
 func (tx *transactionState) copyResources() []touchedResource {
 	if !tx.hasResource {
@@ -279,11 +289,13 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		return err
 	}
 
-	graphChanged := structural || relationChanged
-	if graphChanged {
+	access := transactionGraphAccess(touchedResources, createdResources, stagedDeletes, relationChanged)
+	graphChanged := access == graphAccessWrite
+	switch access {
+	case graphAccessWrite:
 		graphMu.Lock()
 		defer graphMu.Unlock()
-	} else {
+	case graphAccessRead:
 		graphMu.RLock()
 		defer graphMu.RUnlock()
 	}
@@ -321,9 +333,20 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	if !graphChanged && len(touchedResources) == 1 {
+	if !structural && !graphChanged && len(touchedResources) == 1 {
 		return en.commitSingleWrite(tx, touchedResources[0])
 	}
+
+	structuralDBNames := transactionStructuralDBNames(createdResources, stagedDeletes)
+	for _, dbName := range structuralDBNames {
+		committerFor(dbName).lockStructure()
+	}
+
+	defer func() {
+		for index := len(structuralDBNames) - 1; index >= 0; index-- {
+			committerFor(structuralDBNames[index]).unlockStructure()
+		}
+	}()
 
 	for key := range createdResources {
 		if _, exists := committerFor(key.typ.Name()).resourceVersion(key.id); exists {
@@ -331,22 +354,15 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	// Global (dbName,id) lock order: overlapping commits can't form a wait cycle.
-	slices.SortFunc(touchedResources, func(a, b touchedResource) int {
-		if byName := cmp.Compare(a.dbName, b.dbName); byName != 0 {
-			return byName
-		}
-
-		return cmp.Compare(a.id, b.id)
-	})
-
-	for _, resource := range touchedResources {
+	lockedResources := transactionResourceLocks(touchedResources, createdResources, stagedDeletes)
+	for _, resource := range lockedResources {
 		committerFor(resource.dbName).lockResource(resource.id)
 	}
 
 	defer func() {
-		for i := len(touchedResources) - 1; i >= 0; i-- {
-			committerFor(touchedResources[i].dbName).unlockResource(touchedResources[i].id)
+		for index := len(lockedResources) - 1; index >= 0; index-- {
+			resource := lockedResources[index]
+			committerFor(resource.dbName).unlockResource(resource.id)
 		}
 	}()
 
@@ -378,8 +394,8 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	walBackedStructural := structural && len(stagedDeletes) == 0 &&
-		(indexDelta != nil || prepareStructuralCreateWAL(model, touchedResources, createdResources))
+	walBackedStructural := structural && (!graphChanged || len(stagedDeletes) == 0 &&
+		(indexDelta != nil || prepareStructuralCreateWAL(model, touchedResources, createdResources)))
 	if err := logTransactionChanges(touchedResources, createdResources, durableDeletes); err != nil {
 		return err
 	}
@@ -402,13 +418,16 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	}
 
 	if !graphChanged {
+		applyDeletedNodes(durableDeletes)
 		en.evict(tx)
+
 		return nil
 	}
 
 	if indexDelta != nil {
 		indexDelta.publishAndRewire()
 		en.evict(tx)
+
 		return nil
 	}
 
@@ -438,6 +457,104 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	en.evict(tx)
 
 	return nil
+}
+
+type transactionResourceLock struct {
+	dbName string
+	id     int
+}
+
+func transactionGraphAccess(
+	resources []touchedResource,
+	creates map[nodeKey]createdResource,
+	deletes map[nodeKey]stagedDelete,
+	relationChanged bool,
+) graphAccess {
+	if relationChanged {
+		return graphAccessWrite
+	}
+
+	for key := range creates {
+		if relationGraphParticipant(key.typ) {
+			return graphAccessWrite
+		}
+	}
+
+	for key := range deletes {
+		if relationGraphParticipant(key.typ) {
+			return graphAccessWrite
+		}
+	}
+
+	for _, resource := range resources {
+		if relationGraphParticipant(baseRegistry[resource.dbName].(relationRuntime).relationType()) {
+			return graphAccessRead
+		}
+	}
+
+	return graphAccessNone
+}
+
+func transactionStructuralDBNames(
+	creates map[nodeKey]createdResource,
+	deletes map[nodeKey]stagedDelete,
+) []string {
+	names := make(map[string]struct{}, len(creates)+len(deletes))
+	for key := range creates {
+		names[key.typ.Name()] = struct{}{}
+	}
+
+	for key := range deletes {
+		names[key.typ.Name()] = struct{}{}
+	}
+
+	ordered := make([]string, 0, len(names))
+	for name := range names {
+		ordered = append(ordered, name)
+	}
+
+	sort.Strings(ordered)
+
+	return ordered
+}
+
+func transactionResourceLocks(
+	resources []touchedResource,
+	creates map[nodeKey]createdResource,
+	deletes map[nodeKey]stagedDelete,
+) []transactionResourceLock {
+	locks := make([]transactionResourceLock, 0, len(resources)+len(deletes))
+	seen := make(map[transactionResourceKey]struct{}, len(resources)+len(deletes))
+	for _, resource := range resources {
+		key := transactionResourceKey{dbName: resource.dbName, id: resource.id}
+		seen[key] = struct{}{}
+		locks = append(locks, transactionResourceLock(key))
+	}
+
+	for key := range deletes {
+		if _, created := creates[key]; created {
+			continue
+		}
+
+		resource := transactionResourceKey{dbName: key.typ.Name(), id: key.id}
+		if _, exists := seen[resource]; exists {
+			continue
+		}
+
+		seen[resource] = struct{}{}
+		locks = append(locks, transactionResourceLock(resource))
+	}
+
+	// Global (dbName,id) order prevents overlapping commits from forming a cycle.
+	slices.SortFunc(locks, func(a, b transactionResourceLock) int {
+		if byName := cmp.Compare(a.dbName, b.dbName); byName != 0 {
+			return byName
+		}
+
+		return cmp.Compare(a.id, b.id)
+	})
+
+	return locks
 }
 
 func materializeOwnBackReferences(

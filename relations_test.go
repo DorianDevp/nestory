@@ -392,6 +392,9 @@ func resetRegistries() {
 	resetSharedTransactionWAL()
 	storeRegistry = make(map[string]any)
 	baseRegistry = make(map[string]any)
+	relationParticipantsMu.Lock()
+	relationParticipants = make(map[reflect.Type]struct{})
+	relationParticipantsMu.Unlock()
 	engine = newEngine()
 	resetCommittedOwnership()
 }

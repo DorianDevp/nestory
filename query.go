@@ -6,9 +6,16 @@ import (
 
 // FindOneBy returns a detached branch for the first matching entity.
 func (db *DB[T]) FindOneBy(field string, value any) (*T, error) {
-	graphMu.RLock()
+	participant := relationGraphParticipant(reflect.TypeFor[T]())
+	if participant {
+		graphMu.RLock()
+	}
+
 	id, err := db.findID(field, value)
-	graphMu.RUnlock()
+	if participant {
+		graphMu.RUnlock()
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -47,8 +54,13 @@ func (db *DB[T]) findID(field string, value any) (int, error) {
 // Filter returns detached root values matching filterFn. Use Transaction for
 // writable ownership branches.
 func (db *DB[T]) Filter(filterFn func(T) bool) []T {
-	graphMu.RLock()
-	defer graphMu.RUnlock()
+	if relationGraphParticipant(reflect.TypeFor[T]()) {
+		graphMu.RLock()
+		defer graphMu.RUnlock()
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 
 	var filtered []T
 	db.store.Range(func(entity *T) {
