@@ -213,6 +213,7 @@ var committedOwnership = struct {
 	outgoing map[nodeKey][]nodeKey
 	branches map[nodeKey][]nodeKey
 	graph    *relationModel
+	index    *committedRelationIndex
 }{outgoing: make(map[nodeKey][]nodeKey), branches: make(map[nodeKey][]nodeKey)}
 
 // graphMu protects live relation pointers while a branch is copied or a commit
@@ -227,6 +228,7 @@ func resetCommittedOwnership() {
 	committedOwnership.outgoing = make(map[nodeKey][]nodeKey)
 	committedOwnership.branches = make(map[nodeKey][]nodeKey)
 	committedOwnership.graph = nil
+	committedOwnership.index = nil
 }
 
 func ensureCommittedOwnership() error {
@@ -280,8 +282,17 @@ func storeCommittedOwnership(model *relationModel, deleted map[nodeKey]struct{})
 		committedOwnership.graph = nil
 	}
 
+	committedOwnership.index = buildCommittedRelationIndex(model, deleted)
+
 	committedOwnership.Unlock()
 	committedOwnership.ready.Store(true)
+}
+
+func committedRelationIndexSnapshot() *committedRelationIndex {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	return committedOwnership.index
 }
 
 func committedRelationModel() *relationModel {

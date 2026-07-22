@@ -268,11 +268,27 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	}
 
 	var model *relationModel
+	var indexDelta *relationIndexDelta
 	var deleted map[nodeKey]struct{}
 	if graphChanged {
-		model, deleted, err = validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
-		if err != nil {
-			return err
+		if len(createdResources) == 0 && len(stagedDeletes) == 0 {
+			var handled bool
+			indexDelta, handled, err = buildRelationIndexDelta(touchedResources)
+			if err != nil {
+				return err
+			}
+
+			if handled {
+				model = indexDelta.model
+				deleted = make(map[nodeKey]struct{})
+			}
+		}
+
+		if indexDelta == nil {
+			model, deleted, err = validateTransactionGraph(touchedResources, createdResources, stagedDeletes)
+			if err != nil {
+				return err
+			}
 		}
 
 		touchedResources, err = materializeOwnBackReferences(model, transactionResources, touchedResources, createdResources, deleted)
@@ -363,6 +379,12 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	}
 
 	reconcileRelations(model, deleted)
+	if indexDelta != nil {
+		indexDelta.publishAndRewire()
+		en.evict(tx)
+		return nil
+	}
+
 	applyDeletedNodes(deleted)
 	rewireRelations(relationRuntimes())
 

@@ -644,6 +644,106 @@ func TestTargetedBorrowRepointUpdatesBothInverseSides(t *testing.T) {
 	})
 }
 
+func TestIndexedBorrowRepointMovesDeleteVeto(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[txKeyTarget](); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Register[txKeyBorrower](); err != nil {
+			t.Fatal(err)
+		}
+
+		targetDB := Open[txKeyTarget]()
+		borrowerDB := Open[txKeyBorrower]()
+		first := &txKeyTarget{Key: "first"}
+		second := &txKeyTarget{Key: "second"}
+		borrower := &txKeyBorrower{Target: first}
+		targetDB.Unsafe().Create(first)
+		targetDB.Unsafe().Create(second)
+		borrowerDB.Unsafe().Create(borrower)
+		if err := targetDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		secondLive, err := targetDB.Unsafe().Get(second.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = borrowerDB.UpdateWithin(borrower.Id, func(current *txKeyBorrower) error {
+			current.Target = secondLive
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := targetDB.Delete(first.Id); err != nil {
+			t.Fatalf("old borrow target remained restricted: %v", err)
+		}
+
+		if err := targetDB.Delete(second.Id); !errors.Is(err, ErrDeleteRestricted) {
+			t.Fatalf("new borrow target delete error = %v, want %v", err, ErrDeleteRestricted)
+		}
+	})
+}
+
+func TestIndexedReparentMovesCascadeOwnership(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[rtNode](); err != nil {
+			t.Fatal(err)
+		}
+
+		db := Open[rtNode]()
+		root := &rtNode{}
+		left := &rtNode{}
+		right := &rtNode{}
+		branch := &rtNode{}
+		left.Children = []*rtNode{branch}
+		root.Children = []*rtNode{left, right}
+		if err := db.Create(root); err != nil {
+			t.Fatal(err)
+		}
+
+		err := db.Transaction(func(tx *Tx[rtNode]) error {
+			from, getErr := tx.Get(left.Id)
+			if getErr != nil {
+				return getErr
+			}
+
+			to, getErr := tx.Get(right.Id)
+			if getErr != nil {
+				return getErr
+			}
+
+			to.Children = append(to.Children, from.Children[0])
+			from.Children = nil
+
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Delete(left.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := db.Unsafe().Get(branch.Id); err != nil {
+			t.Fatalf("new owner's child was deleted with the old owner: %v", err)
+		}
+
+		if err := db.Delete(right.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := db.Unsafe().Get(branch.Id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("reparented child lookup error = %v, want %v", err, ErrNotFound)
+		}
+	})
+}
+
 func TestConcurrentBorrowAndDeleteCannotBothCommit(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		if err := Register[txKeyTarget](); err != nil {
