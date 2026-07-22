@@ -258,108 +258,104 @@ func scalarRowSize(row reflect.Value) (int, bool) {
 		return 0, false
 	}
 
-	size := 1
-	for i := range row.NumField() {
-		field := row.Field(i)
-		switch field.Kind() {
-		case reflect.Bool:
-			size++
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-			reflect.Float32, reflect.Float64:
-			size += 8
-		case reflect.String:
-			if field.Len() > math.MaxUint32 || size > math.MaxInt-4-field.Len() {
-				return 0, false
-			}
+	size, scalar := scalarValueSize(row)
+	if !scalar || size == math.MaxInt {
+		return 0, false
+	}
 
-			size += 4 + field.Len()
-		default:
+	return size + 1, true
+}
+
+func scalarValueSize(value reflect.Value) (int, bool) {
+	switch value.Kind() {
+	case reflect.Bool:
+		return 1, true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return 8, true
+	case reflect.String:
+		if value.Len() > math.MaxUint32 {
 			return 0, false
 		}
+
+		return 4 + value.Len(), true
+	case reflect.Array:
+		return scalarAggregateSize(value.Len(), value.Index)
+	case reflect.Struct:
+		for index := range value.NumField() {
+			if !value.Type().Field(index).IsExported() {
+				return 0, false
+			}
+		}
+
+		return scalarAggregateSize(value.NumField(), value.Field)
+	default:
+		return 0, false
+	}
+}
+
+func scalarAggregateSize(count int, field func(int) reflect.Value) (int, bool) {
+	size := 0
+	for index := range count {
+		fieldSize, scalar := scalarValueSize(field(index))
+		if !scalar || size > math.MaxInt-fieldSize {
+			return 0, false
+		}
+
+		size += fieldSize
 	}
 
 	return size, true
 }
 
 func encodeScalarRow(out []byte, row reflect.Value) {
-	offset := 0
-	for i := range row.NumField() {
-		field := row.Field(i)
-		switch field.Kind() {
-		case reflect.Bool:
-			if field.Bool() {
-				out[offset] = 1
-			}
+	encodeScalarValue(out, row)
+}
 
-			offset++
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			binary.BigEndian.PutUint64(out[offset:], uint64(field.Int()))
-			offset += 8
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			binary.BigEndian.PutUint64(out[offset:], field.Uint())
-			offset += 8
-		case reflect.Float32, reflect.Float64:
-			binary.BigEndian.PutUint64(out[offset:], math.Float64bits(field.Float()))
-			offset += 8
-		case reflect.String:
-			value := field.String()
-			binary.BigEndian.PutUint32(out[offset:], uint32(len(value)))
-			offset += 4
-			offset += copy(out[offset:], value)
+func encodeScalarValue(out []byte, value reflect.Value) int {
+	switch value.Kind() {
+	case reflect.Bool:
+		if value.Bool() {
+			out[0] = 1
 		}
+
+		return 1
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		binary.BigEndian.PutUint64(out, uint64(value.Int()))
+		return 8
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		binary.BigEndian.PutUint64(out, value.Uint())
+		return 8
+	case reflect.Float32, reflect.Float64:
+		binary.BigEndian.PutUint64(out, math.Float64bits(value.Float()))
+		return 8
+	case reflect.String:
+		text := value.String()
+		binary.BigEndian.PutUint32(out, uint32(len(text)))
+		return 4 + copy(out[4:], text)
+	case reflect.Array:
+		return encodeScalarAggregate(out, value.Len(), value.Index)
+	case reflect.Struct:
+		return encodeScalarAggregate(out, value.NumField(), value.Field)
+	default:
+		panic("nestory: unsupported scalar WAL value")
 	}
 }
 
-func decodeScalarRow(data []byte, row reflect.Value) error {
+func encodeScalarAggregate(out []byte, count int, field func(int) reflect.Value) int {
 	offset := 0
-	for i := range row.NumField() {
-		field := row.Field(i)
-		switch field.Kind() {
-		case reflect.Bool:
-			if len(data)-offset < 1 || data[offset] > 1 {
-				return fmt.Errorf("nestory: malformed scalar WAL row")
-			}
+	for index := range count {
+		offset += encodeScalarValue(out[offset:], field(index))
+	}
 
-			field.SetBool(data[offset] == 1)
-			offset++
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			if len(data)-offset < 8 {
-				return fmt.Errorf("nestory: malformed scalar WAL row")
-			}
+	return offset
+}
 
-			field.SetInt(int64(binary.BigEndian.Uint64(data[offset:])))
-			offset += 8
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			if len(data)-offset < 8 {
-				return fmt.Errorf("nestory: malformed scalar WAL row")
-			}
-
-			field.SetUint(binary.BigEndian.Uint64(data[offset:]))
-			offset += 8
-		case reflect.Float32, reflect.Float64:
-			if len(data)-offset < 8 {
-				return fmt.Errorf("nestory: malformed scalar WAL row")
-			}
-
-			field.SetFloat(math.Float64frombits(binary.BigEndian.Uint64(data[offset:])))
-			offset += 8
-		case reflect.String:
-			if len(data)-offset < 4 {
-				return fmt.Errorf("nestory: malformed scalar WAL row")
-			}
-
-			size := int(binary.BigEndian.Uint32(data[offset:]))
-			offset += 4
-			if size > len(data)-offset {
-				return fmt.Errorf("nestory: malformed scalar WAL row")
-			}
-
-			field.SetString(string(data[offset : offset+size]))
-			offset += size
-		default:
-			return fmt.Errorf("nestory: scalar WAL row contains %s", field.Kind())
-		}
+func decodeScalarRow(data []byte, row reflect.Value) error {
+	offset, err := decodeScalarValue(data, row)
+	if err != nil {
+		return err
 	}
 
 	if offset != len(data) {
@@ -367,4 +363,69 @@ func decodeScalarRow(data []byte, row reflect.Value) error {
 	}
 
 	return nil
+}
+
+func decodeScalarValue(data []byte, value reflect.Value) (int, error) {
+	switch value.Kind() {
+	case reflect.Bool:
+		if len(data) < 1 || data[0] > 1 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		value.SetBool(data[0] == 1)
+		return 1, nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if len(data) < 8 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		value.SetInt(int64(binary.BigEndian.Uint64(data)))
+		return 8, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if len(data) < 8 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		value.SetUint(binary.BigEndian.Uint64(data))
+		return 8, nil
+	case reflect.Float32, reflect.Float64:
+		if len(data) < 8 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		value.SetFloat(math.Float64frombits(binary.BigEndian.Uint64(data)))
+		return 8, nil
+	case reflect.String:
+		if len(data) < 4 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		size := int(binary.BigEndian.Uint32(data))
+		if size > len(data)-4 {
+			return 0, fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		value.SetString(string(data[4 : 4+size]))
+		return 4 + size, nil
+	case reflect.Array:
+		return decodeScalarAggregate(data, value.Len(), value.Index)
+	case reflect.Struct:
+		return decodeScalarAggregate(data, value.NumField(), value.Field)
+	default:
+		return 0, fmt.Errorf("nestory: scalar WAL row contains %s", value.Kind())
+	}
+}
+
+func decodeScalarAggregate(data []byte, count int, field func(int) reflect.Value) (int, error) {
+	offset := 0
+	for index := range count {
+		read, err := decodeScalarValue(data[offset:], field(index))
+		if err != nil {
+			return 0, err
+		}
+
+		offset += read
+	}
+
+	return offset, nil
 }

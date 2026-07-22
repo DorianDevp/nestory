@@ -19,6 +19,15 @@ type walComplexRow struct {
 
 func (row walComplexRow) GetId() int { return row.Id }
 
+type walValueObject struct {
+	Bits [4]uint64
+}
+
+type walNestedRow struct {
+	Id          int
+	Fingerprint walValueObject
+}
+
 func TestWALRowCodecs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -26,6 +35,14 @@ func TestWALRowCodecs(t *testing.T) {
 		encoding byte
 	}{
 		{name: "scalar", row: walTestRow{Id: -7, Name: "nestory"}, encoding: rowEncodingScalar},
+		{
+			name: "nested scalar",
+			row: walNestedRow{
+				Id:          7,
+				Fingerprint: walValueObject{Bits: [4]uint64{1, 2, 3, 4}},
+			},
+			encoding: rowEncodingScalar,
+		},
 		{name: "gob fallback", row: walComplexRow{Id: 9, Values: []string{"a", "b"}}, encoding: rowEncodingGob},
 	}
 
@@ -65,6 +82,29 @@ func TestScalarWALRowRejectsCorruption(t *testing.T) {
 
 	if _, err := decodeRow([]byte{99}, reflect.TypeOf(walTestRow{})); err == nil {
 		t.Fatal("accepted unknown row encoding")
+	}
+}
+
+func BenchmarkWALRowEncoding(b *testing.B) {
+	rows := []struct {
+		name string
+		row  any
+	}{
+		{name: "flat", row: walTestRow{Id: -7, Name: "nestory"}},
+		{name: "nested", row: walNestedRow{Id: 7, Fingerprint: walValueObject{Bits: [4]uint64{1, 2, 3, 4}}}},
+		{name: "gob", row: walComplexRow{Id: 9, Values: []string{"a", "b"}}},
+	}
+
+	for _, benchmark := range rows {
+		b.Run(benchmark.name, func(b *testing.B) {
+			value := reflect.ValueOf(benchmark.row)
+			b.ReportAllocs()
+			for range b.N {
+				if _, err := encodeRow(value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
