@@ -26,7 +26,15 @@ type cachedSpecsByField struct {
 	err   error
 }
 
-var specsByFieldCache sync.Map
+type cachedSchema struct {
+	fields  [][2]string
+	rowType reflect.Type
+}
+
+var (
+	specsByFieldCache sync.Map
+	schemaCache       sync.Map
+)
 
 func specsByField(t reflect.Type) (map[string]relationSpec, error) {
 	if cached, ok := specsByFieldCache.Load(t); ok {
@@ -181,8 +189,16 @@ func (db *DB[T]) normalizeToSchema(instance T) reflect.Value {
 }
 
 func schemaFieldsFor(t reflect.Type) [][2]string {
+	return schemaFor(t).fields
+}
+
+func schemaFor(t reflect.Type) cachedSchema {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+
+	if cached, ok := schemaCache.Load(t); ok {
+		return cached.(cachedSchema)
 	}
 
 	specs, err := specsByField(t)
@@ -190,7 +206,8 @@ func schemaFieldsFor(t reflect.Type) [][2]string {
 		panic(err)
 	}
 
-	fields := make([][2]string, 0, t.NumField())
+	result := cachedSchema{fields: make([][2]string, 0, t.NumField())}
+	columns := make([]reflect.StructField, 0, t.NumField())
 	for i := range t.NumField() {
 		f := t.Field(i)
 		if r, ok := specs[f.Name]; ok {
@@ -198,14 +215,20 @@ func schemaFieldsFor(t reflect.Type) [][2]string {
 				continue
 			}
 
-			fields = append(fields, [2]string{f.Name, relationColumnName(r)})
+			columnName := relationColumnName(r)
+			result.fields = append(result.fields, [2]string{f.Name, columnName})
+			columns = append(columns, reflect.StructField{Name: columnName, Type: relationColumnType(r)})
 			continue
 		}
 
-		fields = append(fields, [2]string{f.Name, f.Name})
+		result.fields = append(result.fields, [2]string{f.Name, f.Name})
+		columns = append(columns, reflect.StructField{Name: f.Name, Type: f.Type})
 	}
 
-	return fields
+	result.rowType = reflect.StructOf(columns)
+	actual, _ := schemaCache.LoadOrStore(t, result)
+
+	return actual.(cachedSchema)
 }
 
 func (db *DB[T]) createSchemaFields() [][2]string {
@@ -213,28 +236,7 @@ func (db *DB[T]) createSchemaFields() [][2]string {
 }
 
 func schemaStructFor(t reflect.Type) reflect.Value {
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-
-	specs, err := specsByField(t)
-	if err != nil {
-		panic(err)
-	}
-
-	fields := schemaFieldsFor(t)
-	columns := make([]reflect.StructField, 0, len(fields))
-	for _, pair := range fields {
-		entityField, _ := t.FieldByName(pair[0])
-		columnType := entityField.Type
-		if r, ok := specs[pair[0]]; ok {
-			columnType = relationColumnType(r)
-		}
-
-		columns = append(columns, reflect.StructField{Name: pair[1], Type: columnType})
-	}
-
-	return reflect.New(reflect.StructOf(columns)).Elem()
+	return reflect.New(schemaFor(t).rowType).Elem()
 }
 
 func (db *DB[T]) createSchemaStruct() reflect.Value {
