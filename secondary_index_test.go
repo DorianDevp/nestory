@@ -3,6 +3,7 @@ package nestory
 import (
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -317,5 +318,54 @@ func TestViewManyReturnsIDOrderAndDeduplicates(t *testing.T) {
 
 	if !reflect.DeepEqual(ids, []int{1, 2, 3}) {
 		t.Fatalf("ids = %v", ids)
+	}
+}
+
+func TestDeleteByIndexPersistsAsOneTransaction(t *testing.T) {
+	originalDir := DataDir
+	DataDir = t.TempDir()
+	t.Cleanup(func() {
+		DataDir = originalDir
+		resetRegistries()
+	})
+
+	resetRegistries()
+	if err := Register[indexedMessage](); err != nil {
+		t.Fatal(err)
+	}
+
+	db := Open[indexedMessage]()
+	for sequence := 1; sequence <= 100; sequence++ {
+		if err := db.Create(&indexedMessage{
+			MessageID: "delete-" + strconv.Itoa(sequence), SessionID: "delete", Seq: sequence,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.Create(&indexedMessage{MessageID: "keep", SessionID: "keep", Seq: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeleteByIndex("session_seq", []any{"delete"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := db.Len(); got != 1 {
+		t.Fatalf("rows after indexed delete = %d, want 1", got)
+	}
+
+	resetRegistries()
+	if err := Register[indexedMessage](); err != nil {
+		t.Fatal(err)
+	}
+
+	db = Open[indexedMessage]()
+	if got := db.Len(); got != 1 {
+		t.Fatalf("rows after replay = %d, want 1", got)
+	}
+
+	if _, err := db.FindOneBy("MessageID", "keep"); err != nil {
+		t.Fatal(err)
 	}
 }

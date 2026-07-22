@@ -83,6 +83,24 @@ func (tx *Tx[T]) Delete(id int) error {
 	return engine.stageDelete(tx.state, stagedDelete{key: key, ver: version})
 }
 
+// DeleteMany stages ids in the same transaction. Duplicate IDs are harmless;
+// either every surviving row is deleted at commit or none is.
+func (tx *Tx[T]) DeleteMany(ids []int) error {
+	seen := make(map[int]struct{}, len(ids))
+	for _, id := range ids {
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+
+		seen[id] = struct{}{}
+		if err := tx.Delete(id); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // UpdateWithin mutates id inside this transaction. It joins the current context
 // and does not commit independently.
 func (tx *Tx[T]) UpdateWithin(id int, fn func(*T) error) error {

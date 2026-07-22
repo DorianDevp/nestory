@@ -98,6 +98,15 @@ field tag when the complete tuple must be unique. Indexes are rebuilt on
 Like `View`, batch view pointers are read-only by contract and must not escape
 the callback for synchronized use.
 
+Evicting a hot partition uses the same index without one transaction or fsync
+per row:
+
+```go
+err := messages.DeleteByIndex("session_seq", []any{sessionID})
+```
+
+`DeleteMany` and `DeleteByIndex` write all tombstones in one transaction frame.
+
 For natural struct editing across several operations, `Transaction` detects
 changes automatically and commits the callback's final graph once:
 

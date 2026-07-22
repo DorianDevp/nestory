@@ -209,6 +209,39 @@ func BenchmarkViewRange(b *testing.B) {
 	}
 }
 
+func BenchmarkDeleteByIndex(b *testing.B) {
+	for _, size := range []int{1_000, 10_000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			quiet(b)
+			b.ReportAllocs()
+			for range b.N {
+				b.StopTimer()
+				DataDir = b.TempDir()
+				resetRegistries()
+				if err := Register[indexedMessage](); err != nil {
+					b.Fatal(err)
+				}
+
+				db := Open[indexedMessage]()
+				for sequence := 1; sequence <= size; sequence++ {
+					db.Unsafe().Create(&indexedMessage{
+						MessageID: strconv.Itoa(sequence), SessionID: "session", Seq: sequence,
+					})
+				}
+
+				if err := db.Unsafe().Flush(); err != nil {
+					b.Fatal(err)
+				}
+
+				b.StartTimer()
+				if err := db.DeleteByIndex("session_seq", []any{"session"}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkSafeGetByID(b *testing.B) {
 	for _, n := range benchSizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
