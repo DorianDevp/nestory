@@ -22,6 +22,26 @@ func BenchmarkWALAppend(b *testing.B) {
 	}
 }
 
+func BenchmarkWALAppendParallel(b *testing.B) {
+	log := openWAL(b.TempDir() + "/wal.log")
+	row, err := encodeRow(reflect.ValueOf(walTestRow{Id: 1, Name: "nestory"}))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	frame := walFrame{Rows: []walRow{{Id: 1, Row: row}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(parallel *testing.PB) {
+		for parallel.Next() {
+			if err := log.appendFrame(frame); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
 func BenchmarkScalarRowEncoding(b *testing.B) {
 	row := reflect.ValueOf(walTestRow{Id: 1, Name: "nestory"})
 	b.ReportAllocs()
