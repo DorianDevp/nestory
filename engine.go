@@ -1,9 +1,11 @@
 package nestory
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 )
@@ -162,8 +164,16 @@ func (en *transactionEngine) record(tx *transactionState, e touchedResource) {
 		if _, exists := tx.resourcePos[key]; exists {
 			return
 		}
-	} else if tx.hasResource && tx.resource.dbName == e.dbName && tx.resource.id == e.id {
-		return
+	} else {
+		if tx.hasResource && tx.resource.dbName == e.dbName && tx.resource.id == e.id {
+			return
+		}
+
+		for _, resource := range tx.resources {
+			if resource.dbName == e.dbName && resource.id == e.id {
+				return
+			}
+		}
 	}
 
 	if !tx.hasResource {
@@ -173,14 +183,17 @@ func (en *transactionEngine) record(tx *transactionState, e touchedResource) {
 		return
 	}
 
-	if tx.resourcePos == nil {
-		tx.resourcePos = map[transactionResourceKey]int{
-			{dbName: tx.resource.dbName, id: tx.resource.id}: 0,
+	tx.resources = append(tx.resources, e)
+	if len(tx.resources) == 8 {
+		tx.resourcePos = make(map[transactionResourceKey]int, 1+len(tx.resources))
+		tx.resourcePos[transactionResourceKey{dbName: tx.resource.dbName, id: tx.resource.id}] = 0
+		for index, resource := range tx.resources {
+			tx.resourcePos[transactionResourceKey{dbName: resource.dbName, id: resource.id}] = index + 1
 		}
+	} else if tx.resourcePos != nil {
+		tx.resourcePos[key] = len(tx.resources)
 	}
 
-	tx.resources = append(tx.resources, e)
-	tx.resourcePos[key] = len(tx.resources)
 	en.bind[e.work] = tx
 }
 
@@ -203,6 +216,12 @@ func (en *transactionEngine) work(tx *transactionState, dbName string, id int) (
 
 	if tx.hasResource && tx.resource.dbName == dbName && tx.resource.id == id {
 		return tx.resource.work, true
+	}
+
+	for _, resource := range tx.resources {
+		if resource.dbName == dbName && resource.id == id {
+			return resource.work, true
+		}
 	}
 
 	return nil, false
@@ -272,15 +291,9 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	var deleted map[nodeKey]struct{}
 	if graphChanged {
 		if len(createdResources) == 0 && len(stagedDeletes) == 0 {
-			var handled bool
-			indexDelta, handled, err = buildRelationIndexDelta(touchedResources)
+			indexDelta, err = buildRelationIndexDelta(touchedResources)
 			if err != nil {
 				return err
-			}
-
-			if handled {
-				model = indexDelta.model
-				deleted = make(map[nodeKey]struct{})
 			}
 		}
 
@@ -291,7 +304,12 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 			}
 		}
 
-		touchedResources, err = materializeOwnBackReferences(model, transactionResources, touchedResources, createdResources, deleted)
+		if indexDelta != nil {
+			touchedResources, err = indexDelta.materializeOwnBackReferences(transactionResources, touchedResources)
+		} else {
+			touchedResources, err = materializeOwnBackReferences(model, transactionResources, touchedResources, createdResources, deleted)
+		}
+
 		if err != nil {
 			return err
 		}
@@ -308,15 +326,12 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	}
 
 	// Global (dbName,id) lock order: overlapping commits can't form a wait cycle.
-	sort.Slice(touchedResources, func(i, j int) bool {
-		resA := touchedResources[i]
-		resB := touchedResources[j]
-
-		if resA.dbName != resB.dbName {
-			return resA.dbName < resB.dbName
+	slices.SortFunc(touchedResources, func(a, b touchedResource) int {
+		if byName := cmp.Compare(a.dbName, b.dbName); byName != 0 {
+			return byName
 		}
 
-		return resA.id < resB.id
+		return cmp.Compare(a.id, b.id)
 	})
 
 	for _, resource := range touchedResources {
@@ -374,16 +389,17 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		return nil
 	}
 
-	if err := bindRelationModelToLiveNodes(model, touchedResources, createdResources); err != nil {
-		return err
-	}
-
-	reconcileRelations(model, deleted)
 	if indexDelta != nil {
 		indexDelta.publishAndRewire()
 		en.evict(tx)
 		return nil
 	}
+
+	if err := bindRelationModelToLiveNodes(model, touchedResources, createdResources); err != nil {
+		return err
+	}
+
+	reconcileRelations(model, deleted)
 
 	applyDeletedNodes(deleted)
 	rewireRelations(relationRuntimes())
@@ -619,20 +635,30 @@ func logTransactionWrites(resources []touchedResource) error {
 		return committerFor(resource.dbName).logWrites(write[:])
 	}
 
-	byDBName := map[string][]pendingWrite{}
-	order := make([]string, 0)
-	for _, resource := range resources {
-		if _, seen := byDBName[resource.dbName]; !seen {
-			order = append(order, resource.dbName)
+	var inline [4]pendingWrite
+	for start := 0; start < len(resources); {
+		end := start + 1
+		for end < len(resources) && resources[end].dbName == resources[start].dbName {
+			end++
 		}
 
-		byDBName[resource.dbName] = append(byDBName[resource.dbName], pendingWrite{id: resource.id, work: resource.work})
-	}
+		count := end - start
+		var writes []pendingWrite
+		if count <= len(inline) {
+			writes = inline[:count]
+		} else {
+			writes = make([]pendingWrite, count)
+		}
 
-	for _, dbName := range order {
-		if err := committerFor(dbName).logWrites(byDBName[dbName]); err != nil {
+		for index, resource := range resources[start:end] {
+			writes[index] = pendingWrite{id: resource.id, work: resource.work}
+		}
+
+		if err := committerFor(resources[start].dbName).logWrites(writes); err != nil {
 			return err
 		}
+
+		start = end
 	}
 
 	return nil
@@ -705,14 +731,23 @@ func ownSliceBackReferencePersists(model *relationModel, ref resolvedRelation) b
 }
 
 func changedResources(resources []touchedResource) []touchedResource {
-	var changed []touchedResource
-	for _, resource := range resources {
+	for firstUnchanged, resource := range resources {
 		if !entityStateEqual(resource.original, resource.work) {
-			changed = append(changed, resource)
+			continue
 		}
+
+		changed := make([]touchedResource, firstUnchanged, len(resources)-1)
+		copy(changed, resources[:firstUnchanged])
+		for _, remaining := range resources[firstUnchanged+1:] {
+			if !entityStateEqual(remaining.original, remaining.work) {
+				changed = append(changed, remaining)
+			}
+		}
+
+		return changed
 	}
 
-	return changed
+	return resources
 }
 
 func entityStateEqual(before, after any) bool {

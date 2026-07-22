@@ -1,8 +1,10 @@
 package nestory
 
 import (
+	"cmp"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -330,19 +332,20 @@ func committedOwnershipKeys(root nodeKey) []nodeKey {
 		return keys
 	}
 
-	out := []nodeKey{root}
+	out := make([]nodeKey, 1, 1+len(committedOwnership.outgoing[root]))
+	out[0] = root
 	for position := 0; position < len(out); position++ {
 		owner := out[position]
 		out = append(out, committedOwnership.outgoing[owner]...)
 	}
 
 	if len(out) > 1 {
-		sort.Slice(out, func(i, j int) bool {
-			if out[i].typ.Name() != out[j].typ.Name() {
-				return out[i].typ.Name() < out[j].typ.Name()
+		slices.SortFunc(out, func(a, b nodeKey) int {
+			if byName := cmp.Compare(a.typ.Name(), b.typ.Name()); byName != 0 {
+				return byName
 			}
 
-			return out[i].id < out[j].id
+			return cmp.Compare(a.id, b.id)
 		})
 	}
 

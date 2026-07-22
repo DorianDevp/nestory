@@ -1,9 +1,10 @@
 package nestory
 
 import (
+	"cmp"
 	"fmt"
 	"reflect"
-	"sort"
+	"slices"
 )
 
 type relationHolderField struct {
@@ -12,8 +13,62 @@ type relationHolderField struct {
 }
 
 type indexedRelationField struct {
-	spec    relationSpec
+	spec    *relationSpec
 	targets []nodeKey
+}
+
+type relationFieldDelta struct {
+	key   relationHolderField
+	field indexedRelationField
+}
+
+type relationFieldDeltas struct {
+	values    []relationFieldDelta
+	positions map[relationHolderField]int
+}
+
+func (fields *relationFieldDeltas) init(inline []relationFieldDelta, capacity int) {
+	if capacity <= cap(inline) {
+		fields.values = inline[:0]
+		return
+	}
+
+	fields.values = make([]relationFieldDelta, 0, capacity)
+}
+
+func (fields *relationFieldDeltas) add(key relationHolderField, field indexedRelationField) {
+	fields.values = append(fields.values, relationFieldDelta{key: key, field: field})
+	if len(fields.values) == 9 {
+		fields.positions = make(map[relationHolderField]int, len(fields.values))
+		for index, entry := range fields.values {
+			fields.positions[entry.key] = index
+		}
+
+		return
+	}
+
+	if fields.positions != nil {
+		fields.positions[key] = len(fields.values) - 1
+	}
+}
+
+func (fields *relationFieldDeltas) find(key relationHolderField) (*indexedRelationField, bool) {
+	if fields.positions != nil {
+		index, found := fields.positions[key]
+		if !found {
+			return nil, false
+		}
+
+		return &fields.values[index].field, true
+	}
+
+	for index := range fields.values {
+		if fields.values[index].key == key {
+			return &fields.values[index].field, true
+		}
+	}
+
+	return nil, false
 }
 
 type committedRelationIndex struct {
@@ -34,101 +89,236 @@ type relationOwnerChange struct {
 	hasAfter  bool
 }
 
+type relationOwnerDelta struct {
+	child  nodeKey
+	change relationOwnerChange
+}
+
+type nodeKeySet struct {
+	inline   [8]nodeKey
+	overflow []nodeKey
+	index    map[nodeKey]struct{}
+	count    int
+}
+
+func (keys *nodeKeySet) add(key nodeKey) bool {
+	if keys.index != nil {
+		if _, exists := keys.index[key]; exists {
+			return false
+		}
+
+		keys.index[key] = struct{}{}
+		keys.overflow = append(keys.overflow, key)
+		keys.count++
+		return true
+	}
+
+	for index := 0; index < keys.count; index++ {
+		if keys.inline[index] == key {
+			return false
+		}
+	}
+
+	if keys.count < len(keys.inline) {
+		keys.inline[keys.count] = key
+		keys.count++
+		return true
+	}
+
+	keys.index = make(map[nodeKey]struct{}, keys.count+1)
+	for _, existing := range keys.inline {
+		keys.index[existing] = struct{}{}
+	}
+
+	keys.index[key] = struct{}{}
+	keys.overflow = append(keys.overflow, key)
+	keys.count++
+
+	return true
+}
+
+func (keys *nodeKeySet) at(index int) nodeKey {
+	if index < len(keys.inline) {
+		return keys.inline[index]
+	}
+
+	return keys.overflow[index-len(keys.inline)]
+}
+
 type relationIndexDelta struct {
 	index          *committedRelationIndex
-	model          *relationModel
-	fields         map[relationHolderField]indexedRelationField
-	ownerChanges   map[nodeKey]relationOwnerChange
+	overrides      []relationIndexOverride
+	overrideInline [2]relationIndexOverride
+	fields         relationFieldDeltas
+	fieldInline    [2]relationFieldDelta
+	ownerChanges   []relationOwnerDelta
+	ownerPositions map[nodeKey]int
+	ownerInline    [1]relationOwnerDelta
 	inverseTargets map[nodeKey]struct{}
 }
 
-func buildRelationIndexDelta(resources []touchedResource) (*relationIndexDelta, bool, error) {
+type relationIndexOverride struct {
+	node  relationGraphNode
+	specs []relationSpec
+}
+
+func buildRelationIndexDelta(resources []touchedResource) (*relationIndexDelta, error) {
 	index := committedRelationIndexSnapshot()
 	if index == nil {
-		return nil, false, nil
+		return nil, nil
 	}
 
-	overrides := make(map[nodeKey]relationGraphNode, len(resources))
+	delta := &relationIndexDelta{index: index}
+	overrides := delta.overrideInline[:0]
+	if len(resources) > cap(overrides) {
+		overrides = make([]relationIndexOverride, 0, len(resources))
+	}
+
+	fieldCount := 0
 	for _, resource := range resources {
 		runtime, ok := baseRegistry[resource.dbName].(relationRuntime)
 		if !ok {
-			return nil, false, nil
+			return nil, nil
 		}
 
 		key := nodeKey{typ: runtime.relationType(), id: resource.id}
 		if _, exists := index.nodes[key]; !exists {
-			return nil, false, nil
+			return nil, nil
 		}
 
 		if relationIndexKeyChanged(index, key, reflect.ValueOf(resource.work)) {
-			return nil, false, nil
+			return nil, nil
 		}
 
-		overrides[key] = relationGraphNode{key: key, value: reflect.ValueOf(resource.work)}
-	}
-
-	model := &relationModel{
-		nodes: make(map[nodeKey]relationGraphNode), targets: index.targets, targetFields: index.targetFields,
-		owners: make(map[nodeKey]nodeKey), outgoing: make(map[nodeKey][]nodeKey),
-	}
-	delta := &relationIndexDelta{
-		index: index, model: model,
-		fields:       make(map[relationHolderField]indexedRelationField),
-		ownerChanges: make(map[nodeKey]relationOwnerChange), inverseTargets: make(map[nodeKey]struct{}),
-	}
-	scannedIncoming := make(map[nodeKey][]incomingOwn)
-	scannedOwnedBy := make(map[nodeKey]incomingOwn)
-	for key, node := range overrides {
-		model.nodes[key] = node
 		specs, err := relationSpecs(key.typ)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 
-		for _, spec := range specs {
+		overrides = append(overrides, relationIndexOverride{
+			node:  relationGraphNode{key: key, value: reflect.ValueOf(resource.work)},
+			specs: specs,
+		})
+		fieldCount += len(specs)
+	}
+
+	delta.overrides = overrides
+	delta.fields.init(delta.fieldInline[:], fieldCount)
+	delta.ownerChanges = delta.ownerInline[:0]
+	for _, override := range overrides {
+		key := override.node.key
+
+		for specIndex := range override.specs {
+			spec := &override.specs[specIndex]
 			if spec.kind == inverseRelation {
+				if delta.inverseTargets == nil {
+					delta.inverseTargets = make(map[nodeKey]struct{})
+				}
+
 				delta.inverseTargets[key] = struct{}{}
 				continue
 			}
 
 			fieldKey := relationHolderField{holder: key, field: spec.fieldIndex}
-			if _, exists := index.fields[fieldKey]; !exists {
-				return nil, false, nil
+			committed, exists := index.fields[fieldKey]
+			if !exists {
+				return nil, nil
 			}
 
-			delta.fields[fieldKey] = indexedRelationField{spec: spec}
-		}
+			replacement := indexedRelationField{spec: spec}
+			if len(committed.targets) == 0 {
+				// An empty committed view cannot observe writes to its spare capacity.
+				replacement.targets = committed.targets[:0]
+			}
 
-		if err := scanNodeRelations(model, node, scannedIncoming, scannedOwnedBy); err != nil {
-			return nil, true, err
-		}
-	}
-
-	if err := validateRequiredRelations(model, nil); err != nil {
-		return nil, true, err
-	}
-
-	for _, ref := range model.refs {
-		fieldKey := relationHolderField{holder: ref.holder, field: ref.spec.fieldIndex}
-		field := delta.fields[fieldKey]
-		field.targets = append(field.targets, ref.target)
-		delta.fields[fieldKey] = field
-		if _, exists := model.nodes[ref.target]; !exists {
-			model.nodes[ref.target] = relationGraphNode{key: ref.target, value: index.nodes[ref.target]}
+			delta.fields.add(fieldKey, replacement)
+			field, _ := delta.fields.find(fieldKey)
+			if err := scanIndexedRelationField(index, override.node, field); err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	if err := delta.validateOwnership(); err != nil {
-		return nil, true, err
+		return nil, err
 	}
 
 	if !delta.supportsOwnershipChanges() {
-		return nil, false, nil
+		return nil, nil
 	}
 
 	delta.collectInverseTargets()
 
-	return delta, true, nil
+	return delta, nil
+}
+
+func scanIndexedRelationField(index *committedRelationIndex, holder relationGraphNode, field *indexedRelationField) error {
+	value := holder.value.Elem().Field(field.spec.fieldIndex)
+	if !field.spec.many {
+		target, found, err := resolveIndexedRelationTarget(index, holder.key, value, *field.spec)
+		if found {
+			field.targets = append(field.targets, target)
+		}
+
+		return err
+	}
+
+	var seen map[nodeKey]struct{}
+	if field.spec.kind == ownRelation && value.Len() > 1 {
+		seen = make(map[nodeKey]struct{}, value.Len())
+	}
+
+	for position := range value.Len() {
+		target, found, err := resolveIndexedRelationTarget(index, holder.key, value.Index(position), *field.spec)
+		if err != nil {
+			return err
+		}
+
+		if !found {
+			continue
+		}
+
+		if seen != nil {
+			if _, duplicate := seen[target]; duplicate {
+				return fmt.Errorf(
+					"%w: %s.%s contains owned child %s more than once",
+					ErrRelationInvariant, holder.key.typ, field.spec.fieldName, target,
+				)
+			}
+
+			seen[target] = struct{}{}
+		}
+
+		field.targets = append(field.targets, target)
+	}
+
+	return nil
+}
+
+func resolveIndexedRelationTarget(
+	index *committedRelationIndex,
+	holder nodeKey,
+	pointer reflect.Value,
+	spec relationSpec,
+) (nodeKey, bool, error) {
+	lookup, present := graphRelationTargetKey(spec, pointer)
+	target, found := index.targets[lookup]
+	if target.duplicate {
+		return nodeKey{}, false, fmt.Errorf("%w: %s.%s does not uniquely identify a target", ErrRelationInvariant, spec.owner, spec.fieldName)
+	}
+
+	if !present || !found {
+		if relationMayBeMissing(spec) {
+			return nodeKey{}, false, nil
+		}
+
+		return nodeKey{}, false, fmt.Errorf(
+			"%w: required relation %s.%s on %s is nil or has no live target",
+			ErrRelationInvariant, holder.typ, spec.fieldName, holder,
+		)
+	}
+
+	return target.key, true, nil
 }
 
 func relationIndexKeyChanged(index *committedRelationIndex, key nodeKey, after reflect.Value) bool {
@@ -148,48 +338,151 @@ func relationIndexKeyChanged(index *committedRelationIndex, key nodeKey, after r
 	return false
 }
 
+func (delta *relationIndexDelta) materializeOwnBackReferences(
+	transactionResources []touchedResource,
+	changed []touchedResource,
+) ([]touchedResource, error) {
+	for _, entry := range delta.fields.values {
+		if entry.field.spec.kind != ownRelation || !entry.field.spec.many {
+			continue
+		}
+
+		owner := delta.overrideValue(entry.key.holder)
+		for _, target := range entry.field.targets {
+			resource, alreadyChanged, err := delta.ownershipTargetResource(target, owner, *entry.field.spec, transactionResources, changed)
+			if err != nil {
+				return nil, err
+			}
+
+			if resource.work == nil || indexedOwnBackReferenceMatches(owner, reflect.ValueOf(resource.work), *entry.field.spec) {
+				continue
+			}
+
+			setIndexedOwnBackReference(owner, reflect.ValueOf(resource.work), *entry.field.spec)
+			if !alreadyChanged {
+				changed = append(changed, resource)
+			}
+		}
+	}
+
+	return changed, nil
+}
+
+func (delta *relationIndexDelta) ownershipTargetResource(
+	target nodeKey,
+	owner reflect.Value,
+	spec relationSpec,
+	transactionResources, changed []touchedResource,
+) (touchedResource, bool, error) {
+	if resource, found := indexedTouchedResource(changed, target); found {
+		return resource, true, nil
+	}
+
+	if resource, found := indexedTouchedResource(transactionResources, target); found {
+		return resource, false, nil
+	}
+
+	live := delta.index.nodes[target]
+	if indexedOwnBackReferenceMatches(owner, live, spec) {
+		return touchedResource{}, false, nil
+	}
+
+	resource, err := snapshotTouchedResource(target)
+
+	return resource, false, err
+}
+
+func (delta *relationIndexDelta) overrideValue(key nodeKey) reflect.Value {
+	for _, override := range delta.overrides {
+		if override.node.key == key {
+			return override.node.value
+		}
+	}
+
+	return delta.index.nodes[key]
+}
+
+func indexedTouchedResource(resources []touchedResource, key nodeKey) (touchedResource, bool) {
+	name := key.typ.Name()
+	for _, resource := range resources {
+		if resource.dbName == name && resource.id == key.id {
+			return resource, true
+		}
+	}
+
+	return touchedResource{}, false
+}
+
+func indexedOwnBackReferenceMatches(owner, child reflect.Value, spec relationSpec) bool {
+	back := child.Elem().FieldByName(spec.matchField)
+	if back.Kind() == reflect.Pointer {
+		return !back.IsNil() && back.Pointer() == owner.Pointer()
+	}
+
+	id := owner.Elem().FieldByName("Id")
+
+	return scalarEqual(back, id)
+}
+
+func setIndexedOwnBackReference(owner, child reflect.Value, spec relationSpec) {
+	back := child.Elem().FieldByName(spec.matchField)
+	if back.Kind() == reflect.Pointer {
+		back.Set(owner)
+		return
+	}
+
+	back.Set(owner.Elem().FieldByName("Id"))
+}
+
 func (delta *relationIndexDelta) validateOwnership() error {
-	affected := make(map[nodeKey]struct{})
-	for fieldKey, field := range delta.fields {
+	var affected nodeKeySet
+	for _, entry := range delta.fields.values {
+		fieldKey, field := entry.key, entry.field
 		old := delta.index.fields[fieldKey]
 		if field.spec.kind == ownRelation {
 			for _, target := range old.targets {
-				affected[target] = struct{}{}
+				affected.add(target)
 			}
 
 			for _, target := range field.targets {
-				affected[target] = struct{}{}
+				affected.add(target)
 			}
 		}
 
 		if field.spec.kind == ownedByRelation {
-			affected[fieldKey.holder] = struct{}{}
+			affected.add(fieldKey.holder)
 		}
 	}
 
-	for child := range affected {
-		raw := delta.effectiveIncomingOwn(child)
+	for index := 0; index < affected.count; index++ {
+		child := affected.at(index)
+		raw, incomingCount := delta.effectiveIncomingOwn(child)
 		back, hasBack := delta.effectiveOwnedBy(child)
-		if len(raw) > 1 {
+		if incomingCount > 1 {
 			return fmt.Errorf("%w: %s has more than one owner", ErrRelationInvariant, child)
 		}
 
-		if len(raw) == 1 && hasBack && raw[0].owner != back.owner {
-			return fmt.Errorf("%w: own and ownedby disagree for %s (%s vs %s)", ErrRelationInvariant, child, raw[0].owner, back.owner)
+		if incomingCount == 1 && hasBack && raw.owner != back.owner {
+			return fmt.Errorf("%w: own and ownedby disagree for %s (%s vs %s)", ErrRelationInvariant, child, raw.owner, back.owner)
 		}
 
-		after, hasAfter := resolvedOwner(raw, back, hasBack)
+		after, hasAfter := raw.owner, incomingCount == 1
+		if !hasAfter && hasBack {
+			after, hasAfter = back.owner, true
+		}
+
 		before, hadBefore := delta.index.owners[child]
 		if before == after && hadBefore == hasAfter {
 			continue
 		}
 
-		delta.ownerChanges[child] = relationOwnerChange{
+		delta.setOwnerChange(child, relationOwnerChange{
 			before: before, hadBefore: hadBefore, after: after, hasAfter: hasAfter,
-		}
+		})
 	}
 
-	for child := range affected {
+	for index := 0; index < affected.count; index++ {
+		child := affected.at(index)
 		if err := delta.validateOwnerChain(child); err != nil {
 			return err
 		}
@@ -198,32 +491,84 @@ func (delta *relationIndexDelta) validateOwnership() error {
 	return nil
 }
 
-func (delta *relationIndexDelta) effectiveIncomingOwn(child nodeKey) []incomingOwn {
-	out := make([]incomingOwn, 0, 1)
-	for fieldKey, count := range delta.index.incoming[child] {
-		if _, replaced := delta.fields[fieldKey]; replaced {
+func (delta *relationIndexDelta) setOwnerChange(child nodeKey, change relationOwnerChange) {
+	if delta.ownerPositions != nil {
+		if index, exists := delta.ownerPositions[child]; exists {
+			delta.ownerChanges[index].change = change
+			return
+		}
+	}
+
+	delta.ownerChanges = append(delta.ownerChanges, relationOwnerDelta{child: child, change: change})
+	if len(delta.ownerChanges) == 9 {
+		delta.ownerPositions = make(map[nodeKey]int, len(delta.ownerChanges))
+		for index, entry := range delta.ownerChanges {
+			delta.ownerPositions[entry.child] = index
+		}
+
+		return
+	}
+
+	if delta.ownerPositions != nil {
+		delta.ownerPositions[child] = len(delta.ownerChanges) - 1
+	}
+}
+
+func (delta *relationIndexDelta) ownerChange(child nodeKey) (relationOwnerChange, bool) {
+	if delta.ownerPositions != nil {
+		index, found := delta.ownerPositions[child]
+		if !found {
+			return relationOwnerChange{}, false
+		}
+
+		return delta.ownerChanges[index].change, true
+	}
+
+	for _, entry := range delta.ownerChanges {
+		if entry.child == child {
+			return entry.change, true
+		}
+	}
+
+	return relationOwnerChange{}, false
+}
+
+func (delta *relationIndexDelta) effectiveIncomingOwn(child nodeKey) (incomingOwn, int) {
+	var first incomingOwn
+	count := 0
+	for fieldKey, multiplicity := range delta.index.incoming[child] {
+		if _, replaced := delta.fields.find(fieldKey); replaced {
 			continue
 		}
 
 		field := delta.index.fields[fieldKey]
-		if field.spec.kind == ownRelation && count > 0 {
-			out = append(out, incomingOwn{owner: fieldKey.holder, spec: field.spec})
+		if field.spec.kind == ownRelation && multiplicity > 0 {
+			if count == 0 {
+				first = incomingOwn{owner: fieldKey.holder, spec: *field.spec}
+			}
+
+			count += multiplicity
 		}
 	}
 
-	for fieldKey, field := range delta.fields {
+	for _, entry := range delta.fields.values {
+		fieldKey, field := entry.key, entry.field
 		if field.spec.kind != ownRelation {
 			continue
 		}
 
 		for _, target := range field.targets {
 			if target == child {
-				out = append(out, incomingOwn{owner: fieldKey.holder, spec: field.spec})
+				if count == 0 {
+					first = incomingOwn{owner: fieldKey.holder, spec: *field.spec}
+				}
+
+				count++
 			}
 		}
 	}
 
-	return out
+	return first, count
 }
 
 func (delta *relationIndexDelta) effectiveOwnedBy(child nodeKey) (incomingOwn, bool) {
@@ -238,9 +583,10 @@ func (delta *relationIndexDelta) effectiveOwnedBy(child nodeKey) (incomingOwn, b
 		}
 
 		fieldKey := relationHolderField{holder: child, field: spec.fieldIndex}
-		field, changed := delta.fields[fieldKey]
+		field, changed := delta.fields.find(fieldKey)
 		if !changed {
-			field = delta.index.fields[fieldKey]
+			indexed := delta.index.fields[fieldKey]
+			field = &indexed
 		}
 
 		if len(field.targets) == 1 {
@@ -252,24 +598,33 @@ func (delta *relationIndexDelta) effectiveOwnedBy(child nodeKey) (incomingOwn, b
 }
 
 func (delta *relationIndexDelta) validateOwnerChain(start nodeKey) error {
-	seen := make(map[nodeKey]struct{})
-	for at := start; ; {
-		if _, duplicate := seen[at]; duplicate {
-			return fmt.Errorf("%w: ownership cycle involving %s", ErrRelationInvariant, at)
-		}
-
-		seen[at] = struct{}{}
-		owner, found := delta.effectiveOwner(at)
+	slow := start
+	fast := start
+	for {
+		var found bool
+		slow, found = delta.effectiveOwner(slow)
 		if !found {
 			return nil
 		}
 
-		at = owner
+		fast, found = delta.effectiveOwner(fast)
+		if !found {
+			return nil
+		}
+
+		fast, found = delta.effectiveOwner(fast)
+		if !found {
+			return nil
+		}
+
+		if slow == fast {
+			return fmt.Errorf("%w: ownership cycle involving %s", ErrRelationInvariant, slow)
+		}
 	}
 }
 
 func (delta *relationIndexDelta) effectiveOwner(child nodeKey) (nodeKey, bool) {
-	if changed, exists := delta.ownerChanges[child]; exists {
+	if changed, exists := delta.ownerChange(child); exists {
 		return changed.after, changed.hasAfter
 	}
 
@@ -278,7 +633,8 @@ func (delta *relationIndexDelta) effectiveOwner(child nodeKey) (nodeKey, bool) {
 }
 
 func (delta *relationIndexDelta) supportsOwnershipChanges() bool {
-	for _, change := range delta.ownerChanges {
+	for _, entry := range delta.ownerChanges {
+		change := entry.change
 		if change.hadBefore && !change.hasAfter {
 			return false
 		}
@@ -288,9 +644,14 @@ func (delta *relationIndexDelta) supportsOwnershipChanges() bool {
 }
 
 func (delta *relationIndexDelta) collectInverseTargets() {
-	for fieldKey, field := range delta.fields {
+	for _, entry := range delta.fields.values {
+		fieldKey, field := entry.key, entry.field
 		if field.spec.kind != borrowRelation && field.spec.kind != optionRelation {
 			continue
+		}
+
+		if delta.inverseTargets == nil {
+			delta.inverseTargets = make(map[nodeKey]struct{})
 		}
 
 		for _, target := range delta.index.fields[fieldKey].targets {
@@ -311,20 +672,26 @@ func (delta *relationIndexDelta) publishAndRewire() {
 		panic("nestory: committed relation index changed under graph lock")
 	}
 
-	for fieldKey, replacement := range delta.fields {
+	for _, entry := range delta.fields.values {
+		fieldKey, replacement := entry.key, entry.field
 		old := index.fields[fieldKey]
 		for _, target := range old.targets {
 			index.decrementIncoming(target, fieldKey)
 		}
 
-		replacement.targets = append([]nodeKey(nil), replacement.targets...)
+		if len(replacement.targets) == 0 && cap(replacement.targets) == 0 {
+			// Keep the removed edge's buffer for a later move back to this field.
+			replacement.targets = old.targets[:0]
+		}
+
 		index.fields[fieldKey] = replacement
 		for _, target := range replacement.targets {
 			index.incrementIncoming(target, fieldKey)
 		}
 	}
 
-	for child, change := range delta.ownerChanges {
+	for _, entry := range delta.ownerChanges {
+		child, change := entry.child, entry.change
 		if change.hadBefore {
 			index.removeChild(change.before, child)
 			removeCommittedChild(change.before, child)
@@ -339,7 +706,7 @@ func (delta *relationIndexDelta) publishAndRewire() {
 	}
 
 	committedOwnership.graph = nil
-	committedOwnership.branches = make(map[nodeKey][]nodeKey)
+	clear(committedOwnership.branches)
 	committedOwnership.Unlock()
 
 	delta.rewire(index)
@@ -353,10 +720,6 @@ func removeCommittedChild(owner, child nodeKey) {
 		}
 
 		committedOwnership.outgoing[owner] = append(children[:i], children[i+1:]...)
-		if len(committedOwnership.outgoing[owner]) == 0 {
-			delete(committedOwnership.outgoing, owner)
-		}
-
 		return
 	}
 }
@@ -372,7 +735,8 @@ func addCommittedChild(owner, child nodeKey) {
 }
 
 func (delta *relationIndexDelta) rewire(index *committedRelationIndex) {
-	for fieldKey, indexed := range delta.fields {
+	for _, entry := range delta.fields.values {
+		fieldKey, indexed := entry.key, entry.field
 		value := index.nodes[fieldKey.holder]
 		setIndexedRelationField(value.Elem().Field(indexed.spec.fieldIndex), indexed.targets, index.nodes)
 	}
@@ -410,7 +774,13 @@ func setIndexedRelationField(field reflect.Value, targets []nodeKey, nodes map[n
 		return
 	}
 
-	wired := reflect.MakeSlice(field.Type(), len(targets), len(targets))
+	var wired reflect.Value
+	if field.Cap() >= len(targets) {
+		wired = field.Slice(0, len(targets))
+	} else {
+		wired = reflect.MakeSlice(field.Type(), len(targets), len(targets))
+	}
+
 	for i, target := range targets {
 		wired.Index(i).Set(nodes[target])
 	}
@@ -438,12 +808,12 @@ func (index *committedRelationIndex) inverseHolders(target nodeKey, inverse rela
 		holders = append(holders, holder)
 	}
 
-	sort.Slice(holders, func(i, j int) bool {
-		if holders[i].typ.Name() != holders[j].typ.Name() {
-			return holders[i].typ.Name() < holders[j].typ.Name()
+	slices.SortFunc(holders, func(a, b nodeKey) int {
+		if byName := cmp.Compare(a.typ.Name(), b.typ.Name()); byName != 0 {
+			return byName
 		}
 
-		return holders[i].id < holders[j].id
+		return cmp.Compare(a.id, b.id)
 	})
 
 	return holders
@@ -512,7 +882,8 @@ func indexRelationFields(index *committedRelationIndex, nodes map[nodeKey]relati
 			continue
 		}
 
-		for _, spec := range specs {
+		for specIndex := range specs {
+			spec := &specs[specIndex]
 			if spec.kind != inverseRelation {
 				fieldKey := relationHolderField{holder: key, field: spec.fieldIndex}
 				index.fields[fieldKey] = indexedRelationField{spec: spec}
@@ -559,9 +930,7 @@ func (index *committedRelationIndex) decrementIncoming(target nodeKey, field rel
 		delete(fields, field)
 	}
 
-	if len(fields) == 0 {
-		delete(index.incoming, target)
-	}
+	// Keep an empty bucket: repeated repoints commonly return to this target.
 }
 
 func (index *committedRelationIndex) addChild(owner, child nodeKey) {
@@ -574,7 +943,5 @@ func (index *committedRelationIndex) addChild(owner, child nodeKey) {
 
 func (index *committedRelationIndex) removeChild(owner, child nodeKey) {
 	delete(index.children[owner], child)
-	if len(index.children[owner]) == 0 {
-		delete(index.children, owner)
-	}
+	// Keep an empty bucket so reparenting back does not allocate it again.
 }
