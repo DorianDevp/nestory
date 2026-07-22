@@ -45,6 +45,10 @@ type committer interface {
 	resourceVersion(id int) (int, bool)
 	applyWrite(id int, work any)
 	refreshSnapshot(id int, work any)
+	hasSecondaryIndexes() bool
+	validateIndexes(items []pendingWrite) error
+	prepareIndexes(items []pendingWrite)
+	finishIndexes(items []pendingWrite)
 	encodeWrites(items []pendingWrite) ([]walRow, error)
 	logWrites(items []pendingWrite) error
 }
@@ -333,11 +337,12 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 		}
 	}
 
-	if !structural && !graphChanged && len(touchedResources) == 1 {
+	if !structural && !graphChanged && len(touchedResources) == 1 &&
+		!committerFor(touchedResources[0].dbName).hasSecondaryIndexes() {
 		return en.commitSingleWrite(tx, touchedResources[0])
 	}
 
-	structuralDBNames := transactionStructuralDBNames(createdResources, stagedDeletes)
+	structuralDBNames := transactionStructuralDBNames(touchedResources, createdResources, stagedDeletes)
 	for _, dbName := range structuralDBNames {
 		committerFor(dbName).lockStructure()
 	}
@@ -396,9 +401,16 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 
 	walBackedStructural := structural && (!graphChanged || len(stagedDeletes) == 0 &&
 		(indexDelta != nil || prepareStructuralCreateWAL(model, touchedResources, createdResources)))
-	if err := logTransactionChanges(touchedResources, createdResources, durableDeletes); err != nil {
+	changes := transactionChanges(touchedResources, createdResources, durableDeletes)
+	if err := validateTransactionIndexes(changes); err != nil {
 		return err
 	}
+
+	if err := logTransactionChanges(changes); err != nil {
+		return err
+	}
+
+	prepareTransactionIndexes(changes)
 
 	for _, e := range touchedResources {
 		committerFor(e.dbName).applyWrite(e.id, e.work)
@@ -419,12 +431,14 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 
 	if !graphChanged {
 		applyDeletedNodes(durableDeletes)
+		finishTransactionIndexes(changes)
 		en.evict(tx)
 
 		return nil
 	}
 
 	if indexDelta != nil {
+		finishTransactionIndexes(changes)
 		indexDelta.publishAndRewire()
 		en.evict(tx)
 
@@ -439,6 +453,7 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 
 	applyDeletedNodes(deleted)
 	rewireRelations(relationRuntimes())
+	finishTransactionIndexes(changes)
 
 	if structural && !walBackedStructural {
 		for _, runtime := range relationRuntimes() {
@@ -496,10 +511,17 @@ func transactionGraphAccess(
 }
 
 func transactionStructuralDBNames(
+	resources []touchedResource,
 	creates map[nodeKey]createdResource,
 	deletes map[nodeKey]stagedDelete,
 ) []string {
 	names := make(map[string]struct{}, len(creates)+len(deletes))
+	for _, resource := range resources {
+		if committerFor(resource.dbName).hasSecondaryIndexes() {
+			names[resource.dbName] = struct{}{}
+		}
+	}
+
 	for key := range creates {
 		names[key.typ.Name()] = struct{}{}
 	}
@@ -765,11 +787,11 @@ func registeredRelationMatchFields() (map[reflect.Type]map[int]struct{}, error) 
 	return fields, nil
 }
 
-func logTransactionChanges(
+func transactionChanges(
 	resources []touchedResource,
 	creates map[nodeKey]createdResource,
 	deletes map[nodeKey]struct{},
-) error {
+) map[string][]pendingWrite {
 	byDBName := make(map[string][]pendingWrite)
 	for _, resource := range resources {
 		runtime := baseRegistry[resource.dbName].(relationRuntime)
@@ -794,6 +816,36 @@ func logTransactionChanges(
 		}
 
 		byDBName[key.typ.Name()] = append(byDBName[key.typ.Name()], pendingWrite{id: key.id, deleted: true})
+	}
+
+	return byDBName
+}
+
+func validateTransactionIndexes(changes map[string][]pendingWrite) error {
+	for dbName, writes := range changes {
+		if err := committerFor(dbName).validateIndexes(writes); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func prepareTransactionIndexes(changes map[string][]pendingWrite) {
+	for dbName, writes := range changes {
+		committerFor(dbName).prepareIndexes(writes)
+	}
+}
+
+func finishTransactionIndexes(changes map[string][]pendingWrite) {
+	for dbName, writes := range changes {
+		committerFor(dbName).finishIndexes(writes)
+	}
+}
+
+func logTransactionChanges(byDBName map[string][]pendingWrite) error {
+	if len(byDBName) == 0 {
+		return nil
 	}
 
 	dbNames := make([]string, 0, len(byDBName))

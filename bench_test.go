@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"testing"
 )
 
@@ -160,6 +161,48 @@ func BenchmarkFindOneByID(b *testing.B) {
 				// performs no WAL write.
 				if err := db.Update(branch); err != nil {
 					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkViewRange(b *testing.B) {
+	for _, size := range []int{1_000, 10_000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			quiet(b)
+			DataDir = b.TempDir()
+			resetRegistries()
+			if err := Register[indexedMessage](); err != nil {
+				b.Fatal(err)
+			}
+
+			db := Open[indexedMessage]()
+			for sequence := 1; sequence <= size; sequence++ {
+				db.Unsafe().Create(&indexedMessage{
+					MessageID: strconv.Itoa(sequence), SessionID: "session", Seq: sequence,
+				})
+			}
+
+			if err := db.Unsafe().Flush(); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				var seen int
+				err := db.ViewRange("session_seq", []any{"session"}, func(messages []*indexedMessage) error {
+					seen = len(messages)
+
+					return nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if seen != size {
+					b.Fatalf("messages = %d, want %d", seen, size)
 				}
 			}
 		})

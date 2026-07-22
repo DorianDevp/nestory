@@ -21,6 +21,7 @@ type relationRuntime interface {
 	relationApplyCreate(reflect.Value)
 	relationDelete(map[int]struct{})
 	relationMarkDirty(int)
+	relationReindex() error
 	relationRewire(*relationWireIndex)
 	relationSave() error
 	relationClearQueues()
@@ -126,6 +127,7 @@ func (db *DB[T]) relationDelete(ids map[int]struct{}) {
 	})
 	for _, p := range removed {
 		id := (*p).GetId()
+		db.removeSecondaryIndices(p)
 		delete(db.index["Id"], id)
 		delete(db.resById, id)
 	}
@@ -163,6 +165,13 @@ func (db *DB[T]) relationMarkDirty(id int) {
 	if r, ok := db.resById[id]; ok {
 		db.store.markDirty(r.chunk)
 	}
+}
+
+func (db *DB[T]) relationReindex() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	return db.rebuildSecondaryIndices()
 }
 
 func (db *DB[T]) relationRewire(index *relationWireIndex) { db.fillRelationFrom(index) }
@@ -1423,6 +1432,11 @@ func flushRelations() error {
 	}
 
 	rewireRelations(runtimes)
+	for _, runtime := range runtimes {
+		if err := runtime.relationReindex(); err != nil {
+			return err
+		}
+	}
 
 	for _, runtime := range runtimes {
 		if err := runtime.relationSave(); err != nil {
@@ -1518,6 +1532,12 @@ func flushWithoutRelations(runtimes []relationRuntime) error {
 		}
 
 		runtime.relationDelete(deleted)
+	}
+
+	for _, runtime := range runtimes {
+		if err := runtime.relationReindex(); err != nil {
+			return err
+		}
 	}
 
 	for _, runtime := range runtimes {

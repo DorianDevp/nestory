@@ -63,6 +63,41 @@ caller error. `View` locks the `own` subtree; `borrow` and `option` targets
 outside that subtree remain navigation pointers without the same consistency
 window.
 
+For flat hot data, declare durable secondary indexes and read several stable
+pointers under one callback instead of cloning one detached branch per row:
+
+```go
+type Message struct {
+    Id        int
+    MessageID string `key:"unique"`
+    SessionID string `index:"session_seq,1,unique"`
+    Seq       int    `index:"session_seq,2,unique"`
+    Payload   []byte
+}
+
+err := messages.ViewRange("session_seq", []any{sessionID}, func(rows []*Message) error {
+    for _, row := range rows { // ordered by SessionID, then Seq
+        consume(row.Payload)
+    }
+    return nil
+})
+
+err = messages.ViewMany(ids, func(rows []*Message) error {
+    // rows are deduplicated and ordered by Id
+    return consumeBatch(rows)
+})
+```
+
+`key:"unique"` creates a single-field unique index. Composite fields share an
+`index` name and use consecutive positions starting at 1; add `unique` to every
+field tag when the complete tuple must be unique. Indexes are rebuilt on
+`Open`, updated atomically with safe transactions, and validated at
+`Unsafe().Flush`. `ViewRange` accepts a typed leading prefix, so an index on
+`(SessionID, Seq)` can return one session without scanning other sessions.
+
+Like `View`, batch view pointers are read-only by contract and must not escape
+the callback for synchronized use.
+
 For natural struct editing across several operations, `Transaction` detects
 changes automatically and commits the callback's final graph once:
 
