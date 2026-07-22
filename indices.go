@@ -1,18 +1,9 @@
 package nestory
 
-import "reflect"
-
-// initIndices creates an empty inner map for every field of T.
+// initIndices creates only indexes that are actually maintained. Non-indexed
+// fields deliberately remain absent so FindOneBy can fall back to a scan.
 func (db *DB[T]) initIndices() {
-	baseType := reflect.TypeOf(*new(T))
-	if baseType.Kind() == reflect.Pointer {
-		baseType = baseType.Elem()
-	}
-
-	for i := range baseType.NumField() {
-		fieldName := baseType.Field(i).Name
-		db.index[fieldName] = make(map[any]*T)
-	}
+	db.index["Id"] = make(map[any]*T)
 }
 
 // syncIdIndex points Index["Id"] at the stable slot for every live entity and
