@@ -374,7 +374,7 @@ func BenchmarkUnsafePointMutationFlush(b *testing.B) {
 	}
 }
 
-// direct map hit on the Id index.
+// direct map hit on the primary index.
 func BenchmarkIndexLookupID(b *testing.B) {
 	for _, n := range benchSizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
@@ -384,7 +384,7 @@ func BenchmarkIndexLookupID(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_ = db.index["Id"][target]
+				_ = db.resById[target]
 			}
 		})
 	}

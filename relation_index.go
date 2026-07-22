@@ -319,7 +319,7 @@ func (delta *relationIndexDelta) indexCreatedTargets(creates map[nodeKey]created
 
 			field := spec.matchField
 			if spec.kind == ownRelation && spec.many {
-				field = "Id"
+				field = entityIDField
 			}
 
 			if _, indexed := delta.index.targetFields[spec.target][field]; !indexed {
@@ -538,7 +538,7 @@ func indexedOwnBackReferenceMatches(owner, child reflect.Value, spec relationSpe
 		return !back.IsNil() && back.Pointer() == owner.Pointer()
 	}
 
-	id := owner.Elem().FieldByName("Id")
+	id := owner.Elem().FieldByName(entityIDField)
 
 	return scalarEqual(back, id)
 }
@@ -550,7 +550,7 @@ func setIndexedOwnBackReference(owner, child reflect.Value, spec relationSpec) {
 		return
 	}
 
-	back.Set(owner.Elem().FieldByName("Id"))
+	back.Set(owner.Elem().FieldByName(entityIDField))
 }
 
 func (delta *relationIndexDelta) validateOwnership() error {

@@ -98,7 +98,7 @@ func (db *DB[T]) relationPrepareCreate(value reflect.Value) error {
 		return nil
 	}
 
-	if db.index[db.identifier][id] != nil {
+	if _, exists := db.resById[id]; exists {
 		return fmt.Errorf("%w: %s(%d)", ErrAlreadyExists, db.name, id)
 	}
 
@@ -128,7 +128,6 @@ func (db *DB[T]) relationDelete(ids map[int]struct{}) {
 	for _, p := range removed {
 		id := (*p).GetId()
 		db.removeSecondaryIndices(p)
-		delete(db.index["Id"], id)
 		delete(db.resById, id)
 	}
 }
@@ -743,7 +742,7 @@ func resolveGraphTarget(model *relationModel, r relationSpec, pointer reflect.Va
 func graphRelationTargetKey(r relationSpec, pointer reflect.Value) (relationTargetKey, bool) {
 	matchField := r.matchField
 	if r.kind == ownRelation && r.many {
-		matchField = "Id"
+		matchField = entityIDField
 	}
 
 	key, present := relationKey(pointer, matchField)
@@ -952,7 +951,7 @@ func relationTargetFields(nodes map[nodeKey]relationGraphNode) (map[reflect.Type
 
 			matchField := spec.matchField
 			if spec.kind == ownRelation && spec.many {
-				matchField = "Id"
+				matchField = entityIDField
 			}
 
 			if fieldsByType[spec.target] == nil {
@@ -1341,7 +1340,7 @@ func syncOwnSliceBackReference(model *relationModel, ref resolvedRelation) bool 
 		return true
 	}
 
-	id := owner.value.Elem().FieldByName("Id")
+	id := owner.value.Elem().FieldByName(entityIDField)
 	back.Set(id)
 	return true
 }
@@ -1354,7 +1353,7 @@ func ownSliceBackReferenceMatches(model *relationModel, ref resolvedRelation) bo
 		return !back.IsNil() && back.Pointer() == owner.value.Pointer()
 	}
 
-	id := owner.value.Elem().FieldByName("Id")
+	id := owner.value.Elem().FieldByName(entityIDField)
 	return scalarEqual(back, id)
 }
 

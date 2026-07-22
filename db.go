@@ -14,7 +14,7 @@ type Entity interface {
 	GetId() int
 }
 
-type indexMap[T any] map[string]map[any]T
+const entityIDField = "Id"
 
 type detachedRoot[T Entity] struct {
 	id       int
@@ -30,7 +30,6 @@ type DB[T Entity] struct {
 	store        *chunkStore[T]
 	persistQueue []*T
 	deleteQueue  []*T
-	index        indexMap[*T] // o2o index, keyed by field then value
 	secondary    map[string]*secondaryIndex[T]
 	schemaFields [][2]string
 	directSchema bool
@@ -105,10 +104,9 @@ func Open[T Entity]() *DB[T] {
 		return existing.(*DB[T])
 	}
 
-	initBase := &DB[T]{identifier: "Id"}
+	initBase := &DB[T]{identifier: entityIDField}
 
 	initBase.name = name
-	initBase.index = make(indexMap[*T])
 	initBase.resById = make(map[int]*resourceSlot[T])
 	initBase.snapshots = make(map[*T]detachedRoot[T])
 	initBase.schemaFields = initBase.createSchemaFields()
@@ -173,7 +171,7 @@ func setID[T any](entity *T, id int) {
 	}
 
 	val = val.Elem()
-	idField := val.FieldByName("Id")
+	idField := val.FieldByName(entityIDField)
 	if !idField.IsValid() {
 		panic("ID field not found")
 	}

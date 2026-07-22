@@ -14,7 +14,7 @@ type walTestRow struct {
 }
 
 type walComplexRow struct {
-	Id     int
+	Id     int `key:"primary"`
 	Values []string
 }
 
@@ -272,21 +272,21 @@ func TestWALReplaysInsertAndDeleteWithoutSnapshot(t *testing.T) {
 }
 
 type walTestEntity struct {
-	Id   int
+	Id   int `key:"primary"`
 	Name string
 }
 
 func (entity walTestEntity) GetId() int { return entity.Id }
 
 type walAtomicLeft struct {
-	Id   int
+	Id   int `key:"primary"`
 	Name string
 }
 
 func (entity walAtomicLeft) GetId() int { return entity.Id }
 
 type walAtomicRight struct {
-	Id   int
+	Id   int `key:"primary"`
 	Name string
 }
 
