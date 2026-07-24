@@ -306,6 +306,34 @@ func BenchmarkSafeGetByIDOnly(b *testing.B) {
 	}
 }
 
+// BenchmarkViewByID is the safe point read: the row is read-locked for the
+// callback and never copied. It is the closest comparison to another engine's
+// "get by primary key", since Unsafe.Get assumes exclusive access and detached
+// Get pays for a mutable copy.
+func BenchmarkViewByID(b *testing.B) {
+	for _, n := range benchSizes {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			quiet(b)
+			db := newBenchDB(b, n)
+			target := n / 2
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				err := db.View(target, func(item *benchItem) error {
+					if item.Id != target {
+						b.Fatal("wrong entity")
+					}
+
+					return nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkUnsafeGetByID(b *testing.B) {
 	for _, n := range benchSizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {

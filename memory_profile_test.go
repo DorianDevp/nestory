@@ -83,12 +83,20 @@ func TestIndexedMemoryProfile(t *testing.T) {
 func memoryProfileSubprocess(t *testing.T, variant string) memoryProfileSample {
 	t.Helper()
 
+	return memoryProfileRun(t, "TestIndexedMemoryProfile", variant)
+}
+
+// memoryProfileRun re-executes one test in a fresh process so a variant's
+// retained heap is measured without whatever the previous variant left behind.
+func memoryProfileRun(t *testing.T, testName, variant string) memoryProfileSample {
+	t.Helper()
+
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	command := exec.Command(executable, "-test.run=^TestIndexedMemoryProfile$", "-test.v")
+	command := exec.Command(executable, "-test.run=^"+testName+"$", "-test.v")
 	command.Env = append(os.Environ(), memoryProfileWorkerEnv+"="+variant)
 	output, err := command.CombinedOutput()
 	if err != nil {

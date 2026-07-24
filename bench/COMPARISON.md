@@ -1,7 +1,7 @@
 # nestory — benchmarks & comparison
 
-Same-machine, same-session comparison of nestory against five pure-Go stores,
-on an identical record shape.
+Same-machine, same-session comparison of nestory against five pure-Go embedded
+stores and one server database, on an identical record shape.
 
 > **Methodology.** All numbers measured on the machine below, `benchtime=300ms`.
 > nestory's numbers come from its in-package benchmark (`../bench_test.go` — it
@@ -12,54 +12,73 @@ on an identical record shape.
 > These are *indicative*, not publication-grade: one machine, one run, short
 > benchtime. The durability and write-amplification models differ — read the
 > caveats before quoting any single ratio.
+>
+> **Freshness.** The four cross-engine tables (bulk insert, point read, point
+> write, scan), the ownership-branch write tables and the Tower memory profile
+> were re-measured together in one session. The remaining nestory-only
+> diagnostics — ordered hot-history, indexed memory footprint, dialog-tree
+> mutation, delta cursor — were **not** re-run in that pass and carry their
+> original numbers.
 
 ## Environment
 
 - CPU: Intel Core i5-8600K @ 3.60 GHz (6 cores), linux/amd64, Go test harness.
-- Competitors: `modernc.org/sqlite` (`synchronous=FULL`), `go.etcd.io/bbolt`,
-  `tidwall/buntdb` (`SyncPolicy=Always`), `dgraph-io/badger/v4`
-  (`SyncWrites=true`), and `hashicorp/go-memdb` (**no durability**).
+- Embedded competitors: `modernc.org/sqlite` (`synchronous=FULL`),
+  `go.etcd.io/bbolt`, `tidwall/buntdb` (`SyncPolicy=Always`),
+  `dgraph-io/badger/v4` (`SyncWrites=true`), and `hashicorp/go-memdb`
+  (**no durability**).
+- Server competitor: MongoDB 8 in Docker, reached over loopback TCP, write
+  concern `w=1, j=true`. **Not comparable head to head** — see caveat 6.
 
 ## Workloads (matched across engines)
 
-| Workload | nestory | SQLite / bbolt | go-memdb |
-|---|---|---|---|
-| **Bulk insert** | queue n + 1 `Flush` (1 fsync) | n inserts in 1 txn (1 fsync) | n inserts in 1 txn (no fsync) |
-| **Point read** | `View`, detached `Get`, or raw `Unsafe.Get` | `SELECT … WHERE id=?` / `Get` | `First("id")` |
-| **Point write** | `UpdateWithin` + fsynced WAL frame | one fsynced transaction | one in-memory transaction |
-| **Scan** | `Filter` (Age==42) | `SELECT … WHERE age=?` / cursor | iterate + filter |
+| Workload | nestory | SQLite / bbolt | go-memdb | MongoDB |
+|---|---|---|---|---|
+| **Bulk insert** | queue n + 1 `Flush` (1 fsync) | n inserts in 1 txn (1 fsync) | n inserts in 1 txn (no fsync) | one `InsertMany` of n |
+| **Point read** | `View`, detached `Get`, or raw `Unsafe.Get` | `SELECT … WHERE id=?` / `Get` | `First("id")` | `findOne({_id})` |
+| **Point write** | `UpdateWithin` + fsynced WAL frame | one fsynced transaction | one in-memory transaction | `updateOne` journaled |
+| **Scan** | `Filter` (Age==42) | `SELECT … WHERE age=?` / cursor | iterate + filter | `find({age:42})` cursor |
 
 ## Durable bulk insert — time per batch (lower = better)
 
-| n | nestory | SQLite | bbolt | BuntDB | Badger | go-memdb* |
-|---:|---:|---:|---:|---:|---:|---:|
-| 100 | **89 µs** | 280 µs | 279 µs | 234 µs | 310 µs | 74 µs |
-| 1,000 | **0.51 ms** | 1.79 ms | 2.64 ms | 2.32 ms | 2.66 ms | 0.75 ms |
-| 10,000 | **5.43 ms** | 16.6 ms | 32.9 ms | 24.6 ms | 28.8 ms | 8.27 ms |
+| engine | n=100 | n=1,000 | n=10,000 | rows/s @10k | B/op @10k | allocs/op @10k |
+|---|---:|---:|---:|---:|---:|---:|
+| **nestory** | **87 µs** | **0.45 ms** | **5.58 ms** | **1.79 M** | 4.88 MB | **11,170** |
+| go-memdb* | 80 µs | 0.88 ms | 10.4 ms | 962 k | 4.96 MB | 110,447 |
+| SQLite | 283 µs | 1.86 ms | 20.9 ms | 477 k | **3.59 MB** | 149,000 |
+| BuntDB | 253 µs | 2.55 ms | 27.3 ms | 367 k | 24.6 MB | 259,845 |
+| Badger | 337 µs | 2.96 ms | 31.5 ms | 317 k | 19.1 MB | 369,722 |
+| bbolt | 349 µs | 3.84 ms | 42.9 ms | 233 k | 34.9 MB | 546,061 |
+| MongoDB† | 4.11 ms | 10.5 ms | 66.8 ms | 150 k | 59.2 MB | 299,968 |
 
 \* go-memdb is **not durable** — no fsync — so its write number isn't comparable
 to the others; it's the in-memory floor.
 
-At n=10k that is about 1.84 million durable rows/s. In this harness nestory is
-roughly 3× faster than SQLite and 6× faster than bbolt; even go-memdb's
+† MongoDB is a server, not an embedded store — see caveat 6.
+
+At n=10k that is about 1.79 million durable rows/s. In this harness nestory is
+roughly 3.7× faster than SQLite and 7.7× faster than bbolt; even go-memdb's
 non-durable MVCC batch is slower.
 
 ## Point read by id — ns/op (lower = better)
 
-| engine / API | n=100 | n=1,000 | n=10,000 | allocs/op |
-|---|---:|---:|---:|---:|
-| **nestory `Unsafe.Get`** | 27 | 28 | **28** | **0** |
-| **nestory `View`** | 145 | 145 | **145** | **0** |
-| **nestory detached `Get`** | 200 | 201 | **211** | 2 |
-| go-memdb | 210 | 229 | 228 | 5–6 |
-| SQLite | 10,343 | 10,481 | 10,523 | 22–24 |
-| BuntDB | 11,156 | 11,558 | 10,920 | 168 |
-| Badger | 11,361 | 11,356 | 11,597 | 173 |
-| bbolt | 11,765 | 11,642 | 11,936 | 173–186 |
+| engine / API | n=100 | n=1,000 | n=10,000 | reads/s @10k | B/op @10k | allocs/op |
+|---|---:|---:|---:|---:|---:|---:|
+| **nestory `Unsafe.Get`** | 32 | 32 | **32** | **30.9 M** | **0** | **0** |
+| **nestory `View`** | 53 | 56 | **56** | **17.9 M** | **0** | **0** |
+| **nestory detached `Get`** | 195 | 195 | **197** | 5.08 M | 96 | 2 |
+| go-memdb | 267 | 326 | 287 | 3.49 M | 208 | 5–6 |
+| SQLite | 10,577 | 10,816 | 10,988 | 91.0 k | 656 | 22–24 |
+| BuntDB | 11,157 | 11,801 | 12,127 | 82.5 k | 7,480 | 168 |
+| Badger | 11,965 | 12,220 | 12,163 | 82.2 k | 8,148 | 173 |
+| bbolt | 14,198 | 14,409 | 13,363 | 74.8 k | 7,984 | 173–186 |
+| MongoDB† | 129,702 | 126,751 | 126,571 | 7.90 k | 12,005 | 95–97 |
 
-`View` is the closest safe comparison: it read-locks the live ownership branch
-for the callback without copying. `Unsafe.Get` is the exclusive-access floor;
-detached `Get` pays for a mutable branch copy.
+`View` is the closest safe comparison: it read-locks the row for the callback
+without copying. `Unsafe.Get` is the exclusive-access floor; detached `Get` pays
+for a mutable branch copy. At n=10,000 `View` is about 196× faster than SQLite
+and 2,260× faster than MongoDB, but the MongoDB figure is dominated by the
+loopback round trip rather than by its storage engine.
 
 ## Ordered hot-history operations
 
@@ -129,14 +148,19 @@ of requesting the complete context again.
 
 ## Durable point write — µs/op (lower = better)
 
-| engine | n=100 | n=1,000 | n=10,000 | allocs/op at 10k |
-|---|---:|---:|---:|---:|
-| **nestory** | **2.58** | **2.61** | **2.67** | **12** |
-| BuntDB | 3.92 | 4.07 | 3.99 | 32 |
-| go-memdb* | 3.02 | 4.11 | 4.38 | 62 |
-| Badger | 10.4 | 10.6 | 10.6 | 61 |
-| bbolt | 13.2 | 14.5 | 17.2 | 115 |
-| SQLite | 48.3 | 49.1 | 49.3 | 7 |
+| engine | n=100 | n=1,000 | n=10,000 | writes/s @10k | B/op @10k | allocs/op @10k |
+|---|---:|---:|---:|---:|---:|---:|
+| **nestory** | **2.98** | **3.02** | **3.08** | **325 k** | 802 | 14 |
+| BuntDB | 4.40 | 4.70 | 4.30 | 233 k | 2,224 | 32 |
+| go-memdb* | 3.98 | 5.87 | 5.72 | 175 k | 9,082 | 62 |
+| Badger | 11.0 | 11.1 | 11.0 | 90.6 k | 3,434 | 61 |
+| bbolt | 14.8 | 16.2 | 19.6 | 51.0 k | 16,392 | 115 |
+| SQLite | 51.7 | 51.6 | 50.7 | 19.7 k | **168** | **7** |
+| MongoDB† | 647 | 593 | 631 | 1.58 k | 6,883 | 98 |
+
+SQLite allocates least per write and is slowest by 16×: its cost is the fsync
+protocol, not Go-side garbage. Reading the two columns together is the point —
+neither alone tells you what an engine does.
 
 Nestory appends and fsyncs one compact WAL frame before publishing the in-memory
 update. On this filesystem it beats every durable comparator in the point-write
@@ -196,18 +220,109 @@ under that pressure, scalar tail latency stays below 0.2 ms rather than inheriti
 the old multi-millisecond global scan. Moving validation outside the write lock
 with a graph-generation OCC check is therefore not justified by this result.
 
+## Scalar write inside an ownership branch — µs/op (lower = better)
+
+No other engine here models ownership, so this one compares nestory's three ways
+of doing the same write: set one scalar field on a root that owns *n* children.
+`Get`+`Update` and a transaction both copy the whole branch and merge it back;
+`UpdateWithin` diffs a persistent shadow; `Tracked().UpdateWithin` declares the
+write and diffs only what was declared. From `BenchmarkTowerVersusBranchClone`
+and `BenchmarkTrackedRootWrite`.
+
+| owned children | `Tracked`‡ | `UpdateWithin` | transaction | `Get`+`Update` |
+|---:|---:|---:|---:|---:|
+| 1 | 5.28 | 6.27 | **5.91** | 6.13 |
+| 2 | **5.33** | 5.59 | 6.23 | 6.18 |
+| 4 | 5.94 | **5.64** | 8.64 | 8.04 |
+| 10 | 6.42 | **5.78** | 14.7 | 13.0 |
+| 100 | **7.76** | 8.75 | 82.1 | 80.1 |
+| 1,000 | **23.4** | 38.4 | 829 | 787 |
+| 10,000 | **183** | 327 | 8,275 | 8,230 |
+| 100,000 | **1,818** | 3,531 | 97,297 | 97,082 |
+
+‡ `Tracked` comes from `BenchmarkTrackedRootWrite`, the other three from
+`BenchmarkTowerVersusBranchClone`. The two benchmarks share an `UpdateWithin`
+column and it agrees within about 1%, which is why they can sit in one table.
+
+Allocation is where the shape of the difference shows:
+
+| owned children | `Tracked` | `UpdateWithin` | `Get`+`Update` |
+|---:|---:|---:|---:|
+| 1 | 27 / 2.0 kB | 26 / 2.0 kB | 30 / 1.7 kB |
+| 100 | 27 / 2.0 kB | 26 / 2.0 kB | 440 / 61 kB |
+| 1,000 | 27 / 2.0 kB | 26 / 2.0 kB | 4,047 / 620 kB |
+| 10,000 | 27 / 2.0 kB | 26 / 2.0 kB | 40,111 / 7.25 MB |
+| 100,000 | 27 / 2.0 kB | 26 / 2.0 kB | 400,569 / 75.4 MB |
+
+Both shadow paths are **flat**: the replica already exists, so a write allocates
+what it publishes and nothing per owned node. The copying path allocates one
+clone per node in the branch, touched or not — which is also why it is the only
+column whose numbers grow.
+
+At one owned child copying wins, by about 5%: maintaining a shadow buys nothing
+there. From two children up the shadow path is ahead, and the gap widens with
+branch size because one side is O(nodes compared) and the other is O(nodes
+copied). The declaration adds a second step change from roughly a hundred
+children, where diffing the branch starts to outweigh the fixed cost of a
+commit.
+
+### What the shadow costs in RAM
+
+The flat allocation counts above are bought with memory. `rebuild()` clones the
+**complete** committed relation index, not the branch being written, so the
+first `UpdateWithin` on any relation-carrying type retains a second copy of
+every participating entity in the project for as long as the replica stays
+valid. `TestTowerMemoryProfile` prices it: build the graph, sample the retained
+heap, then repeat with one scalar root write in between.
+
+| payload/record | nodes | graph alone | + replica | replica adds | per node | live heap |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 B | 100,001 | 140.3 MiB | 173.4 MiB | 33.1 MiB | **347 B** | **+24%** |
+| 128 B | 100,001 | 152.6 MiB | 197.9 MiB | 45.3 MiB | **475 B** | **+30%** |
+| 1 KiB | 50,001 | 119.3 MiB | 184.7 MiB | 65.4 MiB | **1,371 B** | **+55%** |
+
+The three rows decompose cleanly: 347 + 128 = 475 and 347 + 1024 = 1371. So the
+cost is a **fixed ~347 B per node plus a byte-for-byte copy of every slice
+field** — `cloneSliceFields` gives each shadow node its own backing array, which
+is what makes the shadow safe to mutate inside a callback.
+
+The fixed part is mostly bookkeeping rather than record data: two
+`nodeKey`-keyed maps (`nodes` and `live`), the cached branch (96 B per node of
+`towerBranchNode`, a third of it the two boxed pointers the comparator needs),
+the relation baseline, and the shadow struct itself.
+
+Read together with the timing table, the trade is: a scalar write on a
+100,000-child branch drops from 97 ms to 3.5 ms, and the project's live heap
+grows by roughly a third. That is a good trade for a write-heavy graph and a bad
+one for a large graph that is written rarely — the replica is retained whether
+or not it is used again, until any participating table changes.
+
+Run it with:
+
+```sh
+NESTORY_MEMORY_PROFILE=1 go test -run '^TestTowerMemoryProfile$' -count=1 -v
+```
+
 ## Full scan + filter — time per scan (lower = better)
 
-| engine | n=100 | n=1,000 | n=10,000 |
-|---|---:|---:|---:|
-| **nestory** | 435 ns | 4.68 µs | **46.9 µs** |
-| go-memdb | 739 ns | 5.72 µs | 57.8 µs |
-| SQLite | 26.3 µs | 83.0 µs | 625 µs |
-| bbolt | 1.11 ms | 11.1 ms | 112 ms |
+| engine | n=100 | n=1,000 | n=10,000 | rows scanned/s @10k | B/op @10k |
+|---|---:|---:|---:|---:|---:|
+| **nestory** | 474 ns | 5.08 µs | **50.2 µs** | **199 M** | 15.7 kB |
+| go-memdb | 811 ns | 6.04 µs | 60.4 µs | 166 M | **312 B** |
+| SQLite | 27.1 µs | 85.1 µs | 744 µs | 13.4 M | 15.5 kB |
+| MongoDB† | 203 µs | 524 µs | 3.80 ms | 2.63 M | 547 kB |
+| Badger | 1.22 ms | 11.6 ms | 116 ms | 86.3 k | 75.9 MB |
+| BuntDB | 1.18 ms | 13.6 ms | 120 ms | 83.3 k | 74.1 MB |
+| bbolt | 1.34 ms | 14.4 ms | 145 ms | 69.1 k | 73.1 MB |
 
 **nestory wins again** — contiguous `[]T` scan, no per-row deserialization.
-~1.4× faster than go-memdb, ~15× SQLite, ~2,700× bbolt. (bbolt is so slow here
+~1.2× faster than go-memdb, ~15× SQLite, ~2,900× bbolt. (bbolt is so slow here
 because every value is gob-decoded on read — inherent to a KV store of blobs.)
+
+This is the one workload where MongoDB beats the embedded KV stores, by ~30×.
+That is not a storage-engine result: Mongo filters server side and ships only
+the matching rows, while the KV harness pulls every value across and gob-decodes
+it in the client. It measures the harness's encoding choice, not the engines.
 
 ## How to read this — the honest caveats
 
@@ -232,22 +347,46 @@ because every value is gob-decoded on read — inherent to a KV store of blobs.)
    locks; `View` read-locks an ownership branch. `Unsafe` deliberately provides
    no isolation or locking and requires caller-managed exclusive access.
 
+6. **MongoDB is in a different category and its ratios mean less.** Every other
+   engine here runs inside the benchmark process; Mongo answers over a loopback
+   socket. Its ~127 µs point read is roughly a client/server round trip plus
+   BSON encode/decode, so the comparison mostly measures *embedded versus
+   networked*, not one storage engine against another. It also ran on Docker's
+   overlay filesystem rather than the host filesystem the others used, so its
+   journal fsync is not the same operation. Read it as "what an out-of-process
+   database costs you", and nothing finer.
+
 ## Verdict
 
 For its niche — an in-RAM, pointer-native graph with WAL durability — nestory is
 the fastest measured engine on flat reads, scans, durable point writes and
 durable bulk inserts in this harness. ID-targeted structural graph mutation now
-avoids both global validation and global rewiring; detached branch copying
-remains size-dependent only when the caller chooses a large ownership root.
+avoids both global validation and global rewiring.
+
+Detached branch copying is no longer the only option for a large ownership root:
+`UpdateWithin` keeps a persistent shadow of the graph and publishes a diff, so a
+scalar root write costs a comparison per node instead of a copy per node, at a
+flat 26 allocations regardless of branch size. At 100,000 owned children that is
+3.5 ms against 97 ms, and 1.8 ms if the write is declared through
+`Tracked().UpdateWithin`.
 
 ## Reproduce
 
 ```sh
 # nestory (from repo root — needs the in-package harness):
-go test -run='^$' -bench='BatchInsertFlush|SafeGetByIDOnly|UnsafeGetByID|RelationView|PointWrite|Filter|DialogTree' -benchmem -benchtime=300ms
+go test -run='^$' -bench='BatchInsertFlush|ViewByID|SafeGetByIDOnly|UnsafeGetByID|PointWrite|Filter' -benchmem -benchtime=300ms
 
-# competitors (from ./bench):
+# ownership-branch write (fixed iteration count — the largest branch is slow):
+go test -run='^$' -bench='TowerVersusBranchClone|TrackedRootWrite' -benchmem -benchtime=200x
+
+# embedded competitors (from ./bench):
 go test ./compare/ -run='^$' -bench=. -benchmem -benchtime=300ms
+
+# MongoDB — skipped unless a server is reachable (from ./bench):
+docker run -d --name nestory-bench-mongo -p 127.0.0.1:27018:27017 mongo:8
+NESTORY_MONGO_URI=mongodb://127.0.0.1:27018 \
+  go test ./compare/ -run='^$' -bench=Mongo -benchmem -benchtime=300ms
+docker rm -f nestory-bench-mongo
 ```
 
 Not yet measured here (need extra infra): cgo SQLite (`mattn/go-sqlite3`, needs a

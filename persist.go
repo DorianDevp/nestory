@@ -15,6 +15,7 @@ func (db *DB[T]) add(entity *T) {
 	resource := db.store.Append(*entity)
 	id := (*resource.item).GetId()
 	db.resById[id] = resource
+	db.markChanged()
 }
 
 // Create persists entity and its new ownership subtree in one short

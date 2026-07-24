@@ -130,6 +130,9 @@ func (db *DB[T]) relationDelete(ids map[int]struct{}) {
 		db.removeSecondaryIndices(p)
 		delete(db.resById, id)
 	}
+	if len(removed) > 0 {
+		db.markChanged()
+	}
 }
 
 var (
@@ -357,6 +360,32 @@ func committedOwnerHasChildren(owner nodeKey) bool {
 	return len(committedOwnership.outgoing[owner]) > 0
 }
 
+// committedOwnershipRoot walks node up to the owner that nothing owns. Two
+// nodes share that owner exactly when their ownership branches can overlap,
+// which is what tells the Tower which callbacks may run side by side.
+func committedOwnershipRoot(node nodeKey) nodeKey {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	index := committedOwnership.index
+	if index == nil {
+		return node
+	}
+
+	// Ownership is acyclic, but the bound keeps a broken index from wedging
+	// every writer on a lock this call is holding.
+	for range len(index.owners) + 1 {
+		owner, found := index.owners[node]
+		if !found {
+			break
+		}
+
+		node = owner
+	}
+
+	return node
+}
+
 func committedOwnershipKeys(root nodeKey) []nodeKey {
 	committedOwnership.RLock()
 	keys := committedOwnership.branches[root]
@@ -458,16 +487,16 @@ func collectRelationNodesWithOverrides(includePending bool, overrides map[nodeKe
 // node it transitively owns. Relation pointers inside that aggregate are
 // rewired to the copies, preserving pointer identity without touching live
 // store objects.
-func cloneOwnershipAggregate(root nodeKey, record func(touchedResource)) (any, error) {
+func cloneOwnershipAggregate(root nodeKey) (any, []touchedResource, error) {
 	graphMu.RLock()
 	defer graphMu.RUnlock()
 
 	if err := ensureCommittedOwnership(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if !committedOwnerHasChildren(root) {
-		return cloneSingleOwnershipResource(root, record)
+		return cloneSingleOwnershipResource(root)
 	}
 
 	ordered := committedOwnershipKeys(root)
@@ -487,7 +516,7 @@ func cloneOwnershipAggregate(root nodeKey, record func(touchedResource)) (any, e
 	for _, key := range ordered {
 		workCopy, originalCopy, version, found := committerFor(key.typ.Name()).snapshotResource(key.id)
 		if !found {
-			return nil, ErrNotFound
+			return nil, nil, ErrNotFound
 		}
 
 		resource := touchedResource{
@@ -501,24 +530,20 @@ func cloneOwnershipAggregate(root nodeKey, record func(touchedResource)) (any, e
 	}
 
 	if err := rewireOwnershipResources(resources); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	for _, resource := range resources {
-		record(resource)
-	}
-
-	return rootWork, nil
+	return rootWork, resources, nil
 }
 
-func cloneSingleOwnershipResource(root nodeKey, record func(touchedResource)) (any, error) {
+func cloneSingleOwnershipResource(root nodeKey) (any, []touchedResource, error) {
 	committer := committerFor(root.typ.Name())
 	committer.lockResource(root.id)
 	defer committer.unlockResource(root.id)
 
 	work, original, version, found := committer.snapshotResource(root.id)
 	if !found {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 
 	resource := touchedResource{
@@ -526,12 +551,10 @@ func cloneSingleOwnershipResource(root nodeKey, record func(touchedResource)) (a
 		work: work.Interface(), original: original.Interface(),
 	}
 	if err := rewireSingleOwnershipResource(root, &resource); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	record(resource)
-
-	return resource.work, nil
+	return resource.work, []touchedResource{resource}, nil
 }
 
 func rewireSingleOwnershipResource(key nodeKey, resource *touchedResource) error {

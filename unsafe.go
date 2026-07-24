@@ -20,12 +20,14 @@ func (unsafe UnsafeDB[T]) Get(id int) (*T, error) {
 		return nil, err
 	}
 
+	unsafe.db.markChanged()
 	unsafe.db.store.markDirty(resource.chunk)
 	return resource.item, nil
 }
 
 // All returns every stable live pointer and marks every chunk dirty.
 func (unsafe UnsafeDB[T]) All() []*T {
+	unsafe.db.markChanged()
 	unsafe.db.store.markAllDirty()
 
 	return unsafe.db.store.StorePointers()
@@ -39,4 +41,7 @@ func (unsafe UnsafeDB[T]) Delete(id int) error { return unsafe.db.queueDelete(id
 
 // Flush validates the complete live graph, applies unsafe deletes, and writes
 // every dirty chunk.
-func (unsafe UnsafeDB[T]) Flush() error { return flushRelations() }
+func (unsafe UnsafeDB[T]) Flush() error {
+	unsafe.db.markChanged()
+	return flushRelations()
+}

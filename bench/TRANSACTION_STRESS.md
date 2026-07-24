@@ -10,7 +10,7 @@ Measured on 2026-07-24 using:
 This diagnostic measures how the transaction pipeline scales when one ownership
 root has between 10 and 1,000,000 direct children.
 
-## Workload
+## Detached-branch baseline workload
 
 Every measured transaction:
 
@@ -162,7 +162,44 @@ settled database heap.
     └── WAL:                   13 us
 ```
 
-The limiting behavior in this workload is not GC or WAL. Changing one scalar
-on the root currently requires cloning, registering, rewiring, locking and
-later comparing the complete ownership subtree.
+The limiting behavior in this baseline was not GC or WAL. Changing one scalar
+on the root required cloning, registering, rewiring, locking and later
+comparing the complete ownership subtree.
 
+## Tower result
+
+The same scalar-root workload was rerun after adding the project-wide Tower
+shadow, cached semantic field plans, a cached hot branch, changed-field patch
+materialization, and batch transaction registration. Each steady-state result
+below is the mean of three transactions. `cold` includes the first Tower
+replica build and its first commit.
+
+Command:
+
+```sh
+NESTORY_STRESS=1 go test -run '^$' \
+  -bench '^BenchmarkTowerScalarRootWriteStress$' \
+  -benchtime=3x -benchmem -count=1
+```
+
+| children | Tower cold | Tower steady | previous steady | steady reduction | steady allocations |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 33.15 us | 9.07 us | 16.09 us | 43.6% | 1,845 B / 36 |
+| 100 | 130.44 us | 15.07 us | 92.85 us | 83.8% | 1,845 B / 36 |
+| 1,000 | 1.27 ms | 87.92 us | 913.65 us | 90.4% | 1,845 B / 36 |
+| 10,000 | 14.01 ms | 801.91 us | 9.28 ms | 91.4% | 1,845 B / 36 |
+| 100,000 | 184.43 ms | 8.63 ms | 110.90 ms | 92.2% | 1,845 B / 36 |
+| 1,000,000 | **2.509 s** | **150.39 ms** | **1.722 s** | **91.3%** | **1,845 B / 36** |
+
+The steady million-child transaction no longer allocates or clones in
+proportion to the branch size. It still performs a linear semantic scan:
+arbitrary writes through ordinary Go pointers cannot be intercepted by a
+setter or proxy. The remaining 150 ms is therefore primarily change discovery,
+not WAL publication or GC.
+
+The cold path remains O(project size) and intentionally pays for the persistent
+shadow nodes, shadow relation wiring, relation-ID baselines, and hot-branch
+descriptor cache. This trades retained replica memory and one serialized Tower
+writer for low-allocation warm writes. Canonical zero-copy `View` readers do
+not wait for the user callback; they only contend with the short publication
+window.

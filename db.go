@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 // Entity is the contract every persisted struct must satisfy. Id is the primary
@@ -39,7 +40,14 @@ type DB[T Entity] struct {
 	wal          *wal                     // durability log for commits
 	snapshotMu   sync.Mutex
 	snapshots    map[*T]detachedRoot[T]
+	// epoch is this table's Tower counter, resolved once instead of looked up
+	// by name. Every write bumps it, and Unsafe hands out a live pointer often
+	// enough that the map probe showed up in the read path.
+	epoch *atomic.Uint64
 }
+
+// markChanged retires every Tower replica built before this write.
+func (db *DB[T]) markChanged() { db.epoch.Add(1) }
 
 var _ committer = (*DB[Entity])(nil)
 
@@ -89,6 +97,8 @@ func Register[T Entity]() error {
 	}
 
 	storeRegistry[name] = store
+	registerTowerComparator[T]()
+	registerTowerSliceComparator[T]()
 
 	return nil
 }
@@ -107,6 +117,7 @@ func Open[T Entity]() *DB[T] {
 	initBase := &DB[T]{identifier: entityIDField}
 
 	initBase.name = name
+	initBase.epoch = towerEpochCounter(name)
 	initBase.resById = make(map[int]*resourceSlot[T])
 	initBase.snapshots = make(map[*T]detachedRoot[T])
 	initBase.schemaFields = initBase.createSchemaFields()
@@ -138,6 +149,7 @@ func Open[T Entity]() *DB[T] {
 
 	baseRegistry[name] = initBase
 	resetCommittedOwnership()
+	markTowerTableChanged(name)
 
 	return initBase
 }
@@ -260,6 +272,7 @@ func (db *DB[T]) applyWrite(id int, work any) {
 		*r.item = *work.(*T) // write through the stable pointer — never moves
 		r.version++
 		db.store.markDirty(r.chunk)
+		db.markChanged()
 	}
 }
 

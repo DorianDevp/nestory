@@ -116,12 +116,11 @@ func (db *DB[T]) getInTransaction(tx *transactionState, id int) (*T, error) {
 	}
 
 	root := nodeKey{typ: reflect.TypeFor[T](), id: id}
-	rootWork, err := cloneOwnershipAggregate(root, func(resource touchedResource) {
-		engine.record(tx, resource)
-	})
+	rootWork, resources, err := cloneOwnershipAggregate(root)
 	if err != nil {
 		return nil, err
 	}
+	engine.recordBatch(tx, resources, rootWork)
 
 	return rootWork.(*T), nil
 }
@@ -145,6 +144,14 @@ func (db *DB[T]) UpdateWithin(id int, fn func(*T) error) error {
 	defer resource.updateMu.Unlock()
 
 	for {
+		if handled, err := towerUpdateWithin(db, id, fn); handled {
+			if err == ErrConflict {
+				continue
+			}
+
+			return err
+		}
+
 		err := db.Transaction(func(tx *Tx[T]) error {
 			return tx.UpdateWithin(id, fn)
 		})

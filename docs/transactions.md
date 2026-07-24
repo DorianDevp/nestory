@@ -10,7 +10,7 @@ properties.
 |---|---|---|---|
 | `Get` + `Update` | Detached `own` branch | Explicit merge | Edit outside a callback |
 | `Transaction` | Detached branches in one context | Automatic commit on nil return | Several related operations |
-| `UpdateWithin` | Detached branch in a retrying context | Automatic commit | Short intent-only update |
+| `UpdateWithin` | Persistent Tower shadow or detached branch | Automatic commit | Short intent-only update |
 | `View` | Read-locked live branch | No writes allowed | Zero-copy aggregate read |
 | `ViewMany` / `ViewRange` | Read-locked live rows | No writes allowed | Flat batch read |
 | `Unsafe` | Unlocked live pointers | Explicit `Flush` | Exclusive hot loop |
@@ -104,6 +104,26 @@ The DB-level method retries after `ErrConflict`. Its callback may therefore run
 more than once. Keep it free of external side effects such as sending messages,
 charging a card, or appending to an unrelated file. Record intent in the object
 graph and perform external effects after the call succeeds.
+
+For an ownership root with children, the DB-level method uses Tower: one
+project-wide coordinator holding separate shadow tables wired into a complete
+shadow graph. The callback mutates that persistent graph, so repeated updates
+do not clone the ownership branch. After the callback, a semantic field diff
+selects changed rows and fields; only those rows are materialized for WAL,
+index validation, and publication. Relation changes use the normal graph
+validator and pointer-canonicalization path.
+
+Tower serializes writable callbacks across the project. It does not hold the
+canonical graph lock while the callback runs, so `View` continues to read the
+previous committed state. A commit outside Tower advances the project
+generation; the next Tower update rebuilds its shadow before retrying the
+callback.
+
+The warm diff is still O(branch size). Ordinary `*T` writes have no setter or
+proxy through which Nestory could record the changed address, so finding an
+arbitrary changed descendant cannot be guaranteed in O(1). Tower removes the
+full branch clone, per-row transaction registration, and unchanged-row
+publication; it does not claim constant-time automatic change discovery.
 
 Inside an existing transaction, `tx.UpdateWithin` only loads and mutates the
 object in that context; it neither commits independently nor adds another retry

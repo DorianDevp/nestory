@@ -67,6 +67,29 @@ chunks atomically via replacement files and truncates compacted WAL state.
 subtree. They preserve ordinary Go mutation: no proxy, setter, or wrapper is
 needed. The engine retains the original values and resource versions.
 
+DB-level `UpdateWithin` uses a different path for ownership roots with
+children. Tower keeps one project-wide shadow graph, partitioned into typed
+tables, plus canonical pointers, relation-ID baselines, and a cache for the
+current hot ownership branch. A callback edits only the shadow. Publication
+then:
+
+1. verifies that no canonical commit advanced the project generation;
+2. compares the hot branch semantically, using compiled field plans;
+3. creates shallow patch bases only for changed nodes and deep-copies only
+   changed slice fields;
+4. validates versions and indexes, writes the WAL, and writes through the
+   stable canonical pointers.
+
+Scalar-only patches avoid rebuilding the relation graph. A changed relation
+falls back to the complete transaction graph validator. Canonical `View` calls
+remain available while a Tower callback is running; the short publication
+window still uses the graph lock.
+
+The first Tower use is deliberately expensive: it clones and wires the project
+shadow and records relation identities. The replica increases retained memory,
+but warm transactions avoid the much larger temporary pair of `work` and
+`original` copies for every node.
+
 At commit it:
 
 1. detects which detached resources actually changed;
