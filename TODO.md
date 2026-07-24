@@ -15,6 +15,9 @@ Stuff I still want to do, roughly most-important first. Data safety before nice-
 - [x] Write-ahead log per type — a commit is durable without a full Flush.
 - [x] Idempotent Open (one DB per type, shared by the engine).
 - [x] Benchmarks against SQLite, bbolt, go-memdb, buntdb, badger.
+- [x] Tower shadow graph for ownership-root `UpdateWithin`: persistent
+      per-table replicas, semantic field patches, epoch invalidation, and
+      relation-change fallback without moving canonical pointers.
 
 ## In progress
 

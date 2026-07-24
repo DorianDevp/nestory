@@ -3,7 +3,9 @@ package nestory
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -65,6 +67,48 @@ type dialogBenchNode struct {
 func (node dialogBenchNode) GetId() int { return node.Id }
 
 var relationBranchSizes = []int{0, 1, 10, 100, 1000}
+
+// BenchmarkTowerScalarRootWriteStress is opt-in because the largest setup
+// deliberately retains a million-node ownership graph and its Tower shadow.
+// Run with:
+// NESTORY_STRESS=1 go test -run '^$' -bench '^BenchmarkTowerScalarRootWriteStress$' -benchtime=1x -benchmem
+func BenchmarkTowerScalarRootWriteStress(b *testing.B) {
+	if os.Getenv("NESTORY_STRESS") != "1" {
+		b.Skip("set NESTORY_STRESS=1 to allocate the full stress graph")
+	}
+
+	for _, children := range []int{10, 100, 1000, 10000, 100000, 1000000} {
+		b.Run(fmt.Sprintf("children=%d", children), func(b *testing.B) {
+			quiet(b)
+			ownerDB, _, id := newRelationBenchDB(b, children)
+
+			coldStarted := time.Now()
+			if err := ownerDB.UpdateWithin(id, func(owner *relationBenchOwner) error {
+				owner.Name = "cold"
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
+			coldElapsed := time.Since(coldStarted)
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if err := ownerDB.UpdateWithin(id, func(owner *relationBenchOwner) error {
+					if iteration%2 == 0 {
+						owner.Name = "even"
+					} else {
+						owner.Name = "odd"
+					}
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(coldElapsed.Nanoseconds()), "cold-ns")
+		})
+	}
+}
 
 func newRelationBenchDB(tb testing.TB, children int) (*DB[relationBenchOwner], *DB[relationBenchChild], int) {
 	tb.Helper()
@@ -699,6 +743,190 @@ func newParallelBenchDBs(tb testing.TB, records int) (*DB[parallelBenchA], *DB[p
 	}
 
 	return first, second
+}
+
+// BenchmarkTowerVersusBranchClone runs the same logical write — set the root's
+// scalar Name — down all three paths, so the numbers differ only by what each
+// does around fn. The Tower path keeps a shadow and diffs it; the other two
+// clone the whole ownership branch per call. It exists to locate the branch
+// size where keeping a replica starts paying for itself.
+func BenchmarkTowerVersusBranchClone(b *testing.B) {
+	for _, children := range []int{1, 2, 4, 10, 100, 1_000, 10_000, 100_000} {
+		b.Run(fmt.Sprintf("children=%d/tower", children), func(b *testing.B) {
+			quiet(b)
+			ownerDB, _, id := newRelationBenchDB(b, children)
+			if err := ownerDB.UpdateWithin(id, func(owner *relationBenchOwner) error {
+				owner.Name = "warm"
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				if err := ownerDB.UpdateWithin(id, func(owner *relationBenchOwner) error {
+					owner.Name = strconv.Itoa(iteration)
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("children=%d/transaction", children), func(b *testing.B) {
+			quiet(b)
+			ownerDB, _, id := newRelationBenchDB(b, children)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				err := ownerDB.Transaction(func(tx *Tx[relationBenchOwner]) error {
+					return tx.UpdateWithin(id, func(owner *relationBenchOwner) error {
+						owner.Name = strconv.Itoa(iteration)
+						return nil
+					})
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("children=%d/get-update", children), func(b *testing.B) {
+			quiet(b)
+			ownerDB, _, id := newRelationBenchDB(b, children)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				branch, err := ownerDB.Get(id)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				branch.Name = strconv.Itoa(iteration)
+				if err := ownerDB.Update(branch); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkTrackedRootWrite is BenchmarkTowerVersusBranchClone's tower case with
+// the write declared, so the diff sees one node instead of the whole branch. The
+// gap between the two is what the declaration is worth.
+func BenchmarkTrackedRootWrite(b *testing.B) {
+	for _, children := range []int{1, 2, 4, 10, 100, 1_000, 10_000, 100_000} {
+		b.Run(fmt.Sprintf("children=%d/tracked", children), func(b *testing.B) {
+			quiet(b)
+			ownerDB, _, id := newRelationBenchDB(b, children)
+			warmTowerReplica(b, ownerDB, id)
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				err := ownerDB.Tracked().UpdateWithin(id, func(_ *Writes, owner *relationBenchOwner) error {
+					owner.Name = strconv.Itoa(iteration)
+					return nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("children=%d/untracked", children), func(b *testing.B) {
+			quiet(b)
+			ownerDB, _, id := newRelationBenchDB(b, children)
+			warmTowerReplica(b, ownerDB, id)
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for iteration := range b.N {
+				err := ownerDB.UpdateWithin(id, func(owner *relationBenchOwner) error {
+					owner.Name = strconv.Itoa(iteration)
+					return nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func warmTowerReplica(tb testing.TB, ownerDB *DB[relationBenchOwner], id int) {
+	tb.Helper()
+
+	if err := ownerDB.UpdateWithin(id, func(owner *relationBenchOwner) error {
+		owner.Name = "warm"
+		return nil
+	}); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+// BenchmarkTowerParallelBranches writes scalar roots whose ownership branches
+// are disjoint, so nothing about the work itself forces them into a queue. It
+// exists to keep the Tower from quietly going back to one writer at a time.
+func BenchmarkTowerParallelBranches(b *testing.B) {
+	const owners, children = 8, 2000
+
+	quiet(b)
+	DataDir = b.TempDir()
+	resetRegistries()
+	if err := Register[relationBenchChild](); err != nil {
+		b.Fatal(err)
+	}
+
+	if err := Register[relationBenchOwner](); err != nil {
+		b.Fatal(err)
+	}
+
+	childDB := Open[relationBenchChild]()
+	ownerDB := Open[relationBenchOwner]()
+	ids := make([]int, owners)
+	for index := range owners {
+		owner := &relationBenchOwner{Name: "root"}
+		ownerDB.Unsafe().Create(owner)
+		for value := range children {
+			child := &relationBenchChild{OwnerID: owner.Id, Value: value}
+			childDB.Unsafe().Create(child)
+			owner.Children = append(owner.Children, child)
+		}
+
+		ids[index] = owner.Id
+	}
+
+	if err := ownerDB.Unsafe().Flush(); err != nil {
+		b.Fatal(err)
+	}
+
+	// Warm the replica so the loop measures steady state, not the first build.
+	if err := ownerDB.UpdateWithin(ids[0], func(owner *relationBenchOwner) error {
+		owner.Name = "warm"
+		return nil
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	var sequence atomic.Uint64
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		id := ids[int(sequence.Add(1)-1)%owners]
+		value := 0
+		for pb.Next() {
+			value++
+			if err := ownerDB.UpdateWithin(id, func(owner *relationBenchOwner) error {
+				owner.Name = strconv.Itoa(value)
+				return nil
+			}); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
 }
 
 func BenchmarkParallelSafeWrite(b *testing.B) {

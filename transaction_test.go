@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 type txOwner struct {
@@ -1225,6 +1226,94 @@ func TestSelfBorrowCountsOnceAndDoesNotBlockOwnDelete(t *testing.T) {
 
 		if db.Len() != 0 {
 			t.Fatal("self-borrowing entity survived its own delete")
+		}
+	})
+}
+
+func TestTowerUpdateWithinDoesNotSerializeIndependentOwners(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		if err := Register[relationBenchChild](); err != nil {
+			t.Fatal(err)
+		}
+		if err := Register[relationBenchOwner](); err != nil {
+			t.Fatal(err)
+		}
+
+		const ownerCount = 4
+
+		childDB := Open[relationBenchChild]()
+		ownerDB := Open[relationBenchOwner]()
+
+		owners := make([]*relationBenchOwner, ownerCount)
+		for i := range owners {
+			owner := &relationBenchOwner{Name: "before"}
+			child := &relationBenchChild{Value: 10}
+			owner.Children = []*relationBenchChild{child}
+			ownerDB.Unsafe().Create(owner)
+			child.OwnerID = owner.Id
+			childDB.Unsafe().Create(child)
+			owners[i] = owner
+		}
+		if err := ownerDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Re-fetch canonical pointers post-flush, same as seedTowerBranch does.
+		canonicalOwners := make([]*relationBenchOwner, ownerCount)
+		for i, owner := range owners {
+			canonical, err := ownerDB.Unsafe().Get(owner.Id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalOwners[i] = canonical
+		}
+
+		entered := make(chan int, ownerCount)
+		release := make(chan struct{})
+		done := make(chan error, ownerCount)
+
+		for i, owner := range canonicalOwners {
+			i, owner := i, owner
+			go func() {
+				done <- ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+					shadow.Name = "after"
+					entered <- i
+					<-release
+					return nil
+				})
+			}()
+		}
+
+		// If Tower serializes independent owners behind one writer, only
+		// the first goroutine will reach "entered" before the others are
+		// stuck waiting for the writer lock, so this will time out well
+		// before all ownerCount signals arrive.
+		enteredCount := 0
+		deadline := time.After(time.Second)
+		for enteredCount < ownerCount {
+			select {
+			case <-entered:
+				enteredCount++
+			case <-deadline:
+				t.Fatalf(
+					"only %d/%d independent UpdateWithin callbacks entered concurrently; "+
+						"Tower appears to serialize unrelated owners behind a single writer",
+					enteredCount, ownerCount,
+				)
+			}
+		}
+
+		close(release)
+		for range canonicalOwners {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		for _, owner := range canonicalOwners {
+			if owner.Name != "after" {
+				t.Fatalf("owner %d Name = %q, want after", owner.Id, owner.Name)
+			}
 		}
 	})
 }

@@ -397,6 +397,7 @@ func resetRegistries() {
 	relationParticipantsMu.Unlock()
 	engine = newEngine()
 	resetCommittedOwnership()
+	resetTower()
 }
 
 func isolatedRelations(t *testing.T, fn func(t *testing.T)) {
