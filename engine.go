@@ -75,6 +75,7 @@ type transactionState struct {
 	resource    touchedResource
 	resources   []touchedResource
 	resourcePos map[transactionResourceKey]int
+	bindings    []any
 	creates     map[nodeKey]createdResource
 	deletes     map[nodeKey]stagedDelete
 }
@@ -172,45 +173,68 @@ func (en *transactionEngine) stageDelete(tx *transactionState, deleted stagedDel
 }
 
 func (en *transactionEngine) record(tx *transactionState, e touchedResource) {
+	en.recordBatch(tx, []touchedResource{e}, e.work)
+}
+
+// recordBatch installs a complete cloned ownership branch while taking the
+// engine mutex once. Only bindWork needs pointer-to-transaction lookup support;
+// descendants are reached through the transaction's resource index.
+func (en *transactionEngine) recordBatch(tx *transactionState, resources []touchedResource, bindWork any) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	key := transactionResourceKey{dbName: e.dbName, id: e.id}
-	if tx.resourcePos != nil {
-		if _, exists := tx.resourcePos[key]; exists {
-			return
+	if len(resources) > 0 && tx.resourcePos == nil && 1+len(tx.resources)+len(resources) >= 8 {
+		tx.resourcePos = make(map[transactionResourceKey]int, 1+len(tx.resources)+len(resources))
+		if tx.hasResource {
+			tx.resourcePos[transactionResourceKey{dbName: tx.resource.dbName, id: tx.resource.id}] = 0
 		}
-	} else {
-		if tx.hasResource && tx.resource.dbName == e.dbName && tx.resource.id == e.id {
-			return
-		}
-
-		for _, resource := range tx.resources {
-			if resource.dbName == e.dbName && resource.id == e.id {
-				return
-			}
-		}
-	}
-
-	if !tx.hasResource {
-		tx.hasResource = true
-		tx.resource = e
-		en.bind[e.work] = tx
-		return
-	}
-
-	tx.resources = append(tx.resources, e)
-	if len(tx.resources) == 8 {
-		tx.resourcePos = make(map[transactionResourceKey]int, 1+len(tx.resources))
-		tx.resourcePos[transactionResourceKey{dbName: tx.resource.dbName, id: tx.resource.id}] = 0
 		for index, resource := range tx.resources {
 			tx.resourcePos[transactionResourceKey{dbName: resource.dbName, id: resource.id}] = index + 1
 		}
-	} else if tx.resourcePos != nil {
-		tx.resourcePos[key] = len(tx.resources)
 	}
 
-	en.bind[e.work] = tx
+	for _, resource := range resources {
+		key := transactionResourceKey{dbName: resource.dbName, id: resource.id}
+		if tx.resourcePos != nil {
+			if _, exists := tx.resourcePos[key]; exists {
+				continue
+			}
+		} else {
+			if tx.hasResource && tx.resource.dbName == resource.dbName && tx.resource.id == resource.id {
+				continue
+			}
+
+			duplicate := false
+			for _, existing := range tx.resources {
+				if existing.dbName == resource.dbName && existing.id == resource.id {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+		}
+
+		if !tx.hasResource {
+			tx.hasResource = true
+			tx.resource = resource
+			if tx.resourcePos != nil {
+				tx.resourcePos[key] = 0
+			}
+			continue
+		}
+
+		tx.resources = append(tx.resources, resource)
+		if tx.resourcePos != nil {
+			tx.resourcePos[key] = len(tx.resources)
+		}
+	}
+
+	if bindWork != nil {
+		en.bind[bindWork] = tx
+		tx.bindings = append(tx.bindings, bindWork)
+	}
 }
 
 func (en *transactionEngine) work(tx *transactionState, dbName string, id int) (any, bool) {
@@ -1232,12 +1256,8 @@ func (en *transactionEngine) evict(tx *transactionState) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 
-	if tx.hasResource {
-		delete(en.bind, tx.resource.work)
-	}
-
-	for _, e := range tx.resources {
-		delete(en.bind, e.work)
+	for _, binding := range tx.bindings {
+		delete(en.bind, binding)
 	}
 
 	tx.active = false
@@ -1245,6 +1265,7 @@ func (en *transactionEngine) evict(tx *transactionState) {
 	tx.resource = touchedResource{}
 	tx.resources = nil
 	tx.resourcePos = nil
+	tx.bindings = nil
 	tx.creates = nil
 	tx.deletes = nil
 }
