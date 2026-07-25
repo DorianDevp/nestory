@@ -44,30 +44,63 @@ func TestTowerMemoryProfile(t *testing.T) {
 		t.Skip("set NESTORY_MEMORY_PROFILE=1 to run the Tower memory profile")
 	}
 
-	graph := towerMemorySubprocess(t, "graph")
-	replica := towerMemorySubprocess(t, "replica")
+	// Cumulative: each variant keeps one more part of the replica than the last,
+	// so the delta between two rows is what that part costs.
+	variants := []string{"graph", "shadow", "live", "relations", "replica"}
+	samples := make([]memoryProfileSample, 0, len(variants))
+	for _, variant := range variants {
+		samples = append(samples, towerMemorySubprocess(t, variant))
+	}
 
-	entries := uint64(graph.Entries)
-	added := positiveDifference(replica.HeapAlloc, graph.HeapAlloc)
+	entries := uint64(samples[0].Entries)
+	t.Log("component\tbytes/node\tlive heap\tRSS")
+	previous := samples[0]
+	t.Logf(
+		"graph (no replica)\t-\t%s\t%s",
+		formatBytes(previous.HeapAlloc), formatBytes(previous.RSS),
+	)
+	for position := 1; position < len(samples); position++ {
+		current := samples[position]
+		delta := positiveDifference(current.HeapAlloc, previous.HeapAlloc)
+		t.Logf(
+			"+ %s\t%d\t%s\t%s",
+			current.Variant,
+			delta/entries,
+			formatBytes(current.HeapAlloc),
+			formatBytes(current.RSS),
+		)
+		previous = current
+	}
 
-	t.Log("variant\tbytes/node\tlive heap\theap in-use\tRSS")
+	full := samples[len(samples)-1]
+	added := positiveDifference(full.HeapAlloc, samples[0].HeapAlloc)
 	t.Logf(
-		"graph\t%d\t%s\t%s\t%s",
-		graph.HeapAlloc/entries,
-		formatBytes(graph.HeapAlloc), formatBytes(graph.HeapInuse), formatBytes(graph.RSS),
-	)
-	t.Logf(
-		"graph+replica\t%d\t%s\t%s\t%s",
-		replica.HeapAlloc/entries,
-		formatBytes(replica.HeapAlloc), formatBytes(replica.HeapInuse), formatBytes(replica.RSS),
-	)
-	t.Logf(
-		"replica adds %s (%d B/node, +%.0f%% live heap, RSS %s to %s)",
+		"replica total: %s (%d B/node, +%.0f%% live heap, RSS %s to %s)",
 		formatBytes(added),
 		added/entries,
-		100*float64(added)/float64(graph.HeapAlloc),
-		formatBytes(graph.RSS), formatBytes(replica.RSS),
+		100*float64(added)/float64(samples[0].HeapAlloc),
+		formatBytes(samples[0].RSS), formatBytes(full.RSS),
 	)
+}
+
+// pruneTowerReplica drops the parts of the replica a variant is not paying for.
+// Dropping nodes keeps blocks, so the shadow storage stays retained either way;
+// what goes is the index over it.
+func pruneTowerReplica(replica *towerReplica, variant string) {
+	switch variant {
+	case "shadow":
+		replica.live = nil
+		replica.relations = nil
+		replica.branches = nil
+	case "live":
+		replica.relations = nil
+		replica.branches = nil
+	case "relations":
+		replica.branches = nil
+	case "replica":
+	default:
+		panic("unknown tower memory variant: " + variant)
+	}
 }
 
 func towerMemorySubprocess(t *testing.T, variant string) memoryProfileSample {
@@ -124,7 +157,7 @@ func runTowerMemoryWorker(t *testing.T, variant string) {
 		t.Fatal(err)
 	}
 
-	if variant == "replica" {
+	if variant != "graph" {
 		// One scalar root write is enough to build and retain the whole shadow.
 		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *towerProfileOwner) error {
 			shadow.Name = "written"
@@ -133,9 +166,12 @@ func runTowerMemoryWorker(t *testing.T, variant string) {
 			t.Fatal(err)
 		}
 
-		if projectTower.replica.Load() == nil {
+		replica := projectTower.replica.Load()
+		if replica == nil {
 			t.Fatal("expected a live Tower replica")
 		}
+
+		pruneTowerReplica(replica, variant)
 	}
 
 	debug.FreeOSMemory()

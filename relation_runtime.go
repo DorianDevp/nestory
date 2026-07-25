@@ -207,10 +207,13 @@ type relationGraphNode struct {
 	value reflect.Value // *struct
 }
 
+// spec points into the slice relationSpecs caches per type, which is built once
+// and never mutated. Holding it by value cost 96 of this struct's 144 bytes, on
+// a slice that holds one element per edge in the project.
 type resolvedRelation struct {
 	holder nodeKey
 	target nodeKey
-	spec   relationSpec
+	spec   *relationSpec
 }
 
 type relationModel struct {
@@ -248,7 +251,7 @@ type unresolvedRelation struct {
 
 type incomingOwn struct {
 	owner nodeKey
-	spec  relationSpec
+	spec  *relationSpec
 }
 
 var committedOwnership = struct {
@@ -280,7 +283,24 @@ func ensureCommittedOwnership() error {
 		return nil
 	}
 
+	// A project where no type declares a relation has no relation graph to
+	// index. Building one anyway walks every node of every table and copies it
+	// into a model and an index — the complete cost of a graph with no edges.
+	// The check is re-evaluated per call rather than cached in ready, so a
+	// relation-carrying type registered later still gets its index built. Every
+	// consumer of committedOwnership.index already handles a nil index.
+	if !relationGraphRegistered() {
+		return nil
+	}
+
 	return refreshCommittedOwnership()
+}
+
+func relationGraphRegistered() bool {
+	relationParticipantsMu.RLock()
+	defer relationParticipantsMu.RUnlock()
+
+	return len(relationParticipants) > 0
 }
 
 func refreshCommittedOwnership() error {
@@ -1013,7 +1033,8 @@ func scanNodeRelations(model *relationModel, node relationGraphNode, incoming ma
 		return err
 	}
 
-	for _, spec := range specs {
+	for index := range specs {
+		spec := &specs[index]
 		if spec.kind == inverseRelation {
 			continue
 		}
@@ -1026,7 +1047,7 @@ func scanNodeRelations(model *relationModel, node relationGraphNode, incoming ma
 	return nil
 }
 
-func scanRelationField(model *relationModel, node relationGraphNode, spec relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
+func scanRelationField(model *relationModel, node relationGraphNode, spec *relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
 	field := node.value.Elem().Field(spec.fieldIndex)
 	if !spec.many {
 		return scanRelationPointer(model, node, spec, field, nil, incoming, ownedBy)
@@ -1049,29 +1070,29 @@ func scanRelationField(model *relationModel, node relationGraphNode, spec relati
 func scanRelationPointer(
 	model *relationModel,
 	node relationGraphNode,
-	spec relationSpec,
+	spec *relationSpec,
 	pointer reflect.Value,
 	seen map[nodeKey]struct{},
 	incoming map[nodeKey][]incomingOwn,
 	ownedBy map[nodeKey]incomingOwn,
 ) error {
-	target, found, err := resolveGraphTarget(model, spec, pointer)
+	target, found, err := resolveGraphTarget(model, *spec, pointer)
 	if err != nil {
 		return err
 	}
 
 	if !found {
-		if lookup, present := graphRelationTargetKey(spec, pointer); present {
+		if lookup, present := graphRelationTargetKey(*spec, pointer); present {
 			model.unresolved = append(model.unresolved, unresolvedRelation{
-				holder: node.key, spec: spec, lookup: lookup,
+				holder: node.key, spec: *spec, lookup: lookup,
 			})
 		}
 
-		if relationMayBeMissing(spec) {
+		if relationMayBeMissing(*spec) {
 			return nil
 		}
 
-		model.missing = append(model.missing, missingRelation{holder: node.key, spec: spec})
+		model.missing = append(model.missing, missingRelation{holder: node.key, spec: *spec})
 		return nil
 	}
 
@@ -1096,7 +1117,7 @@ func relationMayBeMissing(spec relationSpec) bool {
 	return spec.many && (spec.kind == borrowRelation || spec.kind == ownRelation)
 }
 
-func recordResolvedRelation(model *relationModel, holder, target nodeKey, spec relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) {
+func recordResolvedRelation(model *relationModel, holder, target nodeKey, spec *relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) {
 	model.refs = append(model.refs, resolvedRelation{holder: holder, target: target, spec: spec})
 	edge := incomingOwn{owner: holder, spec: spec}
 	if spec.kind == ownRelation {
@@ -1321,14 +1342,14 @@ func canonicalizeRelationPointers(model *relationModel, deleted, changed map[nod
 		}
 
 		if _, targetDies := deleted[ref.target]; targetDies {
-			if ref.spec.kind == optionRelation && !ref.spec.many && setRelationField(holder, ref.spec, reflect.Value{}) {
+			if ref.spec.kind == optionRelation && !ref.spec.many && setRelationField(holder, *ref.spec, reflect.Value{}) {
 				changed[ref.holder] = struct{}{}
 			}
 
 			continue
 		}
 
-		if !ref.spec.many && setRelationField(holder, ref.spec, target.value) {
+		if !ref.spec.many && setRelationField(holder, *ref.spec, target.value) {
 			changed[ref.holder] = struct{}{}
 		}
 	}
