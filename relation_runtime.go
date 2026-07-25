@@ -254,6 +254,23 @@ type incomingOwn struct {
 	spec  *relationSpec
 }
 
+// incomingOwns records the own edges pointing at one node. attachNodeOwner
+// rejects a second one, so the legal population is zero or one — a slice per
+// node allocated once per node per Flush to hold at most a single element.
+// count still distinguishes "none" from "too many" so the error survives.
+type incomingOwns struct {
+	first incomingOwn
+	count int
+}
+
+func (owns *incomingOwns) add(edge incomingOwn) {
+	if owns.count == 0 {
+		owns.first = edge
+	}
+
+	owns.count++
+}
+
 var committedOwnership = struct {
 	sync.RWMutex
 	ready    atomic.Bool
@@ -830,11 +847,11 @@ func buildRelationModelFromTargets(
 	// array — into a single allocation. A stale hint only costs the usual growth.
 	model := &relationModel{
 		nodes: nodes, targets: targets, targetFields: targetFields,
-		owners: make(map[nodeKey]nodeKey, len(nodes)), outgoing: make(map[nodeKey][]nodeKey),
+		owners: make(map[nodeKey]nodeKey), outgoing: make(map[nodeKey][]nodeKey),
 	}
 
-	incoming := make(map[nodeKey][]incomingOwn)
-	ownedBy := make(map[nodeKey]incomingOwn)
+	incoming := make(map[nodeKey]incomingOwns, len(nodes))
+	ownedBy := make(map[nodeKey]incomingOwn, len(nodes))
 	if hint := committedRelationRefCount(); hint > 0 {
 		model.refs = make([]resolvedRelation, 0, hint)
 	}
@@ -897,7 +914,7 @@ func buildRelationModelDelta(
 		model.refs = append(model.refs, ref)
 	}
 
-	scannedIncoming := make(map[nodeKey][]incomingOwn)
+	scannedIncoming := make(map[nodeKey]incomingOwns)
 	scannedOwnedBy := make(map[nodeKey]incomingOwn)
 	for key, node := range rescan {
 		if _, exists := nodes[key]; !exists {
@@ -917,12 +934,14 @@ func buildRelationModelDelta(
 		affected[child] = struct{}{}
 	}
 
-	incoming := make(map[nodeKey][]incomingOwn, len(affected))
+	incoming := make(map[nodeKey]incomingOwns, len(affected))
 	ownedBy := make(map[nodeKey]incomingOwn, len(affected))
 	for _, ref := range model.refs {
 		if ref.spec.kind == ownRelation {
 			if _, changed := affected[ref.target]; changed {
-				incoming[ref.target] = append(incoming[ref.target], incomingOwn{owner: ref.holder, spec: ref.spec})
+				owns := incoming[ref.target]
+				owns.add(incomingOwn{owner: ref.holder, spec: ref.spec})
+				incoming[ref.target] = owns
 			}
 		}
 
@@ -1048,7 +1067,7 @@ func indexRelationNodeTargets(targets map[relationTargetKey]indexedRelationTarge
 	}
 }
 
-func scanNodeRelations(model *relationModel, node relationGraphNode, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
+func scanNodeRelations(model *relationModel, node relationGraphNode, incoming map[nodeKey]incomingOwns, ownedBy map[nodeKey]incomingOwn) error {
 	specs, err := relationSpecs(node.key.typ)
 	if err != nil {
 		return err
@@ -1068,7 +1087,7 @@ func scanNodeRelations(model *relationModel, node relationGraphNode, incoming ma
 	return nil
 }
 
-func scanRelationField(model *relationModel, node relationGraphNode, spec *relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
+func scanRelationField(model *relationModel, node relationGraphNode, spec *relationSpec, incoming map[nodeKey]incomingOwns, ownedBy map[nodeKey]incomingOwn) error {
 	field := node.value.Elem().Field(spec.fieldIndex)
 	if !spec.many {
 		return scanRelationPointer(model, node, spec, field, nil, incoming, ownedBy)
@@ -1094,7 +1113,7 @@ func scanRelationPointer(
 	spec *relationSpec,
 	pointer reflect.Value,
 	seen map[nodeKey]struct{},
-	incoming map[nodeKey][]incomingOwn,
+	incoming map[nodeKey]incomingOwns,
 	ownedBy map[nodeKey]incomingOwn,
 ) error {
 	target, found, err := resolveGraphTarget(model, *spec, pointer)
@@ -1138,11 +1157,13 @@ func relationMayBeMissing(spec relationSpec) bool {
 	return spec.many && (spec.kind == borrowRelation || spec.kind == ownRelation)
 }
 
-func recordResolvedRelation(model *relationModel, holder, target nodeKey, spec *relationSpec, incoming map[nodeKey][]incomingOwn, ownedBy map[nodeKey]incomingOwn) {
+func recordResolvedRelation(model *relationModel, holder, target nodeKey, spec *relationSpec, incoming map[nodeKey]incomingOwns, ownedBy map[nodeKey]incomingOwn) {
 	model.refs = append(model.refs, resolvedRelation{holder: holder, target: target, spec: spec})
 	edge := incomingOwn{owner: holder, spec: spec}
 	if spec.kind == ownRelation {
-		incoming[target] = append(incoming[target], edge)
+		owns := incoming[target]
+		owns.add(edge)
+		incoming[target] = owns
 	}
 
 	if spec.kind == ownedByRelation {
@@ -1151,14 +1172,14 @@ func recordResolvedRelation(model *relationModel, holder, target nodeKey, spec *
 	}
 }
 
-func attachNodeOwner(model *relationModel, child nodeKey, raw []incomingOwn, ownedBy map[nodeKey]incomingOwn) error {
+func attachNodeOwner(model *relationModel, child nodeKey, raw incomingOwns, ownedBy map[nodeKey]incomingOwn) error {
 	back, hasBack := ownedBy[child]
-	if len(raw) > 1 {
+	if raw.count > 1 {
 		return fmt.Errorf("%w: %s has more than one owner", ErrRelationInvariant, child)
 	}
 
-	if len(raw) == 1 && hasBack && raw[0].owner != back.owner {
-		return fmt.Errorf("%w: own and ownedby disagree for %s (%s vs %s)", ErrRelationInvariant, child, raw[0].owner, back.owner)
+	if raw.count == 1 && hasBack && raw.first.owner != back.owner {
+		return fmt.Errorf("%w: own and ownedby disagree for %s (%s vs %s)", ErrRelationInvariant, child, raw.first.owner, back.owner)
 	}
 
 	owner, found := resolvedOwner(raw, back, hasBack)
@@ -1171,9 +1192,9 @@ func attachNodeOwner(model *relationModel, child nodeKey, raw []incomingOwn, own
 	return nil
 }
 
-func resolvedOwner(raw []incomingOwn, back incomingOwn, hasBack bool) (nodeKey, bool) {
-	if len(raw) == 1 {
-		return raw[0].owner, true
+func resolvedOwner(raw incomingOwns, back incomingOwn, hasBack bool) (nodeKey, bool) {
+	if raw.count == 1 {
+		return raw.first.owner, true
 	}
 
 	if hasBack {
