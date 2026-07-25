@@ -460,8 +460,17 @@ field beats a 40-byte memequal) and were kept only where they replace several
 comparisons. The gate's actual costs were nodeKey map lookups (~17%) and
 element-wise reflect over relation slices (28%) — the flat list removes both,
 recording each relation field's live pointer words at refresh and comparing
-words. The baselines cost 17.5 MiB resident at 100,003 nodes: steady-state live
-heap is 154.8 MiB against 137.3 without them.
+words. The baselines cost 17.5 MiB resident at 100,003 nodes, partly paid back by
+retiring the replica's defensive `live` map (7.0 MiB) that the walk, the shadow
+map and the retained index now cover between them: steady-state live heap is
+147.8 MiB against 137.3 before either change.
+
+`towerWriteLocks` stays as is, deliberately: one mutex per distinct root ever
+written costs ~48 B with `sync.Map` overhead — half a megabyte at ten thousand
+roots, proportional to data rather than operations — while freeing entries
+safely would need refcounting around every lock acquisition. That trade buys
+0.3% of steady-state memory with a correctness risk attached, so it is
+declined, not deferred.
 
 ## Failure modes this architecture permits
 
