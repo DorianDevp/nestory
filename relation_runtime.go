@@ -1502,6 +1502,11 @@ func flushRelations() error {
 		return flushWithoutRelations(runtimes)
 	}
 
+	done, err := flushUnchangedGraph(runtimes)
+	if done || err != nil {
+		return err
+	}
+
 	nodes, err := collectRelationNodes(true, nil)
 	if err != nil {
 		return err
@@ -1574,6 +1579,58 @@ func flushRelations() error {
 	storeCommittedOwnership(model, deleted)
 
 	return nil
+}
+
+// flushUnchangedGraph persists a flush that cannot have changed the relation
+// graph, without rebuilding the model or the index.
+//
+// The published model and index describe the graph, not the field values, so
+// they stay exactly correct as long as no node was created or deleted and no
+// relation field moved. The Tower replica answers the last condition by
+// comparison rather than by trusting anything the caller declared, which is why
+// this is sound under Unsafe's contract. Anything it cannot settle falls through
+// to the full rebuild.
+//
+// Field values still have to be persisted and reindexed — only the graph work is
+// skipped.
+func flushUnchangedGraph(runtimes []relationRuntime) (bool, error) {
+	for _, runtime := range runtimes {
+		if len(runtime.relationPending()) > 0 || len(runtime.relationDeleteIDs()) > 0 {
+			return false, nil
+		}
+	}
+
+	// Identity, not synced(): Unsafe.Flush bumps the table epoch before reaching
+	// here, so synced() is always false by now. What matters is that the
+	// replica's relation baseline was taken from the index still published — if
+	// it was, the baseline is the committed graph and the comparison is exact.
+	replica := projectTower.replica.Load()
+	if replica == nil || replica.index == nil || replica.index != committedRelationIndexSnapshot() {
+		return false, nil
+	}
+
+	diverged, err := replica.relationsDiverged()
+	if err != nil || diverged {
+		return false, err
+	}
+
+	for _, runtime := range runtimes {
+		if err := runtime.relationReindex(); err != nil {
+			return false, err
+		}
+	}
+
+	for _, runtime := range runtimes {
+		if err := runtime.relationSave(); err != nil {
+			return false, err
+		}
+	}
+
+	if err := sharedTransactionWAL().truncate(); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func bindPendingRelationModelToLive(model *relationModel, runtimes []relationRuntime) error {

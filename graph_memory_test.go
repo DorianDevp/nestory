@@ -378,6 +378,21 @@ func measureRelationWrites(t *testing.T, graph relationGraph, total, units int) 
 		HeapAlloc: settledHeap(), PeakHeap: peak, ChurnOp: churn, RSS: processRSS(),
 	})
 
+	// Mutating a field through a pointer kept since build time is what Unsafe's
+	// contract allows, and nothing records it. The graph is untouched, so the
+	// flush has no model or index work to do — but only a comparison against the
+	// shadow can establish that.
+	peak, churn = measureOperation(t, 16, func(iteration int) {
+		graph.anyProject.Name = "renamed-" + strconv.Itoa(iteration)
+		if err := graph.documents.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	emitGraphSample(t, graphMemorySample{
+		Schema: "graph", Phase: "mutate-then-flush", Nodes: total, Roots: units,
+		HeapAlloc: settledHeap(), PeakHeap: peak, ChurnOp: churn, RSS: processRSS(),
+	})
+
 	// Same trigger, reached the way an append-heavy workload reaches it: insert a
 	// row, then update a root. The insert retires the replica the update needs.
 	peak, churn = measureOperation(t, 16, func(iteration int) {
