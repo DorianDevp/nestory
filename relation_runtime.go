@@ -296,6 +296,19 @@ func ensureCommittedOwnership() error {
 	return refreshCommittedOwnership()
 }
 
+// committedRelationRefCount reports how many edges the last published model had,
+// as a sizing hint for the next rebuild. It is a hint, never a correctness input.
+func committedRelationRefCount() int {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	if committedOwnership.graph == nil {
+		return 0
+	}
+
+	return len(committedOwnership.graph.refs)
+}
+
 func relationGraphRegistered() bool {
 	relationParticipantsMu.RLock()
 	defer relationParticipantsMu.RUnlock()
@@ -811,12 +824,20 @@ func buildRelationModelFromTargets(
 	targets map[relationTargetKey]indexedRelationTarget,
 	targetFields map[reflect.Type]map[string]struct{},
 ) (*relationModel, error) {
+	// refs, owners and outgoing all hold one entry per edge or per owned node, and
+	// a full rebuild reaches the same size the committed model already has. Sizing
+	// from it turns eighteen doublings — each copying and abandoning the previous
+	// array — into a single allocation. A stale hint only costs the usual growth.
 	model := &relationModel{
 		nodes: nodes, targets: targets, targetFields: targetFields,
-		owners: make(map[nodeKey]nodeKey), outgoing: make(map[nodeKey][]nodeKey),
+		owners: make(map[nodeKey]nodeKey, len(nodes)), outgoing: make(map[nodeKey][]nodeKey),
 	}
+
 	incoming := make(map[nodeKey][]incomingOwn)
 	ownedBy := make(map[nodeKey]incomingOwn)
+	if hint := committedRelationRefCount(); hint > 0 {
+		model.refs = make([]resolvedRelation, 0, hint)
+	}
 
 	for _, node := range nodes {
 		if err := scanNodeRelations(model, node, incoming, ownedBy); err != nil {
