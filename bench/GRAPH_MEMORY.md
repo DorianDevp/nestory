@@ -391,17 +391,54 @@ entry per node on every refresh.
 The mutation flush is the shape this was aimed at: 143,000x less churn, and a
 peak that no longer scales with the graph at all.
 
+**Steps 14-16 — the flush settles against the shadow.** Three changes close the
+create path:
+
+- `graphMovedNodes` classifies every divergence between live and shadow:
+  relation fields by id, lookup-key fields by value. A lookup-key change poisons
+  the committed target index, so it forces the full rebuild; anything else is a
+  change set the delta can take. This also closed a soundness hole in the first
+  version of the gate, which compared only relation fields — a mutated match
+  field slipped through it.
+- The tower refresh absorbs **created** nodes through fresh per-table blocks, so
+  no existing shadow address ever moves and a create no longer costs a
+  whole-project tower rebuild.
+- `flushIncremental` feeds the derived change set plus the queued creates to
+  `buildRelationCreateIndexDelta` — the same tested route a transactional create
+  takes — and publishes the delta. Deletes, key changes and builder refusals
+  still fall through to today's full rebuild, so every rejection lands in the
+  old path.
+
+A related correctness bug was found and fixed on the way: the refresh's
+moved-node detection skipped relation fields entirely, which left a reordered
+own slice stale in the shadow. Regression test included.
+
+| at 100,003 nodes | baseline | now |
+|---|---:|---:|
+| graph alone | 202.8 MiB | **146.5 MiB** |
+| with Tower replica | 243.3 MiB | **187.0 MiB** |
+| mixed-API, peak | 71.2 MiB | **0.013 MiB** |
+| flush after in-place mutation, peak | 210.4 MiB | **0.002 MiB** |
+| **insert-then-write, peak** | 589.3 MiB | **6.3 MiB** |
+| **insert-then-write, churn** | 617.5 MB | **6.6 MB** |
+
 ### Where this stands, against the stated target
 
-`insert-then-write` stands at **293 MiB against a 187 MiB base — 157%** —
-because it creates a node, and a create still takes the full rebuild. The gate
-declines anything it cannot settle by comparison.
+The target was an increment of at most 50% of the live base, aiming at 5%. The
+measured worst-case increment is now **6.3 MiB against a 187.0 MiB base — 3.4%.
+The target is met, including the stretch goal.** Every write path in the profile
+now peaks below 7 MiB regardless of graph size; the only operations that still
+pay a full O(project) rebuild are deletes and lookup-key mutations, by design.
 
-Closing that case is the same construction one step further: the engine's
-`buildRelationCreateIndexDelta` already accepts a set of touched nodes plus a set
-of creates and produces a publishable delta, and the shadow diff can now supply
-the first of those soundly. What is missing is wiring `Flush`'s queued creates
-into it and mirroring what the engine does around `publishAndRewire`.
+A side effect worth knowing: a delta publish nils the retained committed model
+(`publishAndRewire` has always done this), so steady-state live heap after
+delta-based flushes drops to **137.4 MiB** — the model is rebuilt only when a
+full rebuild is next needed.
+
+Of the remaining 6.6 MB per insert, most is `relationApplyPending` building an
+`existing` map over the whole table to check for duplicate ids, and the
+per-table reindex/save sweep — both proportional to table size, not graph size,
+and neither specific to the delta path.
 
 ## Failure modes this architecture permits
 
