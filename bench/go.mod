@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/hashicorp/go-memdb v1.3.5
+	github.com/redis/go-redis/v9 v9.21.0
 	github.com/tidwall/buntdb v1.3.2
 	go.etcd.io/bbolt v1.4.3
 	go.mongodb.org/mongo-driver/v2 v2.8.0
@@ -40,6 +41,7 @@ require (
 	go.opentelemetry.io/otel v1.37.0 // indirect
 	go.opentelemetry.io/otel/metric v1.37.0 // indirect
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect

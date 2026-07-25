@@ -138,6 +138,10 @@ func (db *DB[T]) relationDelete(ids map[int]struct{}) {
 var (
 	relationParticipantsMu sync.RWMutex
 	relationParticipants   = make(map[reflect.Type]struct{})
+	// relationParticipantsPresent mirrors len(relationParticipants) > 0 so the
+	// relation-free fast path costs an atomic load, not an RWMutex round trip —
+	// ensureCommittedOwnership sits on every Unsafe.Get.
+	relationParticipantsPresent atomic.Bool
 )
 
 func registerRelationParticipants(holder reflect.Type, specs []relationSpec) {
@@ -152,6 +156,8 @@ func registerRelationParticipants(holder reflect.Type, specs []relationSpec) {
 	for _, spec := range specs {
 		relationParticipants[spec.target] = struct{}{}
 	}
+
+	relationParticipantsPresent.Store(true)
 }
 
 func relationGraphParticipant(typ reflect.Type) bool {
@@ -349,10 +355,7 @@ func committedRelationRefCount() int {
 }
 
 func relationGraphRegistered() bool {
-	relationParticipantsMu.RLock()
-	defer relationParticipantsMu.RUnlock()
-
-	return len(relationParticipants) > 0
+	return relationParticipantsPresent.Load()
 }
 
 func refreshCommittedOwnership() error {
