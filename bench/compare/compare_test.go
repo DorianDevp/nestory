@@ -110,27 +110,6 @@ func BenchmarkSQLite_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkSQLite_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openSQLite(b, b.TempDir())
-			seedSQLite(b, db, n)
-			defer db.Close()
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				rows, _ := db.Query(`SELECT id,name,email,age FROM rec WHERE age=42`)
-				for rows.Next() {
-					var r Rec
-					rows.Scan(&r.Id, &r.Name, &r.Email, &r.Age)
-					sink += int64(r.Id)
-				}
-				rows.Close()
-			}
-		})
-	}
-}
-
 // bbolt (durable)
 
 var bucket = []byte("rec")
@@ -173,29 +152,6 @@ func BenchmarkBolt_BulkInsert(b *testing.B) {
 				b.StartTimer()
 				seedBolt(b, db, n)
 				db.Close()
-			}
-		})
-	}
-}
-
-func BenchmarkBolt_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBolt(b, b.TempDir())
-			seedBolt(b, db, n)
-			defer db.Close()
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.View(func(tx *bolt.Tx) error {
-					c := tx.Bucket(bucket).Cursor()
-					for k, v := c.First(); k != nil; k, v = c.Next() {
-						if r := dec(v); r.Age == 42 {
-							sink += int64(r.Id)
-						}
-					}
-					return nil
-				})
 			}
 		})
 	}
@@ -244,23 +200,5 @@ func BenchmarkMemdb_BulkInsert(b *testing.B) {
 
 // PointWrite: durable single-row update
 
-func BenchmarkMemdb_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db, _ := memdb.NewMemDB(memSchema())
-			seedMemdb(b, db, n)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				txn := db.Txn(false)
-				it, _ := txn.Get("rec", "id")
-				for obj := it.Next(); obj != nil; obj = it.Next() {
-					if r := obj.(*Rec); r.Age == 42 {
-						sink += int64(r.Id)
-					}
-				}
-				txn.Abort()
-			}
-		})
-	}
-}
+// memdbNew opens an empty go-memdb with the flat-record schema.
+func memdbNew() (*memdb.MemDB, error) { return memdb.NewMemDB(memSchema()) }

@@ -62,28 +62,6 @@ func BenchmarkBunt_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkBunt_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBunt(b, b.TempDir())
-			seedBunt(b, db, n)
-			defer db.Close()
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.View(func(tx *buntdb.Tx) error {
-					return tx.Ascend("", func(k, v string) bool {
-						if r := dec([]byte(v)); r.Age == 42 {
-							sink += int64(r.Id)
-						}
-						return true
-					})
-				})
-			}
-		})
-	}
-}
-
 // badger (LSM, durable)
 
 func openBadger(tb testing.TB, dir string) *badger.DB {
@@ -123,33 +101,6 @@ func BenchmarkBadger_BulkInsert(b *testing.B) {
 				b.StopTimer()
 				db.Close()
 				b.StartTimer()
-			}
-		})
-	}
-}
-
-func BenchmarkBadger_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBadger(b, b.TempDir())
-			seedBadger(b, db, n)
-			defer db.Close()
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.View(func(txn *badger.Txn) error {
-					it := txn.NewIterator(badger.DefaultIteratorOptions)
-					defer it.Close()
-					for it.Rewind(); it.Valid(); it.Next() {
-						_ = it.Item().Value(func(v []byte) error {
-							if r := dec(v); r.Age == 42 {
-								sink += int64(r.Id)
-							}
-							return nil
-						})
-					}
-					return nil
-				})
 			}
 		})
 	}

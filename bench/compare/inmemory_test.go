@@ -53,32 +53,6 @@ func BenchmarkSQLiteMem_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkSQLiteMem_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openSQLiteMem(b)
-			defer db.Close()
-			seedSQLite(b, db, n)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				rows, err := db.Query(`SELECT id,name,email,age FROM rec WHERE age=42`)
-				if err != nil {
-					b.Fatalf("scan: %v", err)
-				}
-				for rows.Next() {
-					var r Rec
-					if err := rows.Scan(&r.Id, &r.Name, &r.Email, &r.Age); err != nil {
-						b.Fatalf("row: %v", err)
-					}
-					sink += int64(r.Age)
-				}
-				rows.Close()
-			}
-		})
-	}
-}
-
 // BuntDB, :memory: — no AOF, no sync policy to configure.
 
 func openBuntMem(tb testing.TB) *buntdb.DB {
@@ -102,31 +76,6 @@ func BenchmarkBuntMem_BulkInsert(b *testing.B) {
 				b.StopTimer()
 				db.Close()
 				b.StartTimer()
-			}
-		})
-	}
-}
-
-func BenchmarkBuntMem_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBuntMem(b)
-			defer db.Close()
-			seedBunt(b, db, n)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				err := db.View(func(tx *buntdb.Tx) error {
-					return tx.Ascend("", func(_, value string) bool {
-						if r := dec([]byte(value)); r.Age == 42 {
-							sink += int64(r.Age)
-						}
-						return true
-					})
-				})
-				if err != nil {
-					b.Fatalf("scan: %v", err)
-				}
 			}
 		})
 	}
@@ -169,39 +118,6 @@ func BenchmarkBadgerMem_BulkInsert(b *testing.B) {
 				b.StopTimer()
 				db.Close()
 				b.StartTimer()
-			}
-		})
-	}
-}
-
-func BenchmarkBadgerMem_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBadgerMem(b)
-			defer db.Close()
-			seedBadgerMem(b, db, n)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				err := db.View(func(txn *badger.Txn) error {
-					iterator := txn.NewIterator(badger.DefaultIteratorOptions)
-					defer iterator.Close()
-					for iterator.Rewind(); iterator.Valid(); iterator.Next() {
-						err := iterator.Item().Value(func(value []byte) error {
-							if r := dec(value); r.Age == 42 {
-								sink += int64(r.Age)
-							}
-							return nil
-						})
-						if err != nil {
-							return err
-						}
-					}
-					return nil
-				})
-				if err != nil {
-					b.Fatalf("scan: %v", err)
-				}
 			}
 		})
 	}
@@ -255,44 +171,6 @@ func BenchmarkRedis_BulkInsert(b *testing.B) {
 				}
 				b.StartTimer()
 				seedRedis(b, client, n)
-			}
-		})
-	}
-}
-
-func BenchmarkRedis_Scan(b *testing.B) {
-	client := openRedis(b)
-	defer client.Close()
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			seedRedis(b, client, n)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				var cursor uint64
-				for {
-					keys, next, err := client.Scan(context.Background(), cursor, "*", 1000).Result()
-					if err != nil {
-						b.Fatalf("scan: %v", err)
-					}
-					if len(keys) > 0 {
-						values, err := client.MGet(context.Background(), keys...).Result()
-						if err != nil {
-							b.Fatalf("mget: %v", err)
-						}
-						for _, value := range values {
-							if raw, ok := value.(string); ok {
-								if r := dec([]byte(raw)); r.Age == 42 {
-									sink += int64(r.Age)
-								}
-							}
-						}
-					}
-					cursor = next
-					if cursor == 0 {
-						break
-					}
-				}
 			}
 		})
 	}

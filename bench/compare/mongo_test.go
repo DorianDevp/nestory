@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
@@ -105,38 +104,6 @@ func BenchmarkMongo_BulkInsert(b *testing.B) {
 				if _, err := collection.InsertMany(context.Background(), docs); err != nil {
 					b.Fatalf("insert: %v", err)
 				}
-			}
-		})
-	}
-}
-
-func BenchmarkMongo_Scan(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			collection := openMongo(b)
-			seedMongo(b, collection, n)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				cursor, err := collection.Find(context.Background(), bson.M{"age": 42})
-				if err != nil {
-					b.Fatalf("find: %v", err)
-				}
-
-				for cursor.Next(context.Background()) {
-					var rec mongoRec
-					if err := cursor.Decode(&rec); err != nil {
-						b.Fatalf("decode: %v", err)
-					}
-
-					sink += int64(rec.Age)
-				}
-
-				if err := cursor.Err(); err != nil {
-					b.Fatalf("cursor: %v", err)
-				}
-
-				_ = cursor.Close(context.Background())
 			}
 		})
 	}
