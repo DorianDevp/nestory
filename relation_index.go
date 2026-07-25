@@ -3,6 +3,7 @@ package nestory
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 )
@@ -1033,18 +1034,40 @@ func (index *committedRelationIndex) inverseHolders(target nodeKey, inverse rela
 }
 
 func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struct{}) *committedRelationIndex {
-	nodes := make(map[nodeKey]relationGraphNode, len(model.nodes)-len(deleted))
-	values := make(map[nodeKey]reflect.Value, len(model.nodes)-len(deleted))
-	for key, node := range model.nodes {
-		if _, dies := deleted[key]; dies {
-			continue
+	// With nothing deleted the surviving node set is model.nodes itself, so the
+	// filtered copy this used to build was a duplicate map per node. Reading it
+	// is safe: nothing writes through the nodes local, and index.nodes below is a
+	// separate map of a different type.
+	//
+	// model.targets was already derived from exactly these nodes and these
+	// targetFields, so recomputing it walked every node and every target field a
+	// second time for an identical result. It cannot be shared, though —
+	// publishAndRewire assigns into index.targets when a create is published, and
+	// that would write into the model committedOwnership.graph still holds. A map
+	// clone is the cheap half of the old work and keeps the two independent.
+	nodes, targets := model.nodes, maps.Clone(model.targets)
+	if len(deleted) > 0 {
+		nodes = make(map[nodeKey]relationGraphNode, len(model.nodes)-len(deleted))
+		for key, node := range model.nodes {
+			if _, dies := deleted[key]; dies {
+				continue
+			}
+
+			nodes[key] = node
 		}
 
-		nodes[key] = node
+		targets = buildRelationTargetIndexFromFields(nodes, model.targetFields)
+	}
+
+	if targets == nil {
+		targets = make(map[relationTargetKey]indexedRelationTarget)
+	}
+
+	values := make(map[nodeKey]reflect.Value, len(nodes))
+	for key, node := range nodes {
 		values[key] = node.value
 	}
 
-	targets := buildRelationTargetIndexFromFields(nodes, model.targetFields)
 	index := &committedRelationIndex{
 		nodes: values, targets: targets, targetFields: model.targetFields,
 		backFields: make(map[reflect.Type]map[int]struct{}),
