@@ -3,6 +3,7 @@ package nestory
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestViewReadsLiveOwnershipTreeWithoutDirtyingIt(t *testing.T) {
@@ -30,28 +31,11 @@ func TestViewReadsLiveOwnershipTreeWithoutDirtyingIt(t *testing.T) {
 
 		ownerResource, _ := ownerDB.resource(owner.Id)
 		childResource, _ := childDB.resource(child.Id)
-		var viewedOwner *txOwner
-		var viewedChild *txChild
-		if err := ownerDB.View(owner.Id, func(current *txOwner) error {
-			if ownerResource.mu.TryLock() {
-				ownerResource.mu.Unlock()
-				t.Fatal("View did not read-lock its root")
-			}
 
-			if childResource.mu.TryLock() {
-				childResource.mu.Unlock()
-				t.Fatal("View did not read-lock an owned child")
-			}
-
-			viewedOwner = current
-			viewedChild = current.Child
-			return nil
-		}); err != nil {
+		// A read on its own must not mark anything dirty; the writer below
+		// legitimately does, so this has to be settled first.
+		if err := ownerDB.View(owner.Id, func(*txOwner) error { return nil }); err != nil {
 			t.Fatal(err)
-		}
-
-		if viewedOwner != ownerResource.item || viewedChild != childResource.item {
-			t.Fatal("View did not expose canonical stable pointers")
 		}
 
 		if dirty := ownerDB.store.dirtyIndices(); len(dirty) != 0 {
@@ -60,6 +44,53 @@ func TestViewReadsLiveOwnershipTreeWithoutDirtyingIt(t *testing.T) {
 
 		if dirty := childDB.store.dirtyIndices(); len(dirty) != 0 {
 			t.Fatalf("child dirty chunks after View = %v", dirty)
+		}
+
+		// Assert the property the contract promises — writers to the branch are
+		// excluded for the callback's duration — rather than the mechanism that
+		// delivers it. View used to hold one read lock per row; it now holds one
+		// per branch, and the guarantee is what has to survive that.
+		var viewedOwner *txOwner
+		var viewedChild *txChild
+		writerDone := make(chan struct{})
+		if err := ownerDB.View(owner.Id, func(current *txOwner) error {
+			go func() {
+				defer close(writerDone)
+				if err := childDB.UpdateWithin(child.Id, func(live *txChild) error {
+					live.N = 99
+
+					return nil
+				}); err != nil {
+					t.Error(err)
+				}
+			}()
+
+			select {
+			case <-writerDone:
+				t.Error("a writer to an owned child ran during View")
+			case <-time.After(25 * time.Millisecond):
+			}
+
+			viewedOwner = current
+			viewedChild = current.Child
+
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		select {
+		case <-writerDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the writer never completed after View returned")
+		}
+
+		if childResource.item.N != 99 {
+			t.Fatalf("child N = %d, want the writer's 99", childResource.item.N)
+		}
+
+		if viewedOwner != ownerResource.item || viewedChild != childResource.item {
+			t.Fatal("View did not expose canonical stable pointers")
 		}
 	})
 }

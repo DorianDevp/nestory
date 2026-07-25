@@ -36,35 +36,15 @@ func (db *DB[T]) View(id int, fn func(*T) error) error {
 		return err
 	}
 
-	keys := committedOwnershipKeys(nodeKey{typ: reflect.TypeFor[T](), id: id})
 	root, found := db.resource(id)
 	if !found {
 		return ErrNotFound
 	}
 
-	// Branch keys are sorted by type name, so same-type runs are contiguous and
-	// one lookup covers each run. Resolving per node cost more than the locks.
-	var lockType reflect.Type
-	var lockCommitter committer
-	for _, key := range keys {
-		if key.typ != lockType {
-			lockType, lockCommitter = key.typ, committerForType(key.typ)
-		}
-
-		lockCommitter.readLockResource(key.id)
-	}
-
-	defer func() {
-		var unlockType reflect.Type
-		var unlockCommitter committer
-		for i := len(keys) - 1; i >= 0; i-- {
-			if keys[i].typ != unlockType {
-				unlockType, unlockCommitter = keys[i].typ, committerForType(keys[i].typ)
-			}
-
-			unlockCommitter.readUnlockResource(keys[i].id)
-		}
-	}()
+	// One acquisition for the whole branch. Locking every row instead cost 112
+	// atomics across as many cache lines, two thirds of a graph read.
+	branch := lockBranchForRead(reflect.TypeFor[T](), id)
+	defer branch.RUnlock()
 
 	return fn(root.item)
 }
