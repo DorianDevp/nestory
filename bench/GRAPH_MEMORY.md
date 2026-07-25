@@ -353,55 +353,48 @@ that function and deadlocked the whole suite.
 | insert-then-write, peak | 589.3 MiB | **302.0 MiB** |
 | peak as a share of the base | 242% | **161%** |
 
-### Where this stopped, against the stated target
+**Steps 11-12 — diff instead of rebuild.** `Flush` now compares the live graph
+against the Tower shadow and skips the model and index rebuild entirely when
+nothing moved. The shadow is the last committed state, so it *derives* the change
+set rather than trusting a declaration — which is what makes it sound under
+Unsafe's contract, where a caller may mutate through a pointer it kept since
+creation and nothing records that. `refresh` likewise compares before copying,
+instead of re-cloning every slice field to reproduce bytes that already matched.
 
-The target is an increment of at most 50% of the live base. The measured
-increment is **161%**, so it is not met.
+Two things had to be right for the gate to ever open:
 
-The profile now says why, and it is a different answer than three steps ago.
-`buildCommittedRelationIndex` and `buildRelationModelFromTargets` are the top two
-sites and their cost is **flat**, not cumulative: with every map sized correctly,
-each is a single allocation of exactly the table it needs. The remaining 241 MB
-per flush is not waste around the structures — it is the structures. Ten steps of
-representation work have reached the floor of the current design.
+- **Identity, not `synced()`.** `Unsafe.Flush` bumps the table epoch before
+  reaching the check, so `synced()` is always false by then. What matters is that
+  the replica's baseline came from the index still published, which pointer
+  identity states exactly.
+- **Compare by id, not by pointer.** A relation field holds shadow pointers on
+  the shadow side and live pointers on the live side. Comparing them as pointers
+  reports a difference on every node with a relation, always — the first version
+  did, and silently never took the fast path.
 
-Below that floor sits one decision: `flushRelations` rebuilds a complete
-`relationModel` and a complete `committedRelationIndex` on every call.
+| at 100,003 nodes | baseline | now |
+|---|---:|---:|
+| graph alone | 202.8 MiB | **146.4 MiB** |
+| with Tower replica | 243.3 MiB | **187.0 MiB** |
+| mixed-API, peak | 71.2 MiB | **38.2 MiB** |
+| **flush after in-place mutation, peak** | 210.4 MiB | **0.001 MiB** |
+| **flush after in-place mutation, churn** | 220,769,016 B | **1,536 B** |
+| insert-then-write, peak | 589.3 MiB | **302.3 MiB** |
 
-### Why the obvious shortcut is unsound
+The mutation flush is the shape this was aimed at: 143,000x less churn, and a
+peak that no longer scales with the graph at all.
 
-The transaction engine already has the incremental route —
-`buildRelationCreateIndexDelta` plus `publishAndRewire`, which is why a
-transactional scalar write costs a flat 8.7 kB at every graph size. Routing
-`Unsafe().Flush()` into it needs the set of nodes that changed, and the tempting
-implementation is to record the keys handed out by `Unsafe().Get()` and
-`Unsafe().All()`.
+### Where this stands, against the stated target
 
-That is not sound, and this profile's own fixture proves it:
+`insert-then-write` is unchanged at **302 MiB against a 187 MiB base — 161%** —
+because it creates a node, and a create still takes the full rebuild. The gate
+declines anything it cannot settle by comparison.
 
-```go
-graph.documents.Unsafe().Create(document)
-graph.anyProject.Documents = append(graph.anyProject.Documents, document)
-```
-
-`anyProject` is a pointer kept since the graph was built. An existing node's
-relation slice is mutated with no `Unsafe().Get()` anywhere, which is exactly
-what the contract permits — *the caller must provide exclusive access until
-Flush completes*, not *the caller must re-acquire each pointer*. Any tracking
-scheme misses this, and a delta built from an incomplete change set publishes a
-stale index.
-
-So there are two ways down, and they differ in kind:
-
-1. **Rescan without rebuilding.** Keep the O(graph) walk the contract requires,
-   but compare each node's relation fields against the committed index and
-   allocate only for the ones that differ. Sound under the current contract,
-   entirely internal, and a substantial piece of work: it is a new consumer of
-   the validation logic rather than a change of representation.
-2. **Make `Unsafe` declare its writes**, the way `Tracked().UpdateWithin` already
-   does for the Tower. This makes tracking sound and lets `Flush` reuse the
-   engine's existing, tested delta path — but it changes the `Unsafe` contract,
-   which is user-facing.
+Closing that case is the same construction one step further: the engine's
+`buildRelationCreateIndexDelta` already accepts a set of touched nodes plus a set
+of creates and produces a publishable delta, and the shadow diff can now supply
+the first of those soundly. What is missing is wiring `Flush`'s queued creates
+into it and mirroring what the engine does around `publishAndRewire`.
 
 ## Failure modes this architecture permits
 
