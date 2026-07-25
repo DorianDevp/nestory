@@ -13,6 +13,7 @@ require (
 )
 
 require (
+	github.com/DorianDevp/nestory v0.0.0-20260724230406-bf9c50eba330 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -52,3 +53,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/DorianDevp/nestory => ..
