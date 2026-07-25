@@ -1,7 +1,9 @@
 # nestory — benchmarks & comparison
 
 Same-machine, same-session comparison of nestory against five pure-Go embedded
-stores and one server database, on an identical record shape.
+stores and one server database, on an identical record shape. A companion
+report, `INMEMORY.md`, compares against the same engines running purely in
+memory — no files, no fsync.
 
 > **Methodology.** All numbers measured on the machine below, `benchtime=300ms`.
 > nestory's numbers come from its in-package benchmark (`../bench_test.go` — it
