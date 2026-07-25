@@ -554,3 +554,62 @@ func TestTowerRefreshSeesReorderedChildren(t *testing.T) {
 		}
 	})
 }
+
+// TestUnsafeCreateFlushUsesShadowDelta proves the create flush takes the delta
+// route, not just that the result looks right: publishAndRewire nils the
+// committed model, while the full rebuild stores a fresh one, so the nil is a
+// fingerprint of the path taken. The shadow must then serve the new child from
+// its own world, wired and diffable.
+func TestUnsafeCreateFlushUsesShadowDelta(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		ownerDB, childDB, owner, _ := seedTowerBranch(t)
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			shadow.Name = "warm"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		child := &relationBenchChild{OwnerID: owner.Id, Value: 30}
+		childDB.Unsafe().Create(child)
+		owner.Children = append(owner.Children, child)
+		if err := childDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		if committedRelationModel() != nil {
+			t.Fatal("create flush rebuilt the full model instead of publishing a delta")
+		}
+
+		childKey := nodeKey{typ: reflect.TypeFor[relationBenchChild](), id: child.Id}
+		ownerKey := nodeKey{typ: reflect.TypeFor[relationBenchOwner](), id: owner.Id}
+		if got := committedRelationIndexSnapshot().owners[childKey]; got != ownerKey {
+			t.Fatalf("owners[%v] = %v, want %v", childKey, got, ownerKey)
+		}
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			if len(shadow.Children) != 3 {
+				t.Fatalf("shadow sees %d children, want 3", len(shadow.Children))
+			}
+
+			last := shadow.Children[2]
+			if last == child {
+				t.Fatal("shadow hands out the live pointer instead of a shadow copy")
+			}
+
+			if last.Value != 30 {
+				t.Fatalf("shadow child Value = %d, want 30", last.Value)
+			}
+
+			shadow.Name = "after-create"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if owner.Name != "after-create" {
+			t.Fatalf("owner.Name = %q, want after-create", owner.Name)
+		}
+	})
+}

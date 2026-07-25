@@ -895,57 +895,77 @@ func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) b
 	return true
 }
 
-// relationsDiverged reports whether any live node's relation fields still match
-// its shadow.
+// graphMovedNodes reports which committed nodes no longer match the shadow in
+// any way the relation index can see: a relation field compared by id, or a
+// lookup-key field compared by value. keyChanged is set when a lookup-key field
+// moved — the committed target index maps that field's old value to the node,
+// so only the full rebuild can fix it; the delta path must refuse.
 //
-// Flush needs to know which nodes changed, and Unsafe cannot tell it: the
-// contract is that the caller holds exclusive access until Flush completes, not
-// that it re-acquires every pointer, so a caller may mutate through a pointer it
-// kept since creation. Recording what Unsafe.Get hands out would miss exactly
-// that. The shadow does not need to be told — it *is* the last committed state,
-// so comparing against it derives the answer instead of trusting a declaration.
-//
-// The comparison is by id, not by pointer. A relation field holds shadow
-// pointers on the shadow side and live pointers on the live side, so comparing
-// them as pointers reports a difference on every node with a relation, always.
-// Identity is what the graph is made of; the address a copy happens to sit at is
-// not. It allocates nothing.
-func (replica *towerReplica) relationsDiverged() (bool, error) {
+// Flush needs this because Unsafe cannot tell it what changed: the contract is
+// exclusive access until Flush completes, not re-acquiring every pointer, so a
+// caller may mutate through a pointer it kept since creation. The shadow *is*
+// the last committed state, so comparing derives the change set instead of
+// trusting a declaration. Scalar fields outside the lookup keys are ignored:
+// the index does not hold them, so they cannot stale it.
+func (replica *towerReplica) graphMovedNodes() (moved []nodeKey, keyChanged bool, err error) {
 	var currentType reflect.Type
 	var plan cachedTowerFieldPlan
-	var err error
+	var keyFields []int
 
 	for key, live := range replica.live {
 		if key.typ != currentType {
 			currentType = key.typ
 			plan, err = towerFields(currentType)
 			if err != nil {
-				return false, err
+				return nil, false, err
+			}
+
+			keyFields = keyFields[:0]
+			names := replica.index.targetFields[currentType]
+			for _, field := range plan.fields {
+				if field.relational {
+					continue
+				}
+
+				if _, lookup := names[currentType.Field(field.index).Name]; lookup {
+					keyFields = append(keyFields, field.index)
+				}
 			}
 		}
 
 		shadow, present := replica.nodes[key]
 		if !present {
-			return true, nil
+			moved = append(moved, key)
+			continue
 		}
 
 		liveValue, shadowValue := live.Elem(), shadow.Elem()
+		changed := false
 		for _, field := range plan.fields {
 			if !field.relational {
 				continue
 			}
 
-			if !sameRelationIdentity(
-				liveValue.Field(field.index),
-				shadowValue.Field(field.index),
-				field.many,
-			) {
-				return true, nil
+			if !sameRelationIdentity(liveValue.Field(field.index), shadowValue.Field(field.index), field.many) {
+				changed = true
+				break
 			}
+		}
+
+		for _, index := range keyFields {
+			if !relationFieldEqual(liveValue.Field(index), shadowValue.Field(index)) {
+				changed = true
+				keyChanged = true
+				break
+			}
+		}
+
+		if changed {
+			moved = append(moved, key)
 		}
 	}
 
-	return false, nil
+	return moved, keyChanged, nil
 }
 
 // sameRelationIdentity compares two relation fields by the ids they point at.

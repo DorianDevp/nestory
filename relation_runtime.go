@@ -1502,7 +1502,7 @@ func flushRelations() error {
 		return flushWithoutRelations(runtimes)
 	}
 
-	done, err := flushUnchangedGraph(runtimes)
+	done, err := flushIncremental(runtimes)
 	if done || err != nil {
 		return err
 	}
@@ -1586,21 +1586,24 @@ func flushRelations() error {
 	return nil
 }
 
-// flushUnchangedGraph persists a flush that cannot have changed the relation
-// graph, without rebuilding the model or the index.
+// flushIncremental settles a flush against the Tower shadow instead of
+// rebuilding the model and the index from every node in the project.
 //
-// The published model and index describe the graph, not the field values, so
-// they stay exactly correct as long as no node was created or deleted and no
-// relation field moved. The Tower replica answers the last condition by
-// comparison rather than by trusting anything the caller declared, which is why
-// this is sound under Unsafe's contract. Anything it cannot settle falls through
-// to the full rebuild.
+// The shadow is the last committed state, so comparing against it derives the
+// change set — which is what makes this sound under Unsafe's contract, where a
+// caller may mutate through a pointer it kept since creation and nothing
+// records that. Three outcomes:
 //
-// Field values still have to be persisted and reindexed — only the graph work is
-// skipped.
-func flushUnchangedGraph(runtimes []relationRuntime) (bool, error) {
+//   - nothing moved and nothing is queued: persist values and stop;
+//   - relations moved between existing nodes, or rows were created: feed the
+//     derived change set to the transaction engine's delta builder, the same
+//     already-tested route a transactional create takes;
+//   - anything the delta cannot prove — deletes, lookup-key changes, or a
+//     builder refusal — falls through to the full rebuild, so every rejection
+//     lands in today's code path.
+func flushIncremental(runtimes []relationRuntime) (bool, error) {
 	for _, runtime := range runtimes {
-		if len(runtime.relationPending()) > 0 || len(runtime.relationDeleteIDs()) > 0 {
+		if len(runtime.relationDeleteIDs()) > 0 {
 			return false, nil
 		}
 	}
@@ -1614,28 +1617,119 @@ func flushUnchangedGraph(runtimes []relationRuntime) (bool, error) {
 		return false, nil
 	}
 
-	diverged, err := replica.relationsDiverged()
-	if err != nil || diverged {
-		return false, err
+	moved, keyChanged, err := replica.graphMovedNodes()
+	if err != nil || keyChanged {
+		return false, nil
+	}
+
+	creates := make(map[nodeKey]createdResource)
+	for _, runtime := range runtimes {
+		typ := runtime.relationType()
+		for _, pending := range runtime.relationPending() {
+			id, present := valueID(pending)
+			if !present {
+				return false, nil
+			}
+
+			creates[nodeKey{typ: typ, id: id}] = createdResource{
+				key:  nodeKey{typ: typ, id: id},
+				work: pending,
+			}
+		}
+	}
+
+	if len(moved) == 0 && len(creates) == 0 {
+		return true, flushPersist(runtimes)
+	}
+
+	touched := make([]touchedResource, 0, len(moved))
+	for _, key := range moved {
+		touched = append(touched, touchedResource{
+			dbName: key.typ.Name(),
+			id:     key.id,
+			work:   replica.live[key].Interface(),
+		})
+	}
+
+	delta, err := buildRelationCreateIndexDelta(touched, creates)
+	if err != nil || delta == nil {
+		return false, nil
+	}
+
+	changed, err := delta.materializeOwnBackReferences(nil, touched, creates)
+	if err != nil {
+		return false, nil
 	}
 
 	for _, runtime := range runtimes {
-		if err := runtime.relationReindex(); err != nil {
+		if err := runtime.relationApplyPending(); err != nil {
 			return false, err
+		}
+	}
+
+	for key := range creates {
+		runtime, ok := baseRegistry[key.typ.Name()].(relationRuntime)
+		if !ok {
+			return false, fmt.Errorf("%w: created node %s has no runtime", ErrRelationInvariant, key)
+		}
+
+		live, found := runtime.relationValue(key.id)
+		if !found {
+			return false, fmt.Errorf("%w: created node %s is missing", ErrRelationInvariant, key)
+		}
+
+		delta.bindCreatedNode(key, live)
+	}
+
+	// Resources materialize added beyond the derived set carry detached copies
+	// whose back references it just set; they must be written to the live rows,
+	// exactly as the engine does after a transactional create. The derived
+	// resources only need their chunks marked dirty — their work value is the
+	// live pointer itself.
+	for _, resource := range changed[len(touched):] {
+		committerFor(resource.dbName).applyWrite(resource.id, resource.work)
+	}
+
+	for _, resource := range touched {
+		if runtime, ok := baseRegistry[resource.dbName].(relationRuntime); ok {
+			runtime.relationMarkDirty(resource.id)
+		}
+	}
+
+	if err := flushPersist(runtimes); err != nil {
+		return false, err
+	}
+
+	delta.publishAndRewire()
+	projectTower.refreshAfterCommit()
+
+	return true, nil
+}
+
+// flushPersist is the tail every incremental outcome shares: field values still
+// have to be reindexed and written even when the graph did not change shape.
+func flushPersist(runtimes []relationRuntime) error {
+	for _, runtime := range runtimes {
+		if err := runtime.relationReindex(); err != nil {
+			return err
 		}
 	}
 
 	for _, runtime := range runtimes {
 		if err := runtime.relationSave(); err != nil {
-			return false, err
+			return err
 		}
 	}
 
 	if err := sharedTransactionWAL().truncate(); err != nil {
-		return false, err
+		return err
 	}
 
-	return true, nil
+	for _, runtime := range runtimes {
+		runtime.relationClearQueues()
+	}
+
+	return nil
 }
 
 func bindPendingRelationModelToLive(model *relationModel, runtimes []relationRuntime) error {
