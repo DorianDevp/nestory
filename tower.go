@@ -469,24 +469,23 @@ func snapshotTowerRelationsInto(
 	key nodeKey,
 	node reflect.Value,
 ) error {
-	{
-		specs, err := relationSpecs(key.typ)
-		if err != nil {
-			return err
+	specs, err := relationSpecs(key.typ)
+	if err != nil {
+		return err
+	}
+
+	for _, spec := range specs {
+		field := node.Elem().Field(spec.fieldIndex)
+		state := towerRelationState{}
+		if !spec.many {
+			state.one, state.present = valueID(field)
+		} else {
+			baseline := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
+			reflect.Copy(baseline, field)
+			state.many = baseline.Interface()
 		}
 
-		for _, spec := range specs {
-			field := node.Elem().Field(spec.fieldIndex)
-			state := towerRelationState{}
-			if !spec.many {
-				state.one, state.present = valueID(field)
-			} else {
-				baseline := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
-				reflect.Copy(baseline, field)
-				state.many = baseline.Interface()
-			}
-			relations[towerRelationKey{node: key, field: spec.fieldIndex}] = state
-		}
+		relations[towerRelationKey{node: key, field: spec.fieldIndex}] = state
 	}
 
 	return nil
@@ -503,38 +502,36 @@ func wireTowerNodes(nodes map[nodeKey]reflect.Value) error {
 }
 
 func wireTowerNode(nodes map[nodeKey]reflect.Value, key nodeKey, node reflect.Value) error {
-	{
-		specs, err := relationSpecs(key.typ)
-		if err != nil {
-			return err
-		}
+	specs, err := relationSpecs(key.typ)
+	if err != nil {
+		return err
+	}
 
-		for _, spec := range specs {
-			field := node.Elem().Field(spec.fieldIndex)
-			if !spec.many {
-				id, present := valueID(field)
-				if !present {
-					continue
-				}
-
-				target := nodes[nodeKey{typ: spec.target, id: id}]
-				if target.IsValid() {
-					field.Set(target)
-				}
-
+	for _, spec := range specs {
+		field := node.Elem().Field(spec.fieldIndex)
+		if !spec.many {
+			id, present := valueID(field)
+			if !present {
 				continue
 			}
 
-			for position := range field.Len() {
-				id, present := valueID(field.Index(position))
-				if !present {
-					continue
-				}
+			target := nodes[nodeKey{typ: spec.target, id: id}]
+			if target.IsValid() {
+				field.Set(target)
+			}
 
-				target := nodes[nodeKey{typ: spec.target, id: id}]
-				if target.IsValid() {
-					field.Index(position).Set(target)
-				}
+			continue
+		}
+
+		for position := range field.Len() {
+			id, present := valueID(field.Index(position))
+			if !present {
+				continue
+			}
+
+			target := nodes[nodeKey{typ: spec.target, id: id}]
+			if target.IsValid() {
+				field.Index(position).Set(target)
 			}
 		}
 	}
