@@ -71,16 +71,17 @@ func (db *DB[T]) relationApplyPending() error {
 		return nil
 	}
 
-	existing := make(map[int]bool, db.store.Len())
-	db.store.Range(func(p *T) { existing[(*p).GetId()] = true })
+	// resById is already the id set this used to copy into a throwaway map —
+	// one map per flush, sized like the table. add inserts under db.mu before
+	// the next lookup, so an intra-batch duplicate is caught the same way a
+	// live one is.
 	for _, entity := range db.persistQueue {
 		id := (*entity).GetId()
-		if existing[id] {
+		if _, exists := db.resource(id); exists {
 			return fmt.Errorf("%w: %s(%d)", ErrAlreadyExists, db.name, id)
 		}
 
 		db.add(entity)
-		existing[id] = true
 	}
 
 	return nil
