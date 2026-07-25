@@ -62,8 +62,15 @@ with everything it owns (56 nodes):
 |---|---:|---:|---:|
 | **nestory, pointer traversal** | **64.7** | **0** | 1× |
 | go-memdb | 2,241 | 52 | 35× |
-| **nestory, safe `View`** | 4,967 | 0 | 77× |
+| **nestory, safe `View`** | 2,828 | 0 | 44× |
 | SQLite | 202,049 | 570 | 3,120× |
+
+`View` was 4,967 ns when the review landed. Profiling it — rather than assuming,
+as a first draft of this file did — showed the read locks were only 27% of that:
+the majority was `committerFor(key.typ.Name())`, a reflect metadata parse plus a
+string map lookup, run twice per node. Branch keys are sorted by type name, so
+one lookup per contiguous type run replaces one per node, and the same read now
+costs 2,828 ns.
 
 Two findings, pulling opposite ways:
 
@@ -75,15 +82,16 @@ to run three queries and rebuild objects from rows. Against SQLite this is
 asked whether the advantage grows with relations: it grows by an order of
 magnitude.
 
-**And nestory's own safe API discards 98.7% of it.** `View` costs 4,967 ns for
-the same traversal, because it takes a per-row read lock across the whole
-branch. That is 77× the raw traversal and **2.2× slower than go-memdb**, which
-holds an MVCC snapshot and locks nothing. On the one workload where nestory
-should be untouchable, the safe path loses to the obvious competitor.
+**And nestory's own safe API still discards 97.7% of it.** Even after the fix
+above, `View` costs 2,828 ns against 64.7 ns of traversal — 44× — and remains
+**1.26× slower than go-memdb**, which holds an MVCC snapshot and locks nothing.
+On the one workload where nestory should be untouchable, the safe path loses to
+the obvious competitor.
 
-This is the most actionable result in this file: branch-wide per-row read
-locking is the wrong mechanism at this granularity, and a snapshot-based read
-path would recover most of the gap.
+What is left is now genuinely the locking: 56 `RWMutex.RLock` plus 56 unlocks,
+about 112 atomic read-modify-writes on cache lines other cores also touch. That
+is the mechanism to replace — a snapshot-based read path would remove it
+entirely — and it is the most actionable result in this file.
 
 ## 3. Scan throughput past the cache — no cliff
 
