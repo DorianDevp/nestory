@@ -25,7 +25,7 @@ RESULTS=${NESTORY_RESULTS:-results}
 
 # Engines per category. A name absent from a list is one that cannot express
 # that workload, and the report says which and why.
-graph_engines="Nestory NestoryUnsafe Memdb SQLite"
+graph_engines="Nestory NestoryUnsafe Memdb SQLite Bolt Bunt BuntMem Badger BadgerMem"
 
 for category in $CATEGORIES; do
     engines_var="${category}_engines"

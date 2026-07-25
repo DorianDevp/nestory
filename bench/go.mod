@@ -3,6 +3,7 @@ module github.com/DorianDevp/nestory/bench
 go 1.26.3
 
 require (
+	github.com/DorianDevp/nestory v0.0.0-20260724230406-bf9c50eba330
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/hashicorp/go-memdb v1.3.5
 	github.com/redis/go-redis/v9 v9.21.0
@@ -13,7 +14,6 @@ require (
 )
 
 require (
-	github.com/DorianDevp/nestory v0.0.0-20260724230406-bf9c50eba330 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect

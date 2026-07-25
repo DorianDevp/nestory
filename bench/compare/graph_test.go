@@ -8,7 +8,9 @@ package compare
 // to reassemble from rows.
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/gob"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,7 +19,10 @@ import (
 	"testing"
 
 	"github.com/DorianDevp/nestory"
+	badger "github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/go-memdb"
+	"github.com/tidwall/buntdb"
+	bolt "go.etcd.io/bbolt"
 	_ "modernc.org/sqlite"
 )
 
@@ -443,4 +448,281 @@ func BenchmarkGraphLoad_NestoryUnsafe(b *testing.B) {
 			}
 		}
 	}
+}
+
+// KV engines model the branch the way one actually would: each node is a blob
+// under a prefixed key, carrying the ids of what it owns. Loading a branch is
+// then 1 + projects + projects*documents point gets plus a decode each — the
+// work nestory does not do, made explicit.
+
+type kvWorkspace struct {
+	Id       int
+	Name     string
+	Projects []int
+}
+
+type kvProject struct {
+	Id        int
+	Name      string
+	Documents []int
+}
+
+type kvDocument struct {
+	Id    int
+	Title string
+}
+
+// graphStore is the one operation a branch load needs from a KV engine.
+type graphStore interface {
+	node(key string) []byte
+	close()
+}
+
+func graphKey(prefix string, id int) string { return prefix + strconv.Itoa(id) }
+
+// seedGraphKV lays out one shape as blobs and hands back the writes to apply.
+func seedGraphKV(shape graphShape) map[string][]byte {
+	nodes := make(map[string][]byte, shape.totalNodes())
+	projectID, documentID := 0, 0
+	for workspace := 1; workspace <= shape.workspaces; workspace++ {
+		record := kvWorkspace{Id: workspace, Name: "ws"}
+		for range shape.projects {
+			projectID++
+			record.Projects = append(record.Projects, projectID)
+
+			project := kvProject{Id: projectID, Name: "proj"}
+			for range shape.documents {
+				documentID++
+				project.Documents = append(project.Documents, documentID)
+				nodes[graphKey("d:", documentID)] = encAny(kvDocument{Id: documentID, Title: "doc"})
+			}
+
+			nodes[graphKey("p:", projectID)] = encAny(project)
+		}
+
+		nodes[graphKey("w:", workspace)] = encAny(record)
+	}
+
+	return nodes
+}
+
+func loadGraphBranch(b *testing.B, store graphStore, root int) {
+	var workspace kvWorkspace
+	decAny(store.node(graphKey("w:", root)), &workspace)
+	for _, projectID := range workspace.Projects {
+		var project kvProject
+		decAny(store.node(graphKey("p:", projectID)), &project)
+		for _, documentID := range project.Documents {
+			var document kvDocument
+			decAny(store.node(graphKey("d:", documentID)), &document)
+			graphSink += document.Id
+		}
+	}
+}
+
+func benchmarkGraphKV(b *testing.B, open func(testing.TB, graphShape) graphStore) {
+	shape := benchShape(b)
+	store := open(b, shape)
+	defer store.close()
+
+	root := max(shape.workspaces/2, 1)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		loadGraphBranch(b, store, root)
+	}
+}
+
+func encAny(value any) []byte {
+	var buffer bytes.Buffer
+	if err := gob.NewEncoder(&buffer).Encode(value); err != nil {
+		panic(err)
+	}
+
+	return buffer.Bytes()
+}
+
+func decAny(raw []byte, into any) {
+	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(into); err != nil {
+		panic(err)
+	}
+}
+
+// bbolt
+
+type boltGraph struct {
+	db *bolt.DB
+	tx *bolt.Tx
+}
+
+func (store *boltGraph) node(key string) []byte {
+	return store.tx.Bucket([]byte("g")).Get([]byte(key))
+}
+
+func (store *boltGraph) close() {
+	_ = store.tx.Rollback()
+	store.db.Close()
+}
+
+func openGraphBolt(tb testing.TB, shape graphShape) graphStore {
+	tb.Helper()
+
+	db, err := bolt.Open(filepath.Join(tb.TempDir(), "graph.db"), 0o600, nil)
+	if err != nil {
+		tb.Fatalf("open bolt: %v", err)
+	}
+
+	err = db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("g"))
+		if err != nil {
+			return err
+		}
+
+		for key, value := range seedGraphKV(shape) {
+			if err := bucket.Put([]byte(key), value); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		tb.Fatalf("seed bolt: %v", err)
+	}
+
+	// One long-lived read transaction: a fresh one per read would measure
+	// transaction setup, not the lookup.
+	tx, err := db.Begin(false)
+	if err != nil {
+		tb.Fatalf("begin: %v", err)
+	}
+
+	return &boltGraph{db: db, tx: tx}
+}
+
+func BenchmarkGraphLoad_Bolt(b *testing.B) { benchmarkGraphKV(b, openGraphBolt) }
+
+// BuntDB, on disk and in memory
+
+type buntGraph struct {
+	db  *buntdb.DB
+	tx  *buntdb.Tx
+	buf []byte
+}
+
+func (store *buntGraph) node(key string) []byte {
+	value, err := store.tx.Get(key)
+	if err != nil {
+		panic(err)
+	}
+
+	store.buf = append(store.buf[:0], value...)
+
+	return store.buf
+}
+
+func (store *buntGraph) close() {
+	_ = store.tx.Rollback()
+	store.db.Close()
+}
+
+func openGraphBuntWith(tb testing.TB, shape graphShape, path string) graphStore {
+	tb.Helper()
+
+	db, err := buntdb.Open(path)
+	if err != nil {
+		tb.Fatalf("open buntdb: %v", err)
+	}
+
+	err = db.Update(func(tx *buntdb.Tx) error {
+		for key, value := range seedGraphKV(shape) {
+			if _, _, err := tx.Set(key, string(value), nil); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		tb.Fatalf("seed buntdb: %v", err)
+	}
+
+	tx, err := db.Begin(false)
+	if err != nil {
+		tb.Fatalf("begin: %v", err)
+	}
+
+	return &buntGraph{db: db, tx: tx}
+}
+
+func BenchmarkGraphLoad_Bunt(b *testing.B) {
+	benchmarkGraphKV(b, func(tb testing.TB, shape graphShape) graphStore {
+		return openGraphBuntWith(tb, shape, filepath.Join(tb.TempDir(), "graph.db"))
+	})
+}
+
+func BenchmarkGraphLoad_BuntMem(b *testing.B) {
+	benchmarkGraphKV(b, func(tb testing.TB, shape graphShape) graphStore {
+		return openGraphBuntWith(tb, shape, ":memory:")
+	})
+}
+
+// Badger, on disk and in memory
+
+type badgerGraph struct {
+	db  *badger.DB
+	txn *badger.Txn
+}
+
+func (store *badgerGraph) node(key string) []byte {
+	item, err := store.txn.Get([]byte(key))
+	if err != nil {
+		panic(err)
+	}
+
+	value, err := item.ValueCopy(nil)
+	if err != nil {
+		panic(err)
+	}
+
+	return value
+}
+
+func (store *badgerGraph) close() {
+	store.txn.Discard()
+	store.db.Close()
+}
+
+func openGraphBadgerWith(tb testing.TB, shape graphShape, options badger.Options) graphStore {
+	tb.Helper()
+
+	db, err := badger.Open(options.WithLogger(nil))
+	if err != nil {
+		tb.Fatalf("open badger: %v", err)
+	}
+
+	batch := db.NewWriteBatch()
+	for key, value := range seedGraphKV(shape) {
+		if err := batch.Set([]byte(key), value); err != nil {
+			tb.Fatalf("seed badger: %v", err)
+		}
+	}
+
+	if err := batch.Flush(); err != nil {
+		tb.Fatalf("flush badger: %v", err)
+	}
+
+	return &badgerGraph{db: db, txn: db.NewTransaction(false)}
+}
+
+func BenchmarkGraphLoad_Badger(b *testing.B) {
+	benchmarkGraphKV(b, func(tb testing.TB, shape graphShape) graphStore {
+		return openGraphBadgerWith(tb, shape, badger.DefaultOptions(tb.TempDir()))
+	})
+}
+
+func BenchmarkGraphLoad_BadgerMem(b *testing.B) {
+	benchmarkGraphKV(b, func(tb testing.TB, shape graphShape) graphStore {
+		return openGraphBadgerWith(tb, shape, badger.DefaultOptions("").WithInMemory(true))
+	})
 }
