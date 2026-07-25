@@ -251,6 +251,7 @@ func (tower *Tower) retire(replica *towerReplica) {
 // run on across resets is harmless, and it means a table can hold on to its own
 // counter instead of looking it up by name on every write.
 func resetTower() {
+	resetBranchLocks()
 	projectTower = newTower()
 	towerFieldPlans = sync.Map{}
 	towerWriteLocks = sync.Map{}
@@ -1547,6 +1548,9 @@ func commitTowerScalarChanges(resources []touchedResource) error {
 	}()
 
 	lockedResources := transactionResourceLocks(resources, nil, nil)
+	releaseBranches := lockTouchedBranches(lockedResources)
+	defer releaseBranches()
+
 	for _, resource := range lockedResources {
 		committerFor(resource.dbName).lockResource(resource.id)
 	}

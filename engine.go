@@ -400,6 +400,9 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	}
 
 	lockedResources := transactionResourceLocks(touchedResources, createdResources, stagedDeletes)
+	releaseBranches := lockTouchedBranches(lockedResources)
+	defer releaseBranches()
+
 	for _, resource := range lockedResources {
 		committerFor(resource.dbName).lockResource(resource.id)
 	}
@@ -723,6 +726,11 @@ func bindRelationModelToLiveNodes(model *relationModel, resources []touchedResou
 
 func (en *transactionEngine) commitSingleWrite(tx *transactionState, resource touchedResource) error {
 	committer := committerFor(resource.dbName)
+	releaseBranch := lockTouchedBranches([]transactionResourceLock{
+		{dbName: resource.dbName, id: resource.id},
+	})
+	defer releaseBranch()
+
 	committer.lockResource(resource.id)
 	defer committer.unlockResource(resource.id)
 
