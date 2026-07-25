@@ -262,14 +262,40 @@ func (tower *Tower) refresh(
 	index *committedRelationIndex,
 	epochs map[string]uint64,
 ) (bool, error) {
-	if current == nil || len(index.nodes) != len(current.live) {
+	if current == nil || len(index.nodes) < len(current.live) {
 		return false, nil
 	}
 
+	// Committed keys the replica has never seen are additions; they get fresh
+	// storage below, so existing shadow addresses never move. A live pointer
+	// that changed identity, or a key the replica has that the index lost, is a
+	// replacement or a removal — those still take the full rebuild.
+	var added []nodeKey
 	for key, value := range index.nodes {
 		live, ok := current.live[key]
-		if !ok || live.Pointer() != value.Pointer() {
+		if !ok {
+			added = append(added, key)
+			continue
+		}
+
+		if live.Pointer() != value.Pointer() {
 			return false, nil
+		}
+	}
+
+	if len(index.nodes)-len(added) != len(current.live) {
+		return false, nil
+	}
+
+	// New nodes go into one fresh block per table — never into an existing
+	// block, whose never-grow guarantee is what keeps every published shadow
+	// address stable. Appending a block moves no element of any other block.
+	if len(added) > 0 {
+		grown, blocks := buildTowerShadows(addedTowerNodes(index, added))
+		current.blocks = append(current.blocks, blocks...)
+		for key, shadow := range grown {
+			current.nodes[key] = shadow
+			current.live[key] = index.nodes[key]
 		}
 	}
 
@@ -300,6 +326,11 @@ func (tower *Tower) refresh(
 		cloneSliceFields(shadow.Elem())
 		moved = append(moved, key)
 	}
+
+	// An added node compares as unchanged — its shadow was copied from live a
+	// moment ago — but it still needs wiring into the shadow world and a
+	// relation baseline, so it joins the moved set here.
+	moved = append(moved, added...)
 
 	// A node nobody touched keeps its wiring and its relation baseline: refresh
 	// reuses the shadow addresses, so a pointer into an untouched node is still
@@ -429,6 +460,15 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 // Nodes go in ascending id, which is the order committedOwnershipKeys sorts a
 // branch into, so diffing walks the array front to back instead of chasing
 // pointers all over the heap.
+func addedTowerNodes(index *committedRelationIndex, added []nodeKey) map[nodeKey]reflect.Value {
+	nodes := make(map[nodeKey]reflect.Value, len(added))
+	for _, key := range added {
+		nodes[key] = index.nodes[key]
+	}
+
+	return nodes
+}
+
 func buildTowerShadows(liveNodes map[nodeKey]reflect.Value) (map[nodeKey]reflect.Value, []reflect.Value) {
 	byTable := make(map[reflect.Type][]nodeKey)
 	for key := range liveNodes {
