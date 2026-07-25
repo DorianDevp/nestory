@@ -831,12 +831,19 @@ func (replica *towerReplica) branchFor(root nodeKey) ([]towerBranchNode, error) 
 	return branch, nil
 }
 
-// towerNodeUnchanged compares a live node against its shadow, ignoring relation
-// fields: those hold shadow pointers on one side and live pointers on the other,
-// so they always differ bitwise and wireTowerNodes rebuilds them regardless.
+// towerNodeUnchanged compares a live node against its shadow. Relation fields
+// compare by id, not bitwise: they hold shadow pointers on one side and live
+// pointers on the other, so a pointer comparison always differs — but skipping
+// them entirely once left a reordered own slice stale in the shadow, because a
+// membership change is carried by the copy, not by the rewiring. Identity equal
+// means the shadow already points at shadow copies of the right ids.
 func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) bool {
 	for _, field := range plan.fields {
 		if field.relational {
+			if !sameRelationIdentity(live.Field(field.index), shadow.Field(field.index), field.many) {
+				return false
+			}
+
 			continue
 		}
 

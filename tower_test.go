@@ -514,3 +514,42 @@ func TestTowerCallbackDoesNotBlockCanonicalView(t *testing.T) {
 		}
 	})
 }
+
+// TestTowerRefreshSeesReorderedChildren pins the refresh path down on a change
+// that lives only in a relation field. A detached update that reorders an own
+// slice leaves every scalar field of the owner untouched, so a refresh that
+// skips relation fields when deciding what moved would keep the shadow's old
+// slice — and the next callback would read stale children.
+func TestTowerRefreshSeesReorderedChildren(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		ownerDB, _, owner, _ := seedTowerBranch(t)
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			shadow.Name = "warm"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		branch, err := ownerDB.Get(owner.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		branch.Children[0], branch.Children[1] = branch.Children[1], branch.Children[0]
+		if err := ownerDB.Update(branch); err != nil {
+			t.Fatal(err)
+		}
+
+		first := owner.Children[0].Value
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			if got := shadow.Children[0].Value; got != first {
+				t.Fatalf("shadow.Children[0].Value = %d, want %d (stale shadow slice)", got, first)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
