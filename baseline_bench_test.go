@@ -8,7 +8,7 @@ import (
 // The raw-Go baselines answer a question the cross-engine tables cannot: how
 // much of nestory's lead is its data model, and how much is simply the absence
 // of overhead any plain slice would also lack. A slice and a map give up
-// everything — durability, locking, versioning, relations, validation — so the
+// everything, durability, locking, versioning, relations, validation, so the
 // gap between them and nestory is the price of being a database, isolated from
 // the price of being a generic KV store.
 
@@ -93,7 +93,7 @@ func BenchmarkBaselineScan(b *testing.B) {
 
 // BenchmarkFilterAtScale runs nestory's Filter past the point where the data
 // stops fitting in cache. The published 214 M rows/s came from a 10,000-row
-// set — 560 kB, comfortably resident — so it measured cache-warm throughput,
+// set: 560 kB, comfortably resident, so it measured cache-warm throughput,
 // not the storage layout's asymptote.
 func BenchmarkFilterAtScale(b *testing.B) {
 	for _, n := range scanScales {

@@ -347,7 +347,7 @@ func TestTowerDiffsInterfaceFieldWithoutPanicking(t *testing.T) {
 }
 
 // The compiled comparator is what keeps a diff off reflect, and nothing else
-// fails visibly if it stops being installed — the diff just gets several times
+// fails visibly if it stops being installed, the diff just gets several times
 // slower. So assert the plan actually carries one.
 func TestTowerPlanUsesCompiledComparator(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
@@ -388,7 +388,7 @@ func TestTowerPlanUsesCompiledComparator(t *testing.T) {
 // Shadow nodes live inside one array per table, so their addresses are only
 // stable as long as that array never grows. A callback holds those addresses,
 // and the relation wiring points at them, so a move is a correctness bug rather
-// than a slowdown — the same rule chunkStore lives by.
+// than a slowdown, the same rule chunkStore lives by.
 func TestTowerShadowAddressesAreStable(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		ownerDB, _, owner, _ := seedTowerBranch(t)
@@ -519,7 +519,7 @@ func TestTowerCallbackDoesNotBlockCanonicalView(t *testing.T) {
 // that lives only in a relation field. A detached update that reorders an own
 // slice leaves every scalar field of the owner untouched, so a refresh that
 // skips relation fields when deciding what moved would keep the shadow's old
-// slice — and the next callback would read stale children.
+// slice, and the next callback would read stale children.
 func TestTowerRefreshSeesReorderedChildren(t *testing.T) {
 	isolatedRelations(t, func(t *testing.T) {
 		ownerDB, _, owner, _ := seedTowerBranch(t)
@@ -617,7 +617,7 @@ func TestUnsafeCreateFlushUsesShadowDelta(t *testing.T) {
 // TestUnsafeDeleteFlushUsesShadowDelta covers the delete route end to end: a
 // deleted document must vanish from the surviving project's own slice (which
 // the caller deliberately left dangling), from the tier's computed inverse
-// view, and from the committed index — all without publishing a new index,
+// view, and from the committed index, all without publishing a new index,
 // which is the fingerprint of the delta path. A borrowed tier must still
 // refuse deletion through the full path's canonical error.
 func TestUnsafeDeleteFlushUsesShadowDelta(t *testing.T) {

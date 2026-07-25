@@ -46,8 +46,8 @@ func TestViewReadsLiveOwnershipTreeWithoutDirtyingIt(t *testing.T) {
 			t.Fatalf("child dirty chunks after View = %v", dirty)
 		}
 
-		// Assert the property the contract promises — writers to the branch are
-		// excluded for the callback's duration — rather than the mechanism that
+		// Assert the property the contract promises, writers to the branch are
+		// excluded for the callback's duration, rather than the mechanism that
 		// delivers it. View used to hold one read lock per row; it now holds one
 		// per branch, and the guarantee is what has to survive that.
 		var viewedOwner *txOwner

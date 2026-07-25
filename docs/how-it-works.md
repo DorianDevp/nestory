@@ -69,26 +69,44 @@ needed. The engine retains the original values and resource versions.
 
 DB-level `UpdateWithin` uses a different path for ownership roots with
 children. Tower keeps one project-wide shadow graph, partitioned into typed
-tables, plus canonical pointers, relation-ID baselines, and a cache for the
-current hot ownership branch. A callback edits only the shadow. Publication
+tables, plus relation-ID baselines and a bounded cache of the ownership
+branches that have been written. A callback edits only the shadow. Publication
 then:
 
-1. verifies that no canonical commit advanced the project generation;
+1. verifies that no commit outside Tower bumped a participating table's epoch;
 2. compares the hot branch semantically, using compiled field plans;
 3. creates shallow patch bases only for changed nodes and deep-copies only
    changed slice fields;
 4. validates versions and indexes, writes the WAL, and writes through the
    stable canonical pointers.
 
-Scalar-only patches avoid rebuilding the relation graph. A changed relation
-falls back to the complete transaction graph validator. Canonical `View` calls
-remain available while a Tower callback is running; the short publication
-window still uses the graph lock.
+The replica is published through an `atomic.Pointer`, so a callback never holds
+anything a rebuild needs. Writes serialize per top-level owner rather than per
+project: roots in separate trees commit in parallel, nested roots queue. `View`
+keeps reading the previous committed state throughout; only the short
+publication window takes the graph lock.
+
+A comparison decides everything. Field values compare through a comparator the
+compiler emits per entity type rather than through reflection, and relation
+fields compare by **id**, never by pointer. The shadow world and the live world
+never share addresses, so a pointer comparison would report every node as
+changed. Contiguous runs of scalar fields settle in one memory comparison, which
+is sound in the one direction that matters: equal bytes imply equal values.
 
 The first Tower use is deliberately expensive: it clones and wires the project
-shadow and records relation identities. The replica increases retained memory,
-but warm transactions avoid the much larger temporary pair of `work` and
-`original` copies for every node.
+shadow and records relation identities. After that it is refreshed rather than
+rebuilt: only nodes whose values moved are re-copied, and created nodes are
+absorbed into fresh per-table blocks so no existing shadow address ever moves.
+A commit that replaces or removes a node still takes the full rebuild.
+
+The replica increases retained memory, but warm transactions avoid the much
+larger temporary pair of `work` and `original` copies for every node.
+
+`Tracked().UpdateWithin` narrows step 2. The callback declares each node it
+writes through `Edit`, and the commit diffs only those plus the root. Setting
+`AuditTrackedWrites` re-runs the full branch diff and fails an undeclared write
+with `ErrUndeclaredWrite`; it costs what the declaration saves, so it belongs in
+tests rather than production.
 
 At commit it:
 
@@ -114,9 +132,18 @@ The committed graph maintains derived indexes for:
 
 Those indexes make cascade closure, outsider-borrow checks, inverse rewiring,
 and ownership-cycle checks local to the changed area in the common case.
-Creates and relation edits publish deltas when their keys can be resolved
-against the committed graph. Deletes, changed match keys, or an unsupported
-delta shape can use a full validation/rebuild path for correctness.
+Creates, deletes and relation edits publish deltas when their effect can be
+settled against the committed graph. A changed lookup key, or any shape the
+delta builder declines, takes the full validation and rebuild path. The fast
+path only ever refuses work, never guesses at it.
+
+`Unsafe().Flush` uses the same machinery. Its contract is that the caller holds
+exclusive access until the flush completes, not that it re-acquires every
+pointer, so it cannot know which nodes were touched. A caller may mutate
+through a pointer it has held since creation. It therefore does not ask: it
+compares the live graph against the Tower shadow, which *is* the last committed
+state, and derives the change set. If nothing structural moved, the model and
+index are already correct and the flush only persists values.
 
 Validation and publication of a structural change share the global graph write
 lock. This closes the window in which a parallel transaction could otherwise
@@ -130,20 +157,33 @@ relation maintenance.
 ## Read paths
 
 - `Get` creates a mutable detached ownership branch.
-- `View` read-locks and exposes the stable live ownership branch.
+- `View` exposes the stable live ownership branch under a single read lock held
+  at the branch's top-level owner. Writers take the branch locks of every root
+  they touch, in the same total order they use for rows, so the two classes
+  cannot form a cycle; readers take no row locks at all. Locking each row
+  instead meant one atomic pair per node, scattered across as many cache lines,
+  which dominated the cost of reading a graph.
 - `ViewMany` locks selected rows in ID order.
 - `ViewRange` resolves an ordered secondary-index prefix and locks those rows;
   `ViewRangeAfter` starts after an exclusive cursor for incremental consumers.
 - `Unsafe.Get` exposes the live pointer without locks or copies.
 
 The benchmark report measures these paths separately because they provide
-different guarantees. See [bench/COMPARISON.md](../bench/COMPARISON.md).
+different guarantees. See [bench/BENCHMARK_REPORT.md](../bench/BENCHMARK_REPORT.md).
 
 ## Current limitations
 
 Nestory is alpha software. Current constraints include:
 
-- The complete dataset must fit in RAM.
+- The complete dataset must fit in RAM, and a relation graph costs several times
+  the size of the records in it. The indexes over the graph outweigh the graph.
+- Startup is O(data): there is no lazy loading, so a process is not ready until
+  the whole set is materialized and its pointers wired. This is a one-time cost
+  that any long-lived service amortizes, and a per-request cost that a
+  scale-to-zero deployment never does.
+- An unbatched durable write costs one device flush. Batching amortizes it over
+  the whole batch; a workload of single writes is bounded by the disk, not by
+  Nestory.
 - Primary keys are `int`; string IDs require a unique secondary key.
 - `DataDir`, type registries, and the transaction engine are process-global.
   Multiple independent Nestory stores in one process are not yet supported.

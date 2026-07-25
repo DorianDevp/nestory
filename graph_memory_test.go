@@ -380,7 +380,7 @@ func measureRelationWrites(t *testing.T, graph relationGraph, total, units int) 
 
 	// Mutating a field through a pointer kept since build time is what Unsafe's
 	// contract allows, and nothing records it. The graph is untouched, so the
-	// flush has no model or index work to do — but only a comparison against the
+	// flush has no model or index work to do, but only a comparison against the
 	// shadow can establish that.
 	peak, churn = measureOperation(t, 16, func(iteration int) {
 		graph.anyProject.Name = "renamed-" + strconv.Itoa(iteration)

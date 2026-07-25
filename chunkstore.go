@@ -5,7 +5,7 @@ import "sync"
 // chunkStore is the backing store: entities live in fixed-capacity blocks that
 // never grow, so every element address is stable for the store's life. That's
 // what lets relations be real *T pointers without dangling as the set grows.
-// Deletes are tombstones — values are never shifted in place.
+// Deletes are tombstones, values are never shifted in place.
 
 // chunkLimit is the per-block count, baked into chunkBlock's array type so it must
 // be a compile-time constant. 512 is the sweet spot in the sweep.
@@ -113,7 +113,7 @@ func (s *chunkStore[T]) chunkLive(ci int, fn func(*T)) {
 func (s *chunkStore[T]) chunkSlots(ci int) int { return s.chunks[ci].n }
 
 // loadChunk appends a freshly read block, keeping file ↔ chunk index alignment.
-// The block is clean — it already matches disk.
+// The block is clean, it already matches disk.
 func (s *chunkStore[T]) loadChunk(vals []T) {
 	ch := &chunkBlock[resourceSlot[T]]{}
 	tb := &chunkBlock[bool]{}
@@ -136,7 +136,7 @@ func newChunkStore[T any]() *chunkStore[T] {
 	return &chunkStore[T]{}
 }
 
-// Append stores v and returns a stable pointer to its resourceSlot slot — safe to
+// Append stores v and returns a stable pointer to its resourceSlot slot, safe to
 // index by id elsewhere, since neither the resourceSlot nor its item ever moves.
 func (s *chunkStore[T]) Append(v T) *resourceSlot[T] {
 	if len(s.chunks) == 0 || s.chunks[len(s.chunks)-1].Len() == chunkLimit {

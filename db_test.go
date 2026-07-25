@@ -177,7 +177,7 @@ func TestWAL_CommitSurvivesReloadWithoutFlush(t *testing.T) {
 
 	id := c.Id
 
-	// no Flush — durability must come from the WAL alone
+	// no Flush, durability must come from the WAL alone
 	if err := db.UpdateWithin(id, func(c *tCounter) error {
 		c.N = 99
 		return nil
@@ -202,7 +202,7 @@ func TestWAL_CommitSurvivesReloadWithoutFlush(t *testing.T) {
 	}
 }
 
-// Hammer one row from many goroutines. Every increment must land — a final
+// Hammer one row from many goroutines. Every increment must land, a final
 // N < total means version validation or commit locking is broken. Run with -race.
 func TestUpdateWithinConcurrent(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -237,7 +237,7 @@ func TestUpdateWithinConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
-				// UpdateWithin retries ErrConflict internally — a non-nil return is real.
+				// UpdateWithin retries ErrConflict internally, a non-nil return is real.
 				if err := db.UpdateWithin(id, func(c *tCounter) error {
 					c.N++
 					return nil

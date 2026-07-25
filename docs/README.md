@@ -13,6 +13,6 @@ Start with the guide that matches the question you are trying to answer:
 | [Contributing](contributing.md) | Local checks, test expectations, benchmarks, and commit style |
 
 Performance numbers and their caveats live in
-[the benchmark report](../bench/COMPARISON.md). The source code remains the
+[the benchmark report](../bench/BENCHMARK_REPORT.md). The source code remains the
 authority while the project is in alpha; if behavior and documentation differ,
 please open an issue or send a focused fix.

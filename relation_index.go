@@ -19,7 +19,7 @@ type relationHolderField struct {
 // fields, so nearly all of that group is paid for and never used.
 //
 // lookup only materializes once a node's fan-in makes the linear scan worth
-// avoiding — the same trade nodeKeySet makes above eight keys. Without it a
+// avoiding, the same trade nodeKeySet makes above eight keys. Without it a
 // lookup table with 60,000 referents would make index construction quadratic.
 type incomingCounts struct {
 	entries []incomingCount
@@ -1041,7 +1041,7 @@ func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struc
 	//
 	// model.targets was already derived from exactly these nodes and these
 	// targetFields, so recomputing it walked every node and every target field a
-	// second time for an identical result. It cannot be shared, though —
+	// second time for an identical result. It cannot be shared, though
 	// publishAndRewire assigns into index.targets when a create is published, and
 	// that would write into the model committedOwnership.graph still holds. A map
 	// clone is the cheap half of the old work and keeps the two independent.
@@ -1073,7 +1073,7 @@ func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struc
 		backFields: make(map[reflect.Type]map[int]struct{}),
 		// Both hints are tight: incoming takes one entry per referenced node, and
 		// fieldHint is the previous index's own field count, which a rebuild
-		// reaches within a few entries. A loose hint is worse than none here —
+		// reaches within a few entries. A loose hint is worse than none here
 		// sizing fields from len(refs) once cost 21 MiB of retained slack.
 		fields:   make(map[relationHolderField]indexedRelationField, fieldHint),
 		incoming: make(map[nodeKey]incomingCounts, len(nodes)),

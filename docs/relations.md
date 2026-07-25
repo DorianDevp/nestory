@@ -230,21 +230,21 @@ deleting a borrower and target in either order is valid if neither survives.
 
 Schema invariants are checked once at registration:
 
-- **I1 — one role per field.** A field declares one relation role.
-- **I2 — valid shape.** `ownedby` is `*T`; `inverse` is `[]*T` and names a
+- **I1: one role per field.** A field declares one relation role.
+- **I2: valid shape.** `ownedby` is `*T`; `inverse` is `[]*T` and names a
   compatible `borrow` or `option`; other roles allow pointer or pointer slice.
-- **I3 — satisfiable schema.** Mandatory ownership declarations must admit a
+- **I3: satisfiable schema.** Mandatory ownership declarations must admit a
   finite instance graph. A type may have at most one `ownedby`; mandatory
   `ownedby` cycles and to-one `own` cycles are rejected.
 
 Instance invariants are checked at commit:
 
-- **I4 — at most one owner.** The two declared sides of the same edge count as
+- **I4: at most one owner.** The two declared sides of the same edge count as
   one. Duplicate appearance in an `own` slice still counts as two edges and is
   rejected.
-- **I5 — acyclic ownership.** Self-referential types can form trees through
+- **I5: acyclic ownership.** Self-referential types can form trees through
   `own []*T`, but a concrete node cannot own itself or an ancestor.
-- **I6 — pair consistency.** A declared `ownedby` pointer equals the owner
+- **I6: pair consistency.** A declared `ownedby` pointer equals the owner
   derived from the reverse ownership index.
 
 Whether a node may be unowned depends on the child type. A type declaring

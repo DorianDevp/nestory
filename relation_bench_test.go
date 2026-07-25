@@ -745,8 +745,8 @@ func newParallelBenchDBs(tb testing.TB, records int) (*DB[parallelBenchA], *DB[p
 	return first, second
 }
 
-// BenchmarkTowerVersusBranchClone runs the same logical write — set the root's
-// scalar Name — down all three paths, so the numbers differ only by what each
+// BenchmarkTowerVersusBranchClone runs the same logical write, set the root's
+// scalar Name, down all three paths, so the numbers differ only by what each
 // does around fn. The Tower path keeps a shadow and diffs it; the other two
 // clone the whole ownership branch per call. It exists to locate the branch
 // size where keeping a replica starts paying for itself.

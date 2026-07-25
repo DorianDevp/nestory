@@ -71,7 +71,7 @@ func (db *DB[T]) relationApplyPending() error {
 		return nil
 	}
 
-	// resById is already the id set this used to copy into a throwaway map —
+	// resById is already the id set this used to copy into a throwaway map
 	// one map per flush, sized like the table. add inserts under db.mu before
 	// the next lookup, so an intra-batch duplicate is caught the same way a
 	// live one is.
@@ -140,7 +140,7 @@ var (
 	relationParticipantsMu sync.RWMutex
 	relationParticipants   = make(map[reflect.Type]struct{})
 	// relationParticipantsPresent mirrors len(relationParticipants) > 0 so the
-	// relation-free fast path costs an atomic load, not an RWMutex round trip —
+	// relation-free fast path costs an atomic load, not an RWMutex round trip
 	// ensureCommittedOwnership sits on every Unsafe.Get.
 	relationParticipantsPresent atomic.Bool
 )
@@ -262,7 +262,7 @@ type incomingOwn struct {
 }
 
 // incomingOwns records the own edges pointing at one node. attachNodeOwner
-// rejects a second one, so the legal population is zero or one — a slice per
+// rejects a second one, so the legal population is zero or one, a slice per
 // node allocated once per node per Flush to hold at most a single element.
 // count still distinguishes "none" from "too many" so the error survives.
 type incomingOwns struct {
@@ -331,7 +331,7 @@ func ensureCommittedOwnership() error {
 
 	// A project where no type declares a relation has no relation graph to
 	// index. Building one anyway walks every node of every table and copies it
-	// into a model and an index — the complete cost of a graph with no edges.
+	// into a model and an index, the complete cost of a graph with no edges.
 	// The check is re-evaluated per call rather than cached in ready, so a
 	// relation-carrying type registered later still gets its index built. Every
 	// consumer of committedOwnership.index already handles a nil index.
@@ -878,8 +878,8 @@ func buildRelationModelFromTargets(
 
 	// refs, owners and outgoing all hold one entry per edge or per owned node, and
 	// a full rebuild reaches the same size the committed model already has. Sizing
-	// from it turns eighteen doublings — each copying and abandoning the previous
-	// array — into a single allocation. A stale hint only costs the usual growth.
+	// from it turns eighteen doublings, each copying and abandoning the previous
+	// array, into a single allocation. A stale hint only costs the usual growth.
 	model := &relationModel{
 		nodes: nodes, targets: targets, targetFields: targetFields,
 		owners: make(map[nodeKey]nodeKey, hints.owners), outgoing: make(map[nodeKey][]nodeKey, hints.outgoing),
@@ -1594,7 +1594,7 @@ func flushRelations() error {
 // rebuilding the model and the index from every node in the project.
 //
 // The shadow is the last committed state, so comparing against it derives the
-// change set — which is what makes this sound under Unsafe's contract, where a
+// change set, which is what makes this sound under Unsafe's contract, where a
 // caller may mutate through a pointer it kept since creation and nothing
 // records that. Three outcomes:
 //
@@ -1602,15 +1602,15 @@ func flushRelations() error {
 //   - relations moved between existing nodes, or rows were created: feed the
 //     derived change set to the transaction engine's delta builder, the same
 //     already-tested route a transactional create takes;
-//   - anything the delta cannot prove — deletes, lookup-key changes, or a
-//     builder refusal — falls through to the full rebuild, so every rejection
+//   - anything the delta cannot prove, deletes, lookup-key changes, or a
+//     builder refusal, falls through to the full rebuild, so every rejection
 //     lands in today's code path.
 func flushIncremental(runtimes []relationRuntime) (bool, error) {
 	deletes := explicitDeletes()
 
 	// Identity, not synced(): Unsafe.Flush bumps the table epoch before reaching
 	// here, so synced() is always false by now. What matters is that the
-	// replica's relation baseline was taken from the index still published — if
+	// replica's relation baseline was taken from the index still published, if
 	// it was, the baseline is the committed graph and the comparison is exact.
 	replica := projectTower.replica.Load()
 	if replica == nil || replica.index == nil || replica.index != committedRelationIndexSnapshot() {
@@ -1701,7 +1701,7 @@ func flushIncremental(runtimes []relationRuntime) (bool, error) {
 	// Resources materialize added beyond the derived set carry detached copies
 	// whose back references it just set; they must be written to the live rows,
 	// exactly as the engine does after a transactional create. The derived
-	// resources only need their chunks marked dirty — their work value is the
+	// resources only need their chunks marked dirty, their work value is the
 	// live pointer itself.
 	for _, resource := range changed[len(touched):] {
 		committerFor(resource.dbName).applyWrite(resource.id, resource.work)
@@ -1726,9 +1726,9 @@ func flushIncremental(runtimes []relationRuntime) (bool, error) {
 // flushDeletesViaDelta settles a pure-delete flush against committed state:
 // the cascade closure comes from the committed ownership forest, the veto scan
 // from the committed incoming counts, and survivor updates ride the same field
-// delta a transactional write uses. Anything the committed state cannot prove —
+// delta a transactional write uses. Anything the committed state cannot prove
 // a doomed node behind a duplicate lookup key, a surviving borrow or required
-// owner, a delete of something never committed — falls through to the full
+// owner, a delete of something never committed, falls through to the full
 // rebuild, which raises today's canonical errors.
 func flushDeletesViaDelta(
 	runtimes []relationRuntime,

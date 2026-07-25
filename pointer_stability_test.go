@@ -32,7 +32,7 @@ func TestPointerStableAcrossInserts(t *testing.T) {
 		t.Fatalf("FindOneBy(Id,1): p=%v err=%v", p, err)
 	}
 
-	// Insert well past a chunk boundary — this is what used to reallocate the
+	// Insert well past a chunk boundary, this is what used to reallocate the
 	// backing slice and invalidate p.
 	for i := 0; i < chunkLimit+50; i++ {
 		db.Unsafe().Create(&bqItem{Name: "filler"})

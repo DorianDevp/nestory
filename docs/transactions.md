@@ -11,7 +11,8 @@ properties.
 | `Get` + `Update` | Detached `own` branch | Explicit merge | Edit outside a callback |
 | `Transaction` | Detached branches in one context | Automatic commit on nil return | Several related operations |
 | `UpdateWithin` | Persistent Tower shadow or detached branch | Automatic commit | Short intent-only update |
-| `View` | Read-locked live branch | No writes allowed | Zero-copy aggregate read |
+| `Tracked().UpdateWithin` | Same shadow, writes declared through `Edit` | Automatic commit | Large branch, few known writes |
+| `View` | Live branch under one branch read lock | No writes allowed | Zero-copy aggregate read |
 | `ViewMany` / `ViewRange` | Read-locked live rows | No writes allowed | Flat batch read |
 | `Unsafe` | Unlocked live pointers | Explicit `Flush` | Exclusive hot loop |
 
@@ -113,17 +114,53 @@ selects changed rows and fields; only those rows are materialized for WAL,
 index validation, and publication. Relation changes use the normal graph
 validator and pointer-canonicalization path.
 
-Tower serializes writable callbacks across the project. It does not hold the
+Tower serializes writable callbacks per **ownership branch**, not per project.
+Two roots that share no top-level owner have disjoint branches, so their
+callbacks run side by side. Nested roots, meaning a node and one of its own
+ancestors, share a top-level owner and queue behind each other. It does not hold the
 canonical graph lock while the callback runs, so `View` continues to read the
-previous committed state. A commit outside Tower advances the project
-generation; the next Tower update rebuilds its shadow before retrying the
-callback.
+previous committed state.
+
+Each participating table carries an epoch. A commit outside Tower bumps the
+epoch of the table it touched, which retires the shadow; the next Tower update
+refreshes it before retrying the callback. Refreshing copies only the nodes
+whose values actually moved and absorbs newly created ones into fresh storage
+blocks, so a shadow that is still mostly accurate is not rebuilt from scratch.
+Writing to a table outside the relation graph never retires it.
 
 The warm diff is still O(branch size). Ordinary `*T` writes have no setter or
 proxy through which Nestory could record the changed address, so finding an
 arbitrary changed descendant cannot be guaranteed in O(1). Tower removes the
 full branch clone, per-row transaction registration, and unchanged-row
 publication; it does not claim constant-time automatic change discovery.
+
+## Declaring writes: `Tracked`
+
+When a callback knows which nodes it touches, it can say so and skip the branch
+diff entirely:
+
+```go
+err := workspaces.Tracked().UpdateWithin(id, func(w *nestory.Writes, ws *Workspace) error {
+	nestory.Edit(w, ws.Projects[0]).Name = "renamed"
+	return nil
+})
+```
+
+`Edit` returns the node it was given, so it reads as a wrapper around the write
+rather than a separate bookkeeping call. It rejects a node outside the branch
+being updated. The commit then diffs only the declared nodes plus the root,
+which turns an O(branch) comparison into O(declared). That is worth it from
+roughly a hundred owned children upward, and no faster below that.
+
+An undeclared write is a silent lost update, so there is an opt-in check:
+
+```go
+nestory.AuditTrackedWrites = true // re-runs the full branch diff and returns
+                                  // ErrUndeclaredWrite if anything else moved
+```
+
+Enable it in tests. It costs exactly what declaring the write saves, so leaving
+it on in production defeats the purpose.
 
 Inside an existing transaction, `tx.UpdateWithin` only loads and mutates the
 object in that context; it neither commits independently nor adds another retry

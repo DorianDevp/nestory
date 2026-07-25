@@ -161,7 +161,7 @@ type recoveredRow struct {
 }
 
 // replayWAL reads every committed frame in order. A torn tail (short read or
-// undecodable frame) ends the durable region — that tx never committed.
+// undecodable frame) ends the durable region, that tx never committed.
 func replayWAL(path string, rowType reflect.Type) ([]recoveredRow, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {

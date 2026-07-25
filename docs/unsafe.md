@@ -54,6 +54,15 @@ on your behalf.
 The database contract is still enforced. Unsafe means unchecked mutation until
 the boundary, not permission to persist an invalid schema.
 
+Step 1 is where the contract cuts both ways. Because you may mutate through a
+pointer held since creation, `Flush` cannot be told what changed and does not
+try to track it. Instead it compares the live graph against the last committed
+state and derives the change set, then publishes a delta when the result is
+something the committed indexes can settle. A changed lookup key, or anything
+the delta declines, falls back to revalidating and rebuilding the whole graph.
+That fallback is correct, not cheap: it is O(project), so a workload that keeps
+triggering it will feel it.
+
 ## Validation failures
 
 A rejected `Flush` leaves the invalid live mutation in memory. Fix the graph

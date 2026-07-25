@@ -9,8 +9,8 @@ import (
 
 // assertCommittedIndexConsistent rebuilds the committed relation index from
 // scratch and deep-compares it against the delta-maintained one. This is the
-// harness that turns the class of bug this session shipped twice — a delta
-// leaving derived state stale in a way no behavioural test noticed — into a
+// harness that turns the class of bug this session shipped twice, a delta
+// leaving derived state stale in a way no behavioural test noticed, into a
 // red test. Call it after any operation that publishes through a delta.
 func assertCommittedIndexConsistent(t *testing.T) {
 	t.Helper()

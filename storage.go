@@ -215,7 +215,7 @@ func decodeSlice(path string, sliceType reflect.Type) (reflect.Value, error) {
 }
 
 // save writes every dirty chunk in parallel, then marks them clean. Clean chunks
-// are skipped — the win over a whole-file rewrite. Assumes no commit is running
+// are skipped, the win over a whole-file rewrite. Assumes no commit is running
 // concurrently (admin-only, like Flush).
 func (db *DB[T]) save() error {
 	idxs := db.store.dirtyIndices()

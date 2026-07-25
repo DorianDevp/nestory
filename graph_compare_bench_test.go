@@ -4,7 +4,7 @@ import "testing"
 
 // BenchmarkGraphNestoryLoadBranch matches bench/compare/relation_test.go: the
 // same 200 x 5 x 10 ownership graph, the same "read one workspace with
-// everything it owns". Here the branch is already assembled — the read is a
+// everything it owns". Here the branch is already assembled, the read is a
 // lookup plus pointer traversal, with nothing to reconstruct.
 func BenchmarkGraphNestoryLoadBranch(b *testing.B) {
 	const (

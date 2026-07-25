@@ -9,7 +9,7 @@ import (
 // BenchmarkColdStart prices the number the comparison reports never had: how
 // long a process waits before its first query, given data already on disk.
 // Every iteration drops the in-memory registries and rehydrates from the same
-// files — Register reads the store back, Open rebuilds indices, resById and
+// files: Register reads the store back, Open rebuilds indices, resById and
 // the id counter. The Get at the end proves the reload actually served a row.
 func BenchmarkColdStart(b *testing.B) {
 	for _, n := range []int{100_000, 1_000_000} {

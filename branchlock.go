@@ -15,7 +15,7 @@ import (
 //
 // The protocol is asymmetric on purpose. A reader takes the branch lock and
 // nothing else. A writer takes the branch locks of every root it touches, then
-// its per-row locks exactly as before — the row locks still serialize writers
+// its per-row locks exactly as before: the row locks still serialize writers
 // against each other, which is what the version checks rely on. Readers never
 // take a row lock, so they cannot participate in a cycle with one; writers
 // order branch locks among themselves the same way they order rows, by a total
@@ -36,7 +36,7 @@ func resetBranchLocks() { branchLocks = sync.Map{} }
 
 // lockTouchedBranches write-locks the branch of every touched resource and
 // returns the release. A node with no committed owner is its own root, so a
-// write to a relation-free table locks exactly one branch — itself.
+// write to a relation-free table locks exactly one branch: itself.
 func lockTouchedBranches(resources []transactionResourceLock) func() {
 	if len(resources) == 0 {
 		return func() {}

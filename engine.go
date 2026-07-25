@@ -20,7 +20,7 @@ var ErrExpiredSnapshot = errors.New("nestory: expired snapshot")
 
 var ErrNotFound = errors.New("nestory: entity not found")
 
-// touchedResource is one resource a transaction touched — pure, type-erased
+// touchedResource is one resource a transaction touched, pure, type-erased
 // data. The live resourceSlot and the typed write-back resolve at commit via
 // baseRegistry[typ].
 type touchedResource struct {
@@ -33,7 +33,7 @@ type touchedResource struct {
 
 // committer is the type-erased view the transactionEngine drives at commit. *DB[T]
 // implements it. resourceVersion/applyWrite/refreshSnapshot assume the per-row
-// lock is already held — the transactionEngine owns locking so it can enforce a global order.
+// lock is already held, the transactionEngine owns locking so it can enforce a global order.
 type committer interface {
 	lockResource(id int)
 	unlockResource(id int)
@@ -111,7 +111,7 @@ func committerFor(dbName string) committer {
 
 // committersByType resolves a committer from the type itself. The name-keyed
 // path costs a reflect metadata parse plus a string map lookup, and View pays
-// it twice per node in an ownership branch — half the cost of reading one.
+// it twice per node in an ownership branch, half the cost of reading one.
 var committersByType sync.Map
 
 func committerForType(typ reflect.Type) committer {
@@ -126,7 +126,7 @@ func committerForType(typ reflect.Type) committer {
 }
 
 // transactionEngine sits above every DB, owns the live contracts and serialises commits.
-// It stays generic — reaches a type's resources only through baseRegistry.
+// It stays generic, reaches a type's resources only through baseRegistry.
 type transactionEngine struct {
 	mu   sync.Mutex
 	bind map[any]*transactionState // snapshot *T → owning transaction

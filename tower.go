@@ -24,8 +24,8 @@ type Tower struct {
 
 // towerReplica is one reading of the committed graph. Its maps are filled
 // before publication and only read afterwards, so a rebuild publishes a
-// replacement rather than mutating what running callbacks are looking at —
-// which is what keeps callbacks on disjoint branches out of each other's way.
+// replacement rather than mutating what running callbacks are looking at.
+// That is what keeps callbacks on disjoint branches out of each other's way.
 type towerReplica struct {
 	// epochs is the per-table counter reading this replica was built from,
 	// covering every table that takes part in the relation graph. A commit
@@ -33,8 +33,8 @@ type towerReplica struct {
 	epochs atomic.Pointer[map[string]uint64]
 	nodes  map[nodeKey]reflect.Value
 	// blocks owns the storage every shadow node lives in, one contiguous array
-	// per table. Nothing reads it — the node pointers alone would keep it alive
-	// — but naming the owner is what makes the never-grow invariant visible.
+	// per table. Nothing reads it, the node pointers alone would keep it alive
+	//: but naming the owner is what makes the never-grow invariant visible.
 	blocks    []reflect.Value
 	relations map[towerRelationKey]towerRelationState
 	// walk is the flat, type-grouped layout of the node set the flush gate
@@ -48,7 +48,7 @@ type towerReplica struct {
 
 	// branchMu guards branches, the only part of a published replica that
 	// still fills in lazily. branchNodes counts the cached entries so the cache
-	// stays bounded — it used to grow by every root ever written, for the
+	// stays bounded, it used to grow by every root ever written, for the
 	// replica's whole life.
 	branchMu    sync.Mutex
 	branches    map[nodeKey][]towerBranchNode
@@ -86,7 +86,7 @@ type towerFieldPlan struct {
 	slice bool
 	// targetIDIndex is the field index of Id inside the relation target, so an
 	// identity comparison reads the int directly instead of paying valueID's
-	// Interface round trip per element — a fifth of the flush gate.
+	// Interface round trip per element, a fifth of the flush gate.
 	targetIDIndex int
 }
 
@@ -128,8 +128,8 @@ func fieldPointerID(value reflect.Value, idIndex int) (int, bool) {
 }
 
 // towerSegmentsEqual compares the scalar runs of two nodes byte for byte. Both
-// values are addressable structs — live rows sit in chunk blocks and shadows in
-// replica blocks — so their base pointers are stable for the duration.
+// values are addressable structs, live rows sit in chunk blocks and shadows in
+// replica blocks, so their base pointers are stable for the duration.
 func towerSegmentsEqual(live, shadow reflect.Value, segments []towerSegment) bool {
 	if len(segments) == 0 {
 		return true
@@ -170,7 +170,7 @@ type cachedTowerFieldPlan struct {
 
 // towerComparator answers whether two *T hold the same struct. Register builds
 // one per entity type, so the comparison the compiler emits for that struct is
-// what runs — reflect walks the value field by field on every call instead, and
+// what runs, reflect walks the value field by field on every call instead, and
 // that walk was the bulk of a diff.
 type towerComparator func(left, right any) bool
 
@@ -258,7 +258,7 @@ func resetTower() {
 }
 
 // towerWriteLock serializes the callbacks whose branches can touch the same
-// shadow nodes. Nested roots — a node and one of its own ancestors — share a
+// shadow nodes. Nested roots, a node and one of its own ancestors, share a
 // top-level owner and queue behind each other; roots in separate trees never do.
 func towerWriteLock(owner nodeKey) *sync.Mutex {
 	if lock, found := towerWriteLocks.Load(owner); found {
@@ -310,7 +310,7 @@ func towerParticipantEpochs() map[string]uint64 {
 // synced reports whether every participating table still carries the epoch this
 // replica was built from. A participant registered after the rebuild is absent
 // from the snapshot and compares against zero, which is exactly the epoch a
-// table keeps until its first row lands — the first Open or add bumps it. A nil
+// table keeps until its first row lands, the first Open or add bumps it. A nil
 // replica is never synced, which is how a retired one asks for a rebuild.
 func (replica *towerReplica) synced() bool {
 	if replica == nil {
@@ -333,7 +333,7 @@ func (replica *towerReplica) synced() bool {
 }
 
 // refresh republishes the live replica in place when the committed node set is
-// unchanged — same keys, same live pointers. Every shadow then keeps its
+// unchanged, same keys, same live pointers. Every shadow then keeps its
 // address, so blocks, the nodes map and the live map are all reused and a
 // commit that only changed field values allocates nothing per node.
 //
@@ -354,7 +354,7 @@ func (tower *Tower) refresh(
 	}
 
 	// A live pointer that changed identity, or a walk key the index lost, is a
-	// replacement or a removal — those still take the full rebuild. The walk
+	// replacement or a removal, those still take the full rebuild. The walk
 	// carries the recorded live words, so this needs no separate live map; the
 	// replica used to retain a defensive copy of index.nodes for exactly this,
 	// at 73 B per node.
@@ -380,7 +380,7 @@ func (tower *Tower) refresh(
 		}
 	}
 
-	// New nodes go into one fresh block per table — never into an existing
+	// New nodes go into one fresh block per table: never into an existing
 	// block, whose never-grow guarantee is what keeps every published shadow
 	// address stable. Appending a block moves no element of any other block.
 	if len(added) > 0 {
@@ -419,8 +419,8 @@ func (tower *Tower) refresh(
 		moved = append(moved, key)
 	}
 
-	// An added node compares as unchanged — its shadow was copied from live a
-	// moment ago — but it still needs wiring into the shadow world and a
+	// An added node compares as unchanged, its shadow was copied from live a
+	// moment ago, but it still needs wiring into the shadow world and a
 	// relation baseline, so it joins the moved set here.
 	moved = append(moved, added...)
 
@@ -457,8 +457,8 @@ func (tower *Tower) refresh(
 }
 
 // towerForgetNodes drops deleted nodes from the live replica so the following
-// refresh sees matching node sets. Shadow storage is not reclaimed — the block
-// slots stay allocated until the next full rebuild — because compacting a block
+// refresh sees matching node sets. Shadow storage is not reclaimed, the block
+// slots stay allocated until the next full rebuild, because compacting a block
 // would move surviving shadows, and their addresses are what the whole design
 // promises never to move. The caller holds graphMu.Lock.
 func towerForgetNodes(closure map[nodeKey]struct{}) {
@@ -497,7 +497,7 @@ func towerForgetNodes(closure map[nodeKey]struct{}) {
 
 // refreshWalk brings the flat walk in line with a refresh: moved nodes get
 // their relation baselines re-recorded from the post-commit live pointers, and
-// added nodes get entries of their own. Everything else keeps its record — its
+// added nodes get entries of their own. Everything else keeps its record, its
 // live words did not move, that is what "not moved" established.
 func (replica *towerReplica) refreshWalk(index *committedRelationIndex, moved, added []nodeKey) error {
 	if len(moved) == 0 && len(added) == 0 {
@@ -609,7 +609,7 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 	defer graphMu.Unlock()
 
 	// Read the epochs before the graph, not after. A write slipping between the
-	// two then leaves the replica looking stale — one wasted rebuild — instead
+	// two then leaves the replica looking stale: one wasted rebuild, instead
 	// of letting stale nodes look fresh.
 	epochs := towerParticipantEpochs()
 
@@ -666,7 +666,7 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 // buildTowerShadows lays every shadow node of one table end to end in a single
 // array instead of allocating each on its own. The array is sized once and
 // never grows, so the address of each element stays valid for the replica's
-// life — the same invariant chunkStore relies on for live entities.
+// life, the same invariant chunkStore relies on for live entities.
 //
 // Nodes go in ascending id, which is the order committedOwnershipKeys sorts a
 // branch into, so diffing walks the array front to back instead of chasing
@@ -876,8 +876,8 @@ func towerRun(typ reflect.Type, id int, edit towerEdit) (bool, error) {
 }
 
 // towerAttempt runs one shadow edit against a single reading of the graph. It
-// reports whether the attempt settled — a false asks the caller to rebuild and
-// retry — and hands back the resources of a relation edit, which cannot be
+// reports whether the attempt settled, a false asks the caller to rebuild and
+// retry, and hands back the resources of a relation edit, which cannot be
 // published from here because engine.commit needs graphMu exclusively.
 func towerAttempt(
 	replica *towerReplica,
@@ -1097,7 +1097,7 @@ const towerBranchCacheLimit = 64 * 1024
 
 // towerNodeUnchanged compares a live node against its shadow. Relation fields
 // compare by id, not bitwise: they hold shadow pointers on one side and live
-// pointers on the other, so a pointer comparison always differs — but skipping
+// pointers on the other, so a pointer comparison always differs, but skipping
 // them entirely once left a reordered own slice stale in the shadow, because a
 // membership change is carried by the copy, not by the rewiring. Identity equal
 // means the shadow already points at shadow copies of the right ids.
@@ -1125,8 +1125,8 @@ func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) b
 
 // towerWalkRelation is the live-side baseline of one relation field: the exact
 // pointer words it held when the walk was last recorded. Word equality implies
-// the edge set is unchanged — ids are immutable here, a mutated Id is a key
-// field and forces the full rebuild — and a mismatch only ever over-reports,
+// the edge set is unchanged, ids are immutable here, a mutated Id is a key
+// field and forces the full rebuild, and a mismatch only ever over-reports,
 // which the delta then settles exactly.
 type towerWalkRelation struct {
 	offset   uintptr
@@ -1198,8 +1198,8 @@ func newTowerWalkEntry(key nodeKey, live, shadow reflect.Value, plan cachedTower
 }
 
 // buildTowerWalk lays the replica's node set out as a flat, type-grouped list.
-// The flush gate used to pay two nodeKey map operations per node per flush —
-// about a sixth of its whole cost — just to find the pair this list simply
+// The flush gate used to pay two nodeKey map operations per node per flush,
+// about a sixth of its whole cost, just to find the pair this list simply
 // stores.
 func buildTowerWalk(
 	index *committedRelationIndex,
@@ -1244,7 +1244,7 @@ func buildTowerWalk(
 // graphMovedNodes reports which committed nodes no longer match the shadow in
 // any way the relation index can see: a relation field compared by id, or a
 // lookup-key field compared by value. keyChanged is set when a lookup-key field
-// moved — the committed target index maps that field's old value to the node,
+// moved, the committed target index maps that field's old value to the node,
 // so only the full rebuild can fix it; the delta path must refuse.
 //
 // Flush needs this because Unsafe cannot tell it what changed: the contract is
@@ -1262,7 +1262,7 @@ func (replica *towerReplica) graphMovedNodes() (moved []nodeKey, keyChanged bool
 
 			// Relation fields compare as raw pointer words against the recorded
 			// baseline: equality proves the edges unchanged, and a mismatch only
-			// over-reports — the delta settles what actually moved.
+			// over-reports, the delta settles what actually moved.
 			for _, record := range entry.relations {
 				if record.many {
 					current := liveManyWords(entry.liveBase, record.offset)
@@ -1293,7 +1293,7 @@ func (replica *towerReplica) graphMovedNodes() (moved []nodeKey, keyChanged bool
 
 			// Key fields compare bitwise against the shadow first; only a byte
 			// mismatch pays an exact reflect comparison, because a false
-			// keyChanged would cost a full rebuild — a string key with equal
+			// keyChanged would cost a full rebuild, a string key with equal
 			// content in a different backing must not trigger one.
 			for _, field := range group.keyFields {
 				liveBytes := unsafe.Slice((*byte)(unsafe.Add(entry.liveBase, field.offset)), field.size)
@@ -1406,7 +1406,7 @@ func (replica *towerReplica) relationEqual(
 // towerAlwaysComparable reports whether reflect.Value.Equal is safe on every
 // value of typ, so diffFields can trust the cached plan instead of asking each
 // value. reflect calls an interface type comparable even though the dynamic
-// value inside it may be a slice, and Equal panics on exactly that case — so a
+// value inside it may be a slice, and Equal panics on exactly that case, so a
 // type carrying an interface anywhere has to be diffed field by field.
 func towerAlwaysComparable(typ reflect.Type) bool {
 	if !typ.Comparable() {

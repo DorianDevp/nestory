@@ -1,5 +1,5 @@
 // Package nestory persists a Go object graph to a folder of .gob files and
-// rehydrates the whole pointer graph on load. No queries, no joins — relations
+// rehydrates the whole pointer graph on load. No queries, no joins, relations
 // declared via struct tags become real Go pointers the moment you call [Open].
 //
 // Tags:

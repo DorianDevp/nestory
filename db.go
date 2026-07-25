@@ -73,7 +73,7 @@ var (
 )
 
 // Register loads T's chunk files and inflates each row into a *T. Call once per
-// type, before any [Open] — fillRelation needs every type registered to wire
+// type, before any [Open]: fillRelation needs every type registered to wire
 // pointers.
 func Register[T Entity]() error {
 	t := reflect.TypeFor[T]()
@@ -108,7 +108,7 @@ func Register[T Entity]() error {
 func Open[T Entity]() *DB[T] {
 	name := reflect.TypeFor[T]().Name()
 
-	// One canonical DB per type — the engine reaches a type by name through
+	// One canonical DB per type, the engine reaches a type by name through
 	// baseRegistry, so identity must be stable.
 	if existing, ok := baseRegistry[name]; ok {
 		return existing.(*DB[T])
@@ -218,7 +218,7 @@ func (db *DB[T]) resource(id int) (*resourceSlot[T], bool) {
 	return r, ok
 }
 
-// committer — driven by the transactionEngine. lockResource/unlockResource own the per-row
+// committer, driven by the transactionEngine. lockResource/unlockResource own the per-row
 // mutex; the rest assume it's already held.
 
 func (db *DB[T]) lockResource(id int) {
@@ -269,7 +269,7 @@ func (db *DB[T]) snapshotResource(id int) (reflect.Value, reflect.Value, int, bo
 
 func (db *DB[T]) applyWrite(id int, work any) {
 	if r, ok := db.resource(id); ok {
-		*r.item = *work.(*T) // write through the stable pointer — never moves
+		*r.item = *work.(*T) // write through the stable pointer: never moves
 		r.version++
 		db.store.markDirty(r.chunk)
 		db.markChanged()

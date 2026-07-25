@@ -35,7 +35,7 @@ func TestRegression_BatchQueueAssignsDistinctIds(t *testing.T) {
 		{Name: "fourth"},
 	}
 
-	// Queue all four before any Flush — what the old code mishandled.
+	// Queue all four before any Flush, what the old code mishandled.
 	for _, it := range items {
 		db.Unsafe().Create(it)
 	}
@@ -203,7 +203,7 @@ func TestRegression_SaveOverwritePreservesPrevOnNewWrite(t *testing.T) {
 		t.Fatalf("stat v1: %v", err)
 	}
 
-	// v2 — both rows live in chunk 0, rewritten in place.
+	// v2: both rows live in chunk 0, rewritten in place.
 	db.Unsafe().Create(&bqItem{Name: "v2"})
 	if err := db.Unsafe().Flush(); err != nil {
 		t.Fatalf("second Flush: %v", err)

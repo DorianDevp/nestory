@@ -516,7 +516,7 @@ func wireIndexedSlice(owner, field reflect.Value, spec relationSpec, index *rela
 
 	// Membership comes from the index; order is user data and comes from the
 	// field as it stands. Rebuilding purely in store order silently discarded
-	// every reorder the caller had made — and left the published index, which
+	// every reorder the caller had made, and left the published index, which
 	// does preserve order, disagreeing with the live graph it describes. After
 	// a cold load the field is empty, so rehydration still lands in store order.
 	byID := make(map[int]reflect.Value, len(values))

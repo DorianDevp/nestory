@@ -8,7 +8,7 @@ import (
 
 // AuditTrackedWrites makes every tracked write also run the full branch diff
 // and fail when a node changed that [Edit] never named. It costs exactly what
-// declaring nothing would have cost, so switch it on in tests — that is where a
+// declaring nothing would have cost, so switch it on in tests, that is where a
 // forgotten Edit should surface, rather than as a write that quietly vanishes.
 var AuditTrackedWrites bool
 

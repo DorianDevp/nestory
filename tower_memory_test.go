@@ -11,7 +11,7 @@ import (
 const towerMemoryWorkerEnv = "NESTORY_TOWER_MEMORY_WORKER"
 
 // towerProfileChild carries a payload because the replica clones slice fields
-// as well as struct headers — a shadow node is a whole second record, not a
+// as well as struct headers, a shadow node is a whole second record, not a
 // pointer to the first one.
 type towerProfileChild struct {
 	Id      int `key:"primary"`
