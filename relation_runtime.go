@@ -1578,6 +1578,11 @@ func flushRelations() error {
 
 	storeCommittedOwnership(model, deleted)
 
+	// Live and committed agree from here, so the replica can be re-pointed at the
+	// index just published and serve as the baseline the next flush compares
+	// against.
+	projectTower.refreshAfterCommit()
+
 	return nil
 }
 

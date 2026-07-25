@@ -322,6 +322,35 @@ func (tower *Tower) refresh(
 	return true, nil
 }
 
+// refreshAfterCommit re-points a live replica at the index a commit just
+// published, so the next Flush has a baseline to compare against.
+//
+// It must run after the commit, never before a comparison: a replica built from
+// the current live graph is by construction equal to it, so comparing against
+// one would report "nothing moved" even when the graph had. Here live and
+// committed agree, which is what makes the baseline meaningful.
+//
+// It never builds a replica and never retires one. A commit that changed the
+// node set simply leaves the replica as it was: its epochs are already stale, so
+// synced() sends the next writer to a rebuild, and the flush gate compares
+// index identity, which no longer matches. Retiring here would additionally
+// throw away a replica that a write to an unrelated table had not invalidated.
+//
+// The caller holds graphMu.Lock.
+func (tower *Tower) refreshAfterCommit() {
+	current := tower.replica.Load()
+	if current == nil {
+		return
+	}
+
+	index := committedRelationIndexSnapshot()
+	if index == nil {
+		return
+	}
+
+	_, _ = tower.refresh(current, index, towerParticipantEpochs())
+}
+
 func (tower *Tower) rebuild() (*towerReplica, error) {
 	if err := ensureCommittedOwnership(); err != nil {
 		return nil, err
@@ -794,7 +823,7 @@ func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) b
 }
 
 // relationsDiverged reports whether any live node's relation fields still match
-// the state this replica captured at the last commit.
+// its shadow.
 //
 // Flush needs to know which nodes changed, and Unsafe cannot tell it: the
 // contract is that the caller holds exclusive access until Flush completes, not
@@ -803,8 +832,11 @@ func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) b
 // that. The shadow does not need to be told — it *is* the last committed state,
 // so comparing against it derives the answer instead of trusting a declaration.
 //
-// It allocates nothing: the walk is map iteration plus the same comparisons the
-// branch diff already uses.
+// The comparison is by id, not by pointer. A relation field holds shadow
+// pointers on the shadow side and live pointers on the live side, so comparing
+// them as pointers reports a difference on every node with a relation, always.
+// Identity is what the graph is made of; the address a copy happens to sit at is
+// not. It allocates nothing.
 func (replica *towerReplica) relationsDiverged() (bool, error) {
 	var currentType reflect.Type
 	var plan cachedTowerFieldPlan
@@ -819,20 +851,52 @@ func (replica *towerReplica) relationsDiverged() (bool, error) {
 			}
 		}
 
-		value := live.Elem()
+		shadow, present := replica.nodes[key]
+		if !present {
+			return true, nil
+		}
+
+		liveValue, shadowValue := live.Elem(), shadow.Elem()
 		for _, field := range plan.fields {
 			if !field.relational {
 				continue
 			}
 
-			baseline := replica.relations[towerRelationKey{node: key, field: field.index}]
-			if !replica.relationEqual(value.Field(field.index), field, baseline) {
+			if !sameRelationIdentity(
+				liveValue.Field(field.index),
+				shadowValue.Field(field.index),
+				field.many,
+			) {
 				return true, nil
 			}
 		}
 	}
 
 	return false, nil
+}
+
+// sameRelationIdentity compares two relation fields by the ids they point at.
+func sameRelationIdentity(live, shadow reflect.Value, many bool) bool {
+	if !many {
+		liveID, livePresent := valueID(live)
+		shadowID, shadowPresent := valueID(shadow)
+
+		return livePresent == shadowPresent && (!livePresent || liveID == shadowID)
+	}
+
+	if live.Len() != shadow.Len() {
+		return false
+	}
+
+	for index := range live.Len() {
+		liveID, livePresent := valueID(live.Index(index))
+		shadowID, shadowPresent := valueID(shadow.Index(index))
+		if livePresent != shadowPresent || (livePresent && liveID != shadowID) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (replica *towerReplica) diffFields(node towerBranchNode, plan cachedTowerFieldPlan) []int {
