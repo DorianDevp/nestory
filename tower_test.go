@@ -547,6 +547,7 @@ func TestTowerRefreshSeesReorderedChildren(t *testing.T) {
 			if got := shadow.Children[0].Value; got != first {
 				t.Fatalf("shadow.Children[0].Value = %d, want %d (stale shadow slice)", got, first)
 			}
+
 			return nil
 		}); err != nil {
 			t.Fatal(err)
