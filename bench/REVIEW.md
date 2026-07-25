@@ -61,16 +61,27 @@ with everything it owns (56 nodes):
 | engine / API | ns/op | allocs/op | vs nestory raw |
 |---|---:|---:|---:|
 | **nestory, pointer traversal** | **64.7** | **0** | 1× |
+| **nestory, safe `View`** | **177** | **0** | 2.7× |
 | go-memdb | 2,241 | 52 | 35× |
-| **nestory, safe `View`** | 2,828 | 0 | 44× |
 | SQLite | 202,049 | 570 | 3,120× |
 
-`View` was 4,967 ns when the review landed. Profiling it — rather than assuming,
-as a first draft of this file did — showed the read locks were only 27% of that:
-the majority was `committerFor(key.typ.Name())`, a reflect metadata parse plus a
-string map lookup, run twice per node. Branch keys are sorted by type name, so
-one lookup per contiguous type run replaces one per node, and the same read now
-costs 2,828 ns.
+`View` cost **4,967 ns** when the review landed — 2.2× *slower* than go-memdb on
+the workload nestory exists for. Two rounds of profiling fixed it:
+
+1. **`committerFor(key.typ.Name())` per node, twice.** A reflect metadata parse
+   plus a string map lookup, run once per lock and once per unlock. Branch keys
+   are sorted by type name, so one lookup per contiguous run replaces one per
+   node. 4,967 → 2,828 ns.
+2. **One read lock per row.** 112 atomic read-modify-writes scattered across 56
+   cache lines, which the profile then showed as 46% of what remained. Ownership
+   branches now carry a single `RWMutex` at their top-level owner: a reader takes
+   that and nothing else, and writers take the branch locks of the roots they
+   touch — in the same total order they already use for rows, so the two classes
+   cannot form a cycle. 2,828 → **177 ns**.
+
+The first draft of this file asserted the locks were the problem without
+profiling. They were, eventually — but only after the type lookups, which were
+larger, were removed. Both numbers came from measurement, in that order.
 
 Two findings, pulling opposite ways:
 
@@ -82,16 +93,15 @@ to run three queries and rebuild objects from rows. Against SQLite this is
 asked whether the advantage grows with relations: it grows by an order of
 magnitude.
 
-**And nestory's own safe API still discards 97.7% of it.** Even after the fix
-above, `View` costs 2,828 ns against 64.7 ns of traversal — 44× — and remains
-**1.26× slower than go-memdb**, which holds an MVCC snapshot and locks nothing.
-On the one workload where nestory should be untouchable, the safe path loses to
-the obvious competitor.
+**And the safe API now costs 2.7× the raw traversal, not 77×.** `View` at 177 ns
+against 64.7 ns of pointer walking is one uncontended read lock plus the walk —
+**12.7× faster than go-memdb** and 1,140× faster than SQLite, with zero
+allocations against their 52 and 570.
 
-What is left is now genuinely the locking: 56 `RWMutex.RLock` plus 56 unlocks,
-about 112 atomic read-modify-writes on cache lines other cores also touch. That
-is the mechanism to replace — a snapshot-based read path would remove it
-entirely — and it is the most actionable result in this file.
+The review's implicit question was whether nestory's advantage on graphs is real
+or an artifact of the flat record. It is real and it is large — but it took
+replacing the read-lock protocol to collect it, and until the review forced the
+measurement, the safe path was losing to go-memdb on nestory's home ground.
 
 ## 3. Scan throughput past the cache — no cliff
 
@@ -136,7 +146,9 @@ is the device's, not the engine's.
   the only durable entrant. True on tmpfs; on a real device it is fourth of five
   on point writes. The bulk-insert, read and scan conclusions stand.
 - **`COMPARISON.md`**'s durable point-write table ranks engines by an effect
-  that disappears on real hardware.
+  that disappears on real hardware. Its `View` row (56 ns for a relation-free
+  type) was never wrong, but it hid that the same call on a real ownership
+  branch cost 4,967 ns until this round.
 - Any external quotation of **357 k writes/s** should be **155 writes/s
   unbatched, 363 k rows/s batched, on this NVMe**.
 - Nothing in the memory reports is affected — those measured allocation and
