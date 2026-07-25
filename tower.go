@@ -1,12 +1,14 @@
 package nestory
 
 import (
+	"bytes"
 	"cmp"
 	"fmt"
 	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // Tower coordinates one persistent shadow graph for the complete project.
@@ -74,10 +76,87 @@ type towerFieldPlan struct {
 	index      int
 	relational bool
 	many       bool
+	// slice marks a non-relational slice field. Its shadow clone owns a fresh
+	// backing array, so its header always differs bitwise and it must stay out
+	// of the memory segments below.
+	slice bool
+	// targetIDIndex is the field index of Id inside the relation target, so an
+	// identity comparison reads the int directly instead of paying valueID's
+	// Interface round trip per element — a fifth of the flush gate.
+	targetIDIndex int
+}
+
+func (field towerFieldPlan) segmentEligible() bool {
+	return !field.relational && !field.slice
+}
+
+// entityIDFieldIndex caches where Id sits inside a type, so identity checks can
+// read it as an int field instead of boxing the value into an interface.
+var entityIDIndexes sync.Map
+
+func entityIDFieldIndex(typ reflect.Type) int {
+	if cached, found := entityIDIndexes.Load(typ); found {
+		return cached.(int)
+	}
+
+	index := -1
+	if field, found := typ.FieldByName(entityIDField); found && len(field.Index) == 1 && field.Type.Kind() == reflect.Int {
+		index = field.Index[0]
+	}
+
+	entityIDIndexes.Store(typ, index)
+
+	return index
+}
+
+// fieldPointerID reads a relation pointer's target id through the cached field
+// index. It falls back to valueID for the rare shape the cache cannot serve.
+func fieldPointerID(value reflect.Value, idIndex int) (int, bool) {
+	if idIndex < 0 {
+		return valueID(value)
+	}
+
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		return 0, false
+	}
+
+	return int(value.Elem().Field(idIndex).Int()), true
+}
+
+// towerSegmentsEqual compares the scalar runs of two nodes byte for byte. Both
+// values are addressable structs — live rows sit in chunk blocks and shadows in
+// replica blocks — so their base pointers are stable for the duration.
+func towerSegmentsEqual(live, shadow reflect.Value, segments []towerSegment) bool {
+	if len(segments) == 0 {
+		return true
+	}
+
+	liveBase := live.Addr().UnsafePointer()
+	shadowBase := shadow.Addr().UnsafePointer()
+	for _, segment := range segments {
+		liveBytes := unsafe.Slice((*byte)(unsafe.Add(liveBase, segment.offset)), segment.size)
+		shadowBytes := unsafe.Slice((*byte)(unsafe.Add(shadowBase, segment.offset)), segment.size)
+		if !bytes.Equal(liveBytes, shadowBytes) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// towerSegment is one contiguous byte range of scalar fields. Bitwise equality
+// implies semantic equality for every field kind (equal headers mean shared
+// backing), so a segment hit settles the whole run in one comparison; the
+// reverse is not true, and a miss falls back to field-by-field. Padding inside
+// a run only ever produces that safe false positive.
+type towerSegment struct {
+	offset uintptr
+	size   uintptr
 }
 
 type cachedTowerFieldPlan struct {
-	fields []towerFieldPlan
+	fields   []towerFieldPlan
+	segments []towerSegment
 	// equal is non-nil exactly when the whole struct can be settled in one
 	// comparison: the type carries no relation and nothing inside it can be
 	// incomparable at runtime.
@@ -924,16 +1003,20 @@ const towerBranchCacheLimit = 64 * 1024
 // membership change is carried by the copy, not by the rewiring. Identity equal
 // means the shadow already points at shadow copies of the right ids.
 func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) bool {
+	if !towerSegmentsEqual(live, shadow, plan.segments) {
+		return false
+	}
+
 	for _, field := range plan.fields {
 		if field.relational {
-			if !sameRelationIdentity(live.Field(field.index), shadow.Field(field.index), field.many) {
+			if !sameRelationIdentity(live.Field(field.index), shadow.Field(field.index), field.many, field.targetIDIndex) {
 				return false
 			}
 
 			continue
 		}
 
-		if !relationFieldEqual(live.Field(field.index), shadow.Field(field.index)) {
+		if field.slice && !relationFieldEqual(live.Field(field.index), shadow.Field(field.index)) {
 			return false
 		}
 	}
@@ -992,12 +1075,15 @@ func (replica *towerReplica) graphMovedNodes() (moved []nodeKey, keyChanged bool
 				continue
 			}
 
-			if !sameRelationIdentity(liveValue.Field(field.index), shadowValue.Field(field.index), field.many) {
+			if !sameRelationIdentity(liveValue.Field(field.index), shadowValue.Field(field.index), field.many, field.targetIDIndex) {
 				changed = true
 				break
 			}
 		}
 
+		// Key fields are typically one int, so per-field comparison beats a
+		// segment pass here — measured, not assumed: the segment variant cost
+		// ~9% of the whole gate on this fixture.
 		for _, index := range keyFields {
 			if !relationFieldEqual(liveValue.Field(index), shadowValue.Field(index)) {
 				changed = true
@@ -1015,10 +1101,10 @@ func (replica *towerReplica) graphMovedNodes() (moved []nodeKey, keyChanged bool
 }
 
 // sameRelationIdentity compares two relation fields by the ids they point at.
-func sameRelationIdentity(live, shadow reflect.Value, many bool) bool {
+func sameRelationIdentity(live, shadow reflect.Value, many bool, idIndex int) bool {
 	if !many {
-		liveID, livePresent := valueID(live)
-		shadowID, shadowPresent := valueID(shadow)
+		liveID, livePresent := fieldPointerID(live, idIndex)
+		shadowID, shadowPresent := fieldPointerID(shadow, idIndex)
 
 		return livePresent == shadowPresent && (!livePresent || liveID == shadowID)
 	}
@@ -1028,8 +1114,8 @@ func sameRelationIdentity(live, shadow reflect.Value, many bool) bool {
 	}
 
 	for index := range live.Len() {
-		liveID, livePresent := valueID(live.Index(index))
-		shadowID, shadowPresent := valueID(shadow.Index(index))
+		liveID, livePresent := fieldPointerID(live.Index(index), idIndex)
+		shadowID, shadowPresent := fieldPointerID(shadow.Index(index), idIndex)
 		if livePresent != shadowPresent || (livePresent && liveID != shadowID) {
 			return false
 		}
@@ -1047,19 +1133,26 @@ func (replica *towerReplica) diffFields(node towerBranchNode, plan cachedTowerFi
 	before := node.live.Elem()
 	after := node.shadow.Elem()
 
+	// One comparison per scalar run settles the common case; a miss only means
+	// the per-field loop below has to name which fields moved.
+	scalarsEqual := towerSegmentsEqual(before, after, plan.segments)
+
 	var changed []int
 	for _, field := range plan.fields {
-		left := before.Field(field.index)
-		right := after.Field(field.index)
 		var equal bool
-		if field.relational {
+		switch {
+		case field.relational:
 			equal = replica.relationEqual(
-				right,
+				after.Field(field.index),
 				field,
 				replica.relations[towerRelationKey{node: key, field: field.index}],
 			)
-		} else {
-			equal = relationFieldEqual(left, right)
+		case field.slice:
+			equal = relationFieldEqual(before.Field(field.index), after.Field(field.index))
+		case scalarsEqual:
+			continue
+		default:
+			equal = relationFieldEqual(before.Field(field.index), after.Field(field.index))
 		}
 
 		if !equal {
@@ -1076,7 +1169,7 @@ func (replica *towerReplica) relationEqual(
 	baseline towerRelationState,
 ) bool {
 	if !field.many {
-		id, present := valueID(value)
+		id, present := fieldPointerID(value, field.targetIDIndex)
 		return present == baseline.present && (!present || id == baseline.one)
 	}
 
@@ -1130,11 +1223,26 @@ func towerFields(typ reflect.Type) (cachedTowerFieldPlan, error) {
 	}
 
 	fields := make([]towerFieldPlan, typ.NumField())
+	var segments []towerSegment
 	for index := range typ.NumField() {
-		field := towerFieldPlan{index: index}
-		if spec, relational := specs[typ.Field(index).Name]; relational {
+		structField := typ.Field(index)
+		field := towerFieldPlan{index: index, targetIDIndex: -1}
+		if spec, relational := specs[structField.Name]; relational {
 			field.relational = true
 			field.many = spec.many
+			field.targetIDIndex = entityIDFieldIndex(spec.target)
+		} else if structField.Type.Kind() == reflect.Slice {
+			field.slice = true
+		} else {
+			// Extend the current segment or open a new one. Spanning the padding
+			// between two scalar fields is deliberate: comparing it can only
+			// produce a safe false positive.
+			end := structField.Offset + structField.Type.Size()
+			if index > 0 && len(segments) > 0 && fields[index-1].segmentEligible() {
+				segments[len(segments)-1].size = end - segments[len(segments)-1].offset
+			} else {
+				segments = append(segments, towerSegment{offset: structField.Offset, size: end - structField.Offset})
+			}
 		}
 
 		fields[index] = field
@@ -1143,7 +1251,7 @@ func towerFields(typ reflect.Type) (cachedTowerFieldPlan, error) {
 	// equal is only usable on the struct as a whole, so a type holding a
 	// relation is excluded: those fields compare by id against the baseline,
 	// not by the pointer the shadow happens to carry.
-	entry := cachedTowerFieldPlan{fields: fields}
+	entry := cachedTowerFieldPlan{fields: fields, segments: segments}
 	if comparator, found := towerComparators.Load(typ); found && len(specs) == 0 {
 		entry.equal = comparator.(towerComparator)
 	}
