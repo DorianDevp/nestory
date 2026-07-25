@@ -26,6 +26,7 @@ func BenchmarkColdStart(b *testing.B) {
 					Age:   position % 90,
 				})
 			}
+
 			if err := db.Unsafe().Flush(); err != nil {
 				b.Fatal(err)
 			}
