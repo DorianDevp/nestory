@@ -301,46 +301,62 @@ That turns roughly eighteen append doublings — each copying and abandoning the
 previous array — into one allocation. Flush churn 389.3 → 332.8 MB;
 `insert-then-write` peak 444.2 → **389.7 MiB**.
 
+**Steps 6-8 — stop rebuilding what is already known.**
+`buildCommittedRelationIndex` filtered `model.nodes` into an identical map and
+recomputed the target index from scratch, both from data the model already held;
+the node map is now read from the model directly and the target index cloned.
+`model.refs` is presized from the last published model instead of growing from
+empty. `map[nodeKey][]incomingOwn` became a value record: a node has at most one
+owner, so that map allocated a slice per node to hold one element.
+
+| at 100,003 nodes | baseline | now |
+|---|---:|---:|
+| graph alone | 202.8 MiB | **146.4 MiB** |
+| with Tower replica | 243.3 MiB | **186.9 MiB** |
+| flush churn | 543 MB | **285 MB** |
+| insert-then-write, peak | 589.3 MiB | **351.0 MiB** |
+| peak as a share of the base | 242% | **188%** |
+
+Two things this round are worth recording because they cut against the
+optimization.
+
+**A shared map was a latent corruption, and the tests passed.** The first version
+also shared `model.targets` with the index. `publishAndRewire` assigns into
+`index.targets` when a create is published, which would have written into the
+model `committedOwnership.graph` still holds. `go test -race` was green with the
+bug present; it was found by grepping mutation sites, not by testing. The index
+clones the map instead.
+
+**Loose map size hints cost more than they save.** Sizing `fields` from
+`len(model.refs)` and `outgoing` from `len(nodes)` cut churn but raised the
+resident graph from 146.5 to 168.0 MiB, because both maps are keyed by something
+far less numerous than the hint. Only `incoming`, which really does take one
+entry per node, keeps its hint.
+
 ### Where this stopped, against the stated target
 
-The target was an increment of at most 50% of the live base (≤ ~94 MiB), ideally
-5% (~9 MiB). The measured increment is **389.7 MiB against a 187.6 MiB base —
-2.08×**, so the target is **not met**, and the gap is a factor of 4.1.
+The target is an increment of at most 50% of the live base. The measured
+increment is **188%**, so it is not met, and the remaining gap is a factor of
+3.8.
 
-The reason is visible in the profile and is not something more presizing fixes.
-After five steps the flush profile is still dominated by structures rebuilt from
-scratch every time: `recordResolvedRelation` 30%, `indexRelationNodeTargets`
-12.3%, `indexRelationFields` 8.2%, `incrementIncoming` 11.7% cumulative, with
-`buildCommittedRelationIndex` at 34% cumulative. Every one of those is a
-consequence of `flushRelations` building a complete `relationModel` and a
-complete `committedRelationIndex` on each call.
+Every remaining allocation site is a consequence of one decision:
+`flushRelations` builds a complete `relationModel` and a complete
+`committedRelationIndex` on every call. After eight steps no single site
+dominates — `recordResolvedRelation`, `indexRelationFields`,
+`incomingCounts.increment`, `indexRelationNodeTargets` and `addGraphNode` are all
+between 8% and 19% — which is what running out of representation-level wins looks
+like.
 
-Reaching a 50% increment means not rebuilding them — validating the graph as it
-is walked rather than materializing a model, and publishing an index diff rather
-than a new index. That is the structural change; the five steps above were
-representation changes, and representation changes have now returned what they
-can.
-
-The flat control is fixed outright rather than reduced:
-
-| flat table, 100,000 rows | before | after |
-|---|---:|---:|
-| built | 17.2 MiB | 17.2 MiB |
-| after first write | 34.2 MiB | **16.5 MiB** |
-
-Resident cost is down 27.4% and the worst-case peak 24.6%, with `go test -race`
-green and no new lint findings.
-
-### What step 3 did not reach, and why
-
-The plan was to replace the full index rebuild in `flushRelations` with a
-published diff. An allocation profile of `Unsafe().Flush()` redirected it:
-`storeCommittedOwnership` is only **27%** of the flush, while
-`recordResolvedRelation` — inside model *construction*, which the `Unsafe`
-contract requires to be O(graph) — was **47.7%**. Shrinking what that loop
-appends was therefore worth more than diffing what follows it, and is what step 3
-actually did. Making the remaining model build incremental is a larger change
-than swapping a representation, and is not done.
+The path forward is identified and needs no API change. The transaction engine
+already has a fully incremental route: `buildRelationCreateIndexDelta` produces a
+`relationIndexDelta` and `publishAndRewire` publishes it, which is why a
+transactional scalar write costs a flat 8.7 kB at every graph size.
+`Unsafe().Flush()` never enters it. The obstacle is that the delta needs to know
+which nodes changed, and `Unsafe` hands out raw pointers through `Unsafe().Get()`
+and `Unsafe().All()` without recording anything. Those two call sites are the
+complete mutation surface, so recording the keys they hand out — and falling back
+to the full rebuild after `All()` — would let `Flush` reuse the engine's existing,
+already-tested delta path rather than a new validator.
 
 ## Failure modes this architecture permits
 
