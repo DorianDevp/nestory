@@ -1056,7 +1056,7 @@ func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struc
 			nodes[key] = node
 		}
 
-		targets = buildRelationTargetIndexFromFields(nodes, model.targetFields)
+		targets = buildRelationTargetIndexFromFields(nodes, model.targetFields, len(model.targets))
 	}
 
 	if targets == nil {

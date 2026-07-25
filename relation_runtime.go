@@ -273,17 +273,37 @@ func (owns *incomingOwns) add(edge incomingOwn) {
 
 var committedOwnership = struct {
 	sync.RWMutex
-	ready      atomic.Bool
-	outgoing   map[nodeKey][]nodeKey
-	branches   map[nodeKey][]nodeKey
-	graph      *relationModel
-	fieldCount int
-	index      *committedRelationIndex
+	ready    atomic.Bool
+	outgoing map[nodeKey][]nodeKey
+	branches map[nodeKey][]nodeKey
+	graph    *relationModel
+	sizes    committedSizes
+	index    *committedRelationIndex
 }{outgoing: make(map[nodeKey][]nodeKey), branches: make(map[nodeKey][]nodeKey)}
 
 // graphMu protects live relation pointers while a branch is copied or a commit
 // publishes and rewires a new graph. User callbacks run entirely outside it.
 var graphMu sync.RWMutex
+
+// committedSizes remembers how large each rebuilt collection came out last time.
+// A rebuild lands within a few entries of it, so these are tight hints and skip
+// the fifteen-odd rehashes a hintless map of this size pays. Hints taken from a
+// differently-keyed collection are not safe this way: the slack they leave stays
+// resident.
+type committedSizes struct {
+	nodes    int
+	targets  int
+	owners   int
+	outgoing int
+	fields   int
+}
+
+func committedSizeHints() committedSizes {
+	committedOwnership.RLock()
+	defer committedOwnership.RUnlock()
+
+	return committedOwnership.sizes
+}
 
 func resetCommittedOwnership() {
 	committedOwnership.Lock()
@@ -293,7 +313,7 @@ func resetCommittedOwnership() {
 	committedOwnership.outgoing = make(map[nodeKey][]nodeKey)
 	committedOwnership.branches = make(map[nodeKey][]nodeKey)
 	committedOwnership.graph = nil
-	committedOwnership.fieldCount = 0
+	committedOwnership.sizes = committedSizes{}
 	committedOwnership.index = nil
 }
 
@@ -378,8 +398,14 @@ func storeCommittedOwnership(model *relationModel, deleted map[nodeKey]struct{})
 		committedOwnership.graph = nil
 	}
 
-	committedOwnership.index = buildCommittedRelationIndex(model, deleted, committedOwnership.fieldCount)
-	committedOwnership.fieldCount = len(committedOwnership.index.fields)
+	committedOwnership.index = buildCommittedRelationIndex(model, deleted, committedOwnership.sizes.fields)
+	committedOwnership.sizes = committedSizes{
+		nodes:    len(model.nodes),
+		targets:  len(model.targets),
+		owners:   len(model.owners),
+		outgoing: len(model.outgoing),
+		fields:   len(committedOwnership.index.fields),
+	}
 
 	committedOwnership.Unlock()
 	committedOwnership.ready.Store(true)
@@ -516,7 +542,7 @@ func collectRelationNodes(includePending bool, override *relationGraphNode) (map
 }
 
 func collectRelationNodesWithOverrides(includePending bool, overrides map[nodeKey]relationGraphNode) (map[nodeKey]relationGraphNode, error) {
-	nodes := make(map[nodeKey]relationGraphNode)
+	nodes := make(map[nodeKey]relationGraphNode, committedSizeHints().nodes)
 	for _, rawStore := range storeRegistry {
 		if err := collectStoreNodes(nodes, rawStore); err != nil {
 			return nil, err
@@ -835,7 +861,7 @@ func buildRelationModel(nodes map[nodeKey]relationGraphNode) (*relationModel, er
 		return nil, err
 	}
 
-	targets := buildRelationTargetIndexFromFields(nodes, fields)
+	targets := buildRelationTargetIndexFromFields(nodes, fields, committedSizeHints().targets)
 	return buildRelationModelFromTargets(nodes, targets, fields)
 }
 
@@ -844,13 +870,15 @@ func buildRelationModelFromTargets(
 	targets map[relationTargetKey]indexedRelationTarget,
 	targetFields map[reflect.Type]map[string]struct{},
 ) (*relationModel, error) {
+	hints := committedSizeHints()
+
 	// refs, owners and outgoing all hold one entry per edge or per owned node, and
 	// a full rebuild reaches the same size the committed model already has. Sizing
 	// from it turns eighteen doublings — each copying and abandoning the previous
 	// array — into a single allocation. A stale hint only costs the usual growth.
 	model := &relationModel{
 		nodes: nodes, targets: targets, targetFields: targetFields,
-		owners: make(map[nodeKey]nodeKey), outgoing: make(map[nodeKey][]nodeKey),
+		owners: make(map[nodeKey]nodeKey, hints.owners), outgoing: make(map[nodeKey][]nodeKey, hints.outgoing),
 	}
 
 	incoming := make(map[nodeKey]incomingOwns, len(nodes))
@@ -1004,11 +1032,14 @@ func validateChangedOwnershipCycles(model *relationModel, changed map[nodeKey]st
 	return nil
 }
 
+// hint is passed in rather than read from committedOwnership: one caller runs
+// under committedOwnership.Lock, and Go's RWMutex is not reentrant.
 func buildRelationTargetIndexFromFields(
 	nodes map[nodeKey]relationGraphNode,
 	fieldsByType map[reflect.Type]map[string]struct{},
+	hint int,
 ) map[relationTargetKey]indexedRelationTarget {
-	targets := make(map[relationTargetKey]indexedRelationTarget)
+	targets := make(map[relationTargetKey]indexedRelationTarget, hint)
 	for nodeKey, node := range nodes {
 		indexRelationNodeTargets(targets, node, fieldsByType[nodeKey.typ])
 	}

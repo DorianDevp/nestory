@@ -1109,7 +1109,7 @@ func prepareTransactionRelationState(
 		}
 
 		return transactionRelationState{
-			nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields),
+			nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields, committedSizeHints().targets),
 			targetFields: fields, rebuild: true,
 		}, nil
 	}
@@ -1131,7 +1131,7 @@ func prepareTransactionRelationState(
 			}
 
 			return transactionRelationState{
-				committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields),
+				committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields, committedSizeHints().targets),
 				targetFields: fields, rebuild: true,
 			}, nil
 		}
@@ -1139,7 +1139,7 @@ func prepareTransactionRelationState(
 
 	if relationTargetKeysChanged(overrides, committed.nodes, committed.targetFields) {
 		return transactionRelationState{
-			committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, committed.targetFields),
+			committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, committed.targetFields, len(committed.targets)),
 			targetFields: committed.targetFields, rebuild: true,
 		}, nil
 	}
