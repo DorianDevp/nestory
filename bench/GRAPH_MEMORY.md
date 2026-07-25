@@ -294,6 +294,33 @@ set, so it takes the rebuild fallback. What remains of the mixed-API path is
 per node even when the slice contents did not change — copying into the existing
 shadow slice when capacity allows is the obvious next step and is not done.
 
+**Step 5 — `model.refs` sized from the last published model.** A full rebuild
+reaches the same edge count the committed model already has, so
+`buildRelationModelFromTargets` now presizes from `committedRelationRefCount()`.
+That turns roughly eighteen append doublings — each copying and abandoning the
+previous array — into one allocation. Flush churn 389.3 → 332.8 MB;
+`insert-then-write` peak 444.2 → **389.7 MiB**.
+
+### Where this stopped, against the stated target
+
+The target was an increment of at most 50% of the live base (≤ ~94 MiB), ideally
+5% (~9 MiB). The measured increment is **389.7 MiB against a 187.6 MiB base —
+2.08×**, so the target is **not met**, and the gap is a factor of 4.1.
+
+The reason is visible in the profile and is not something more presizing fixes.
+After five steps the flush profile is still dominated by structures rebuilt from
+scratch every time: `recordResolvedRelation` 30%, `indexRelationNodeTargets`
+12.3%, `indexRelationFields` 8.2%, `incrementIncoming` 11.7% cumulative, with
+`buildCommittedRelationIndex` at 34% cumulative. Every one of those is a
+consequence of `flushRelations` building a complete `relationModel` and a
+complete `committedRelationIndex` on each call.
+
+Reaching a 50% increment means not rebuilding them — validating the graph as it
+is walked rather than materializing a model, and publishing an index diff rather
+than a new index. That is the structural change; the five steps above were
+representation changes, and representation changes have now returned what they
+can.
+
 The flat control is fixed outright rather than reduced:
 
 | flat table, 100,000 rows | before | after |
