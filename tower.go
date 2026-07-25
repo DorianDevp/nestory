@@ -43,9 +43,12 @@ type towerReplica struct {
 	index *committedRelationIndex
 
 	// branchMu guards branches, the only part of a published replica that
-	// still fills in lazily.
-	branchMu sync.Mutex
-	branches map[nodeKey][]towerBranchNode
+	// still fills in lazily. branchNodes counts the cached entries so the cache
+	// stays bounded — it used to grow by every root ever written, for the
+	// replica's whole life.
+	branchMu    sync.Mutex
+	branches    map[nodeKey][]towerBranchNode
+	branchNodes int
 }
 
 type towerChange struct {
@@ -351,6 +354,7 @@ func (tower *Tower) refresh(
 	// branches are the one derived structure a refresh cannot keep.
 	current.branchMu.Lock()
 	current.branches = make(map[nodeKey][]towerBranchNode)
+	current.branchNodes = 0
 	current.branchMu.Unlock()
 
 	current.epochs.Store(&epochs)
@@ -382,6 +386,7 @@ func towerForgetNodes(closure map[nodeKey]struct{}) {
 
 	replica.branchMu.Lock()
 	replica.branches = make(map[nodeKey][]towerBranchNode)
+	replica.branchNodes = 0
 	replica.branchMu.Unlock()
 }
 
@@ -893,11 +898,24 @@ func (replica *towerReplica) branchFor(root nodeKey) ([]towerBranchNode, error) 
 	}
 
 	replica.branchMu.Lock()
+	// Crude but self-healing: past the cap, drop everything and let the hot
+	// roots refill. An entry is 104 B, so the cap holds the cache near 6 MiB
+	// instead of letting a root-rotating workload grow it without limit.
+	if replica.branchNodes+len(branch) > towerBranchCacheLimit {
+		replica.branches = make(map[nodeKey][]towerBranchNode)
+		replica.branchNodes = 0
+	}
+
 	replica.branches[root] = branch
+	replica.branchNodes += len(branch)
 	replica.branchMu.Unlock()
 
 	return branch, nil
 }
+
+// towerBranchCacheLimit bounds the branch cache by cached nodes, not roots:
+// one huge branch and many small ones cost the same memory per node.
+const towerBranchCacheLimit = 64 * 1024
 
 // towerNodeUnchanged compares a live node against its shadow. Relation fields
 // compare by id, not bitwise: they hold shadow pointers on one side and live
