@@ -88,23 +88,3 @@ func seedMongo(tb testing.TB, collection *mongo.Collection, n int) {
 		tb.Fatalf("seed: %v", err)
 	}
 }
-
-func BenchmarkMongo_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			collection := openMongo(b)
-			docs := make([]any, n)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				base := i * n
-				for j := range n {
-					docs[j] = mkMongoRec(base + j + 1)
-				}
-				if _, err := collection.InsertMany(context.Background(), docs); err != nil {
-					b.Fatalf("insert: %v", err)
-				}
-			}
-		})
-	}
-}

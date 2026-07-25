@@ -9,7 +9,6 @@ package compare
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"os"
 	"strconv"
 	"testing"
@@ -36,23 +35,6 @@ func openSQLiteMem(tb testing.TB) *sql.DB {
 	return db
 }
 
-func BenchmarkSQLiteMem_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db := openSQLiteMem(b)
-				b.StartTimer()
-				seedSQLite(b, db, n)
-				b.StopTimer()
-				db.Close()
-				b.StartTimer()
-			}
-		})
-	}
-}
-
 // BuntDB, :memory: — no AOF, no sync policy to configure.
 
 func openBuntMem(tb testing.TB) *buntdb.DB {
@@ -62,23 +44,6 @@ func openBuntMem(tb testing.TB) *buntdb.DB {
 		tb.Fatalf("open buntdb mem: %v", err)
 	}
 	return db
-}
-
-func BenchmarkBuntMem_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db := openBuntMem(b)
-				b.StartTimer()
-				seedBunt(b, db, n)
-				b.StopTimer()
-				db.Close()
-				b.StartTimer()
-			}
-		})
-	}
 }
 
 // Badger, WithInMemory — LSM machinery kept, value log in RAM.
@@ -103,23 +68,6 @@ func seedBadgerMem(tb testing.TB, db *badger.DB, n int) {
 	}
 	if err := batch.Flush(); err != nil {
 		tb.Fatalf("flush: %v", err)
-	}
-}
-
-func BenchmarkBadgerMem_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db := openBadgerMem(b)
-				b.StartTimer()
-				seedBadgerMem(b, db, n)
-				b.StopTimer()
-				db.Close()
-				b.StartTimer()
-			}
-		})
 	}
 }
 
@@ -155,23 +103,5 @@ func seedRedis(tb testing.TB, client *redis.Client, n int) {
 	})
 	if err != nil {
 		tb.Fatalf("seed redis: %v", err)
-	}
-}
-
-func BenchmarkRedis_BulkInsert(b *testing.B) {
-	client := openRedis(b)
-	defer client.Close()
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				if err := client.FlushDB(context.Background()).Err(); err != nil {
-					b.Fatalf("flushdb: %v", err)
-				}
-				b.StartTimer()
-				seedRedis(b, client, n)
-			}
-		})
 	}
 }

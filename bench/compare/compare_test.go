@@ -95,21 +95,6 @@ func seedSQLite(tb testing.TB, db *sql.DB, n int) {
 	}
 }
 
-func BenchmarkSQLite_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db := openSQLite(b, b.TempDir())
-				b.StartTimer()
-				seedSQLite(b, db, n)
-				db.Close()
-			}
-		})
-	}
-}
-
 // bbolt (durable)
 
 var bucket = []byte("rec")
@@ -142,21 +127,6 @@ func seedBolt(tb testing.TB, db *bolt.DB, n int) {
 	}
 }
 
-func BenchmarkBolt_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db := openBolt(b, b.TempDir())
-				b.StartTimer()
-				seedBolt(b, db, n)
-				db.Close()
-			}
-		})
-	}
-}
-
 // go-memdb (in-memory, not durable)
 
 func memSchema() *memdb.DBSchema {
@@ -182,20 +152,6 @@ func seedMemdb(tb testing.TB, db *memdb.MemDB, n int) {
 		}
 	}
 	txn.Commit()
-}
-
-func BenchmarkMemdb_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db, _ := memdb.NewMemDB(memSchema())
-				b.StartTimer()
-				seedMemdb(b, db, n)
-			}
-		})
-	}
 }
 
 // PointWrite: durable single-row update

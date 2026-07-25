@@ -4,7 +4,6 @@ package compare
 // (in-memory + AOF durable) and dgraph-io/badger/v4 (LSM, durable).
 
 import (
-	"fmt"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -47,21 +46,6 @@ func seedBunt(tb testing.TB, db *buntdb.DB, n int) {
 	}
 }
 
-func BenchmarkBunt_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db := openBunt(b, b.TempDir())
-				b.StartTimer()
-				seedBunt(b, db, n)
-				db.Close()
-			}
-		})
-	}
-}
-
 // badger (LSM, durable)
 
 func openBadger(tb testing.TB, dir string) *badger.DB {
@@ -86,22 +70,5 @@ func seedBadger(tb testing.TB, db *badger.DB, n int) {
 	}
 	if err := wb.Flush(); err != nil {
 		tb.Fatalf("badger batch flush: %v", err)
-	}
-}
-
-func BenchmarkBadger_BulkInsert(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				db := openBadger(b, b.TempDir())
-				b.StartTimer()
-				seedBadger(b, db, n)
-				b.StopTimer()
-				db.Close()
-				b.StartTimer()
-			}
-		})
 	}
 }

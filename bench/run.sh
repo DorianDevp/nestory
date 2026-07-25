@@ -28,6 +28,7 @@ RESULTS=${NESTORY_RESULTS:-results}
 graph_engines="Nestory NestoryUnsafe Memdb SQLite Bolt Bunt BuntMem Badger BadgerMem"
 point_engines="Nestory NestoryUnsafe NestoryGet Memdb SQLite SQLiteMem Bolt Bunt BuntMem Badger BadgerMem Redis Mongo"
 scan_engines="Nestory Memdb SQLite SQLiteMem Bolt Bunt BuntMem Badger BadgerMem Redis Mongo"
+bulk_engines="Nestory Memdb SQLite SQLiteMem Bolt Bunt BuntMem Badger BadgerMem Redis Mongo"
 
 for category in $CATEGORIES; do
     engines_var="${category}_engines"
@@ -45,6 +46,7 @@ for category in $CATEGORIES; do
                     graph) pattern="^BenchmarkGraphLoad_${engine}\$" ;;
                     point) pattern="^BenchmarkPoint(Read|Write)_${engine}\$" ;;
                     scan) pattern="^BenchmarkScan_${engine}\$" ;;
+                    bulk) pattern="^BenchmarkBulk_${engine}\$" ;;
                     *) echo "no pattern for $category" >&2; exit 1 ;;
                 esac
                 out="$RESULTS/$category/${engine}-${shape}-${scale}.txt"
