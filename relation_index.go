@@ -1033,7 +1033,7 @@ func (index *committedRelationIndex) inverseHolders(target nodeKey, inverse rela
 	return holders
 }
 
-func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struct{}) *committedRelationIndex {
+func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struct{}, fieldHint int) *committedRelationIndex {
 	// With nothing deleted the surviving node set is model.nodes itself, so the
 	// filtered copy this used to build was a duplicate map per node. Reading it
 	// is safe: nothing writes through the nodes local, and index.nodes below is a
@@ -1071,11 +1071,11 @@ func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struc
 	index := &committedRelationIndex{
 		nodes: values, targets: targets, targetFields: model.targetFields,
 		backFields: make(map[reflect.Type]map[int]struct{}),
-		// incoming takes one entry per referenced node, so len(nodes) is a tight
-		// hint and skips about seventeen rehashes. fields is keyed by (holder,
-		// relation field) and owners by owned child, both far below len(refs) and
-		// len(nodes): a loose hint there buys churn back as retained slack.
-		fields:   make(map[relationHolderField]indexedRelationField),
+		// Both hints are tight: incoming takes one entry per referenced node, and
+		// fieldHint is the previous index's own field count, which a rebuild
+		// reaches within a few entries. A loose hint is worse than none here —
+		// sizing fields from len(refs) once cost 21 MiB of retained slack.
+		fields:   make(map[relationHolderField]indexedRelationField, fieldHint),
 		incoming: make(map[nodeKey]incomingCounts, len(nodes)),
 		owners:   make(map[nodeKey]nodeKey, len(model.owners)),
 	}
