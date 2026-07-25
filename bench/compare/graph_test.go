@@ -371,7 +371,7 @@ func buildGraphNestory(tb testing.TB, shape graphShape) *nestory.DB[NWorkspace] 
 		tb.Fatalf("tempdir: %v", err)
 	}
 
-	tb.Cleanup(func() { _ = os.RemoveAll(directory) })
+	benchTempDirs = append(benchTempDirs, directory)
 	nestory.DataDir = directory
 	for _, register := range []func() error{
 		nestory.Register[NDocument], nestory.Register[NProject], nestory.Register[NWorkspace],

@@ -53,49 +53,6 @@ func BenchmarkSQLiteMem_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkSQLiteMem_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openSQLiteMem(b)
-			defer db.Close()
-			seedSQLite(b, db, n)
-			stmt, err := db.Prepare(`SELECT id,name,email,age FROM rec WHERE id=?`)
-			if err != nil {
-				b.Fatalf("prepare: %v", err)
-			}
-			defer stmt.Close()
-			target := n / 2
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				var r Rec
-				if err := stmt.QueryRow(target).Scan(&r.Id, &r.Name, &r.Email, &r.Age); err != nil {
-					b.Fatalf("read: %v", err)
-				}
-				sink += int64(r.Age)
-			}
-		})
-	}
-}
-
-func BenchmarkSQLiteMem_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openSQLiteMem(b)
-			defer db.Close()
-			seedSQLite(b, db, n)
-			target := n / 2
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				if _, err := db.Exec(`UPDATE rec SET age=? WHERE id=?`, i%90, target); err != nil {
-					b.Fatalf("write: %v", err)
-				}
-			}
-		})
-	}
-}
-
 func BenchmarkSQLiteMem_Scan(b *testing.B) {
 	for _, n := range sizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
@@ -145,56 +102,6 @@ func BenchmarkBuntMem_BulkInsert(b *testing.B) {
 				b.StopTimer()
 				db.Close()
 				b.StartTimer()
-			}
-		})
-	}
-}
-
-func BenchmarkBuntMem_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBuntMem(b)
-			defer db.Close()
-			seedBunt(b, db, n)
-			target := strconv.Itoa(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				err := db.View(func(tx *buntdb.Tx) error {
-					raw, err := tx.Get(target)
-					if err != nil {
-						return err
-					}
-					sink += int64(dec([]byte(raw)).Age)
-					return nil
-				})
-				if err != nil {
-					b.Fatalf("read: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func BenchmarkBuntMem_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBuntMem(b)
-			defer db.Close()
-			seedBunt(b, db, n)
-			target := strconv.Itoa(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				r := mkRec(n / 2)
-				r.Age = i % 90
-				err := db.Update(func(tx *buntdb.Tx) error {
-					_, _, err := tx.Set(target, string(enc(r)), nil)
-					return err
-				})
-				if err != nil {
-					b.Fatalf("write: %v", err)
-				}
 			}
 		})
 	}
@@ -262,57 +169,6 @@ func BenchmarkBadgerMem_BulkInsert(b *testing.B) {
 				b.StopTimer()
 				db.Close()
 				b.StartTimer()
-			}
-		})
-	}
-}
-
-func BenchmarkBadgerMem_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBadgerMem(b)
-			defer db.Close()
-			seedBadgerMem(b, db, n)
-			target := itob(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				err := db.View(func(txn *badger.Txn) error {
-					item, err := txn.Get(target)
-					if err != nil {
-						return err
-					}
-					return item.Value(func(value []byte) error {
-						sink += int64(dec(value).Age)
-						return nil
-					})
-				})
-				if err != nil {
-					b.Fatalf("read: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func BenchmarkBadgerMem_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBadgerMem(b)
-			defer db.Close()
-			seedBadgerMem(b, db, n)
-			target := itob(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				r := mkRec(n / 2)
-				r.Age = i % 90
-				err := db.Update(func(txn *badger.Txn) error {
-					return txn.Set(target, enc(r))
-				})
-				if err != nil {
-					b.Fatalf("write: %v", err)
-				}
 			}
 		})
 	}
@@ -399,46 +255,6 @@ func BenchmarkRedis_BulkInsert(b *testing.B) {
 				}
 				b.StartTimer()
 				seedRedis(b, client, n)
-			}
-		})
-	}
-}
-
-func BenchmarkRedis_PointRead(b *testing.B) {
-	client := openRedis(b)
-	defer client.Close()
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			seedRedis(b, client, n)
-			target := strconv.Itoa(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				raw, err := client.Get(context.Background(), target).Bytes()
-				if err != nil {
-					b.Fatalf("read: %v", err)
-				}
-				sink += int64(dec(raw).Age)
-			}
-		})
-	}
-}
-
-func BenchmarkRedis_PointWrite(b *testing.B) {
-	client := openRedis(b)
-	defer client.Close()
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			seedRedis(b, client, n)
-			target := strconv.Itoa(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				r := mkRec(n / 2)
-				r.Age = i % 90
-				if err := client.Set(context.Background(), target, enc(r), 0).Err(); err != nil {
-					b.Fatalf("write: %v", err)
-				}
 			}
 		})
 	}

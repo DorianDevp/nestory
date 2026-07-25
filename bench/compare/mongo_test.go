@@ -110,51 +110,6 @@ func BenchmarkMongo_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkMongo_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			collection := openMongo(b)
-			seedMongo(b, collection, n)
-			target := n / 2
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				var rec mongoRec
-				err := collection.
-					FindOne(context.Background(), bson.M{"_id": target}).
-					Decode(&rec)
-				if err != nil {
-					b.Fatalf("find: %v", err)
-				}
-
-				sink += int64(rec.Age)
-			}
-		})
-	}
-}
-
-func BenchmarkMongo_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			collection := openMongo(b)
-			seedMongo(b, collection, n)
-			target := n / 2
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_, err := collection.UpdateByID(
-					context.Background(),
-					target,
-					bson.M{"$set": bson.M{"age": i % 90}},
-				)
-				if err != nil {
-					b.Fatalf("update: %v", err)
-				}
-			}
-		})
-	}
-}
-
 func BenchmarkMongo_Scan(b *testing.B) {
 	for _, n := range sizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {

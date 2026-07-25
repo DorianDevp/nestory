@@ -26,6 +26,7 @@ RESULTS=${NESTORY_RESULTS:-results}
 # Engines per category. A name absent from a list is one that cannot express
 # that workload, and the report says which and why.
 graph_engines="Nestory NestoryUnsafe Memdb SQLite Bolt Bunt BuntMem Badger BadgerMem"
+point_engines="Nestory NestoryUnsafe NestoryGet Memdb SQLite SQLiteMem Bolt Bunt BuntMem Badger BadgerMem Redis Mongo"
 
 for category in $CATEGORIES; do
     engines_var="${category}_engines"
@@ -39,16 +40,21 @@ for category in $CATEGORIES; do
     for shape in $SHAPES; do
         for scale in $SCALES; do
             for engine in $engines; do
-                pattern="^Benchmark$(tr '[:lower:]' '[:upper:]' <<<"${category:0:1}")${category:1}Load_${engine}\$"
+                case $category in
+                    graph) pattern="^BenchmarkGraphLoad_${engine}\$" ;;
+                    point) pattern="^BenchmarkPoint(Read|Write)_${engine}\$" ;;
+                    *) echo "no pattern for $category" >&2; exit 1 ;;
+                esac
                 out="$RESULTS/$category/${engine}-${shape}-${scale}.txt"
                 printf '%-14s %-7s n=%-8s ' "$engine" "$shape" "$scale"
 
                 if NESTORY_BENCH_SCALE="$scale" NESTORY_BENCH_SHAPE="$shape" \
                     go test ./compare/ -run='^$' -bench="$pattern" \
                     -benchmem -benchtime="$BENCHTIME" >"$out" 2>&1; then
-                    line=$(grep -E '^Benchmark' "$out" | head -1)
-                    if [ -n "$line" ]; then
-                        echo "$line" | awk '{printf "%12s ns/op %10s B/op %8s allocs/op\n", $3, $5, $7}'
+                    lines=$(grep -E '^Benchmark' "$out")
+                    if [ -n "$lines" ]; then
+                        echo
+                        echo "$lines" | awk '{printf "  %-34s %12s ns/op %10s B/op %8s allocs/op\n", $1, $3, $5, $7}'
                     else
                         echo "skipped"
                     fi

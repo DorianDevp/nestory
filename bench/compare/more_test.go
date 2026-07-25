@@ -62,27 +62,6 @@ func BenchmarkBunt_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkBunt_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBunt(b, b.TempDir())
-			seedBunt(b, db, n)
-			defer db.Close()
-			target := strconv.Itoa(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.View(func(tx *buntdb.Tx) error {
-					if v, err := tx.Get(target); err == nil {
-						sink += int64(dec([]byte(v)).Age)
-					}
-					return nil
-				})
-			}
-		})
-	}
-}
-
 func BenchmarkBunt_Scan(b *testing.B) {
 	for _, n := range sizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
@@ -99,27 +78,6 @@ func BenchmarkBunt_Scan(b *testing.B) {
 						}
 						return true
 					})
-				})
-			}
-		})
-	}
-}
-
-func BenchmarkBunt_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBunt(b, b.TempDir())
-			seedBunt(b, db, n)
-			defer db.Close()
-			target := strconv.Itoa(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.Update(func(tx *buntdb.Tx) error {
-					r := mkRec(n / 2)
-					r.Age = i % 90
-					_, _, err := tx.Set(target, string(enc(r)), nil)
-					return err
 				})
 			}
 		})
@@ -170,31 +128,6 @@ func BenchmarkBadger_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkBadger_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBadger(b, b.TempDir())
-			seedBadger(b, db, n)
-			defer db.Close()
-			target := itob(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.View(func(txn *badger.Txn) error {
-					item, err := txn.Get(target)
-					if err != nil {
-						return nil
-					}
-					return item.Value(func(v []byte) error {
-						sink += int64(dec(v).Age)
-						return nil
-					})
-				})
-			}
-		})
-	}
-}
-
 func BenchmarkBadger_Scan(b *testing.B) {
 	for _, n := range sizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
@@ -216,26 +149,6 @@ func BenchmarkBadger_Scan(b *testing.B) {
 						})
 					}
 					return nil
-				})
-			}
-		})
-	}
-}
-
-func BenchmarkBadger_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBadger(b, b.TempDir())
-			seedBadger(b, db, n)
-			defer db.Close()
-			target := itob(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.Update(func(txn *badger.Txn) error {
-					r := mkRec(n / 2)
-					r.Age = i % 90
-					return txn.Set(target, enc(r))
 				})
 			}
 		})

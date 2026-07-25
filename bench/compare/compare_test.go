@@ -110,26 +110,6 @@ func BenchmarkSQLite_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkSQLite_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openSQLite(b, b.TempDir())
-			seedSQLite(b, db, n)
-			defer db.Close()
-			target := n / 2
-			stmt, _ := db.Prepare(`SELECT name,email,age FROM rec WHERE id=?`)
-			defer stmt.Close()
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				var r Rec
-				_ = stmt.QueryRow(target).Scan(&r.Name, &r.Email, &r.Age)
-				sink += int64(r.Age)
-			}
-		})
-	}
-}
-
 func BenchmarkSQLite_Scan(b *testing.B) {
 	for _, n := range sizes {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
@@ -193,27 +173,6 @@ func BenchmarkBolt_BulkInsert(b *testing.B) {
 				b.StartTimer()
 				seedBolt(b, db, n)
 				db.Close()
-			}
-		})
-	}
-}
-
-func BenchmarkBolt_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBolt(b, b.TempDir())
-			seedBolt(b, db, n)
-			defer db.Close()
-			target := itob(n / 2)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.View(func(tx *bolt.Tx) error {
-					v := tx.Bucket(bucket).Get(target)
-					r := dec(v)
-					sink += int64(r.Age)
-					return nil
-				})
 			}
 		})
 	}
@@ -283,87 +242,7 @@ func BenchmarkMemdb_BulkInsert(b *testing.B) {
 	}
 }
 
-func BenchmarkMemdb_PointRead(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db, _ := memdb.NewMemDB(memSchema())
-			seedMemdb(b, db, n)
-			target := n / 2
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				txn := db.Txn(false)
-				raw, _ := txn.First("rec", "id", target)
-				if raw != nil {
-					sink += int64(raw.(*Rec).Age)
-				}
-				txn.Abort()
-			}
-		})
-	}
-}
-
 // PointWrite: durable single-row update
-
-func BenchmarkSQLite_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openSQLite(b, b.TempDir())
-			seedSQLite(b, db, n)
-			defer db.Close()
-			target := n / 2
-			stmt, _ := db.Prepare(`UPDATE rec SET age=? WHERE id=?`)
-			defer stmt.Close()
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				if _, err := stmt.Exec(i%90, target); err != nil {
-					b.Fatalf("update: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func BenchmarkBolt_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db := openBolt(b, b.TempDir())
-			seedBolt(b, db, n)
-			defer db.Close()
-			target := n / 2
-			key := itob(target)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				_ = db.Update(func(tx *bolt.Tx) error {
-					r := mkRec(target)
-					r.Age = i % 90
-					return tx.Bucket(bucket).Put(key, enc(r))
-				})
-			}
-		})
-	}
-}
-
-func BenchmarkMemdb_PointWrite(b *testing.B) {
-	for _, n := range sizes {
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			db, _ := memdb.NewMemDB(memSchema())
-			seedMemdb(b, db, n)
-			target := n / 2
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				txn := db.Txn(true)
-				r := mkRec(target)
-				r.Age = i % 90
-				_ = txn.Insert("rec", &r)
-				txn.Commit()
-			}
-		})
-	}
-}
 
 func BenchmarkMemdb_Scan(b *testing.B) {
 	for _, n := range sizes {
