@@ -281,6 +281,7 @@ func (tower *Tower) refresh(
 	var plan cachedTowerFieldPlan
 	var err error
 
+	moved := make([]nodeKey, 0, 8)
 	for key, value := range index.nodes {
 		if key.typ != currentType {
 			currentType = key.typ
@@ -297,18 +298,22 @@ func (tower *Tower) refresh(
 
 		shadow.Elem().Set(value.Elem())
 		cloneSliceFields(shadow.Elem())
+		moved = append(moved, key)
 	}
 
-	if err := wireTowerNodes(current.nodes); err != nil {
-		return false, err
-	}
+	// A node nobody touched keeps its wiring and its relation baseline: refresh
+	// reuses the shadow addresses, so a pointer into an untouched node is still
+	// the right pointer. Rebuilding both for the whole project allocated a
+	// baseline slice per owner and a map entry per node, every time.
+	for _, key := range moved {
+		if err := wireTowerNode(current.nodes, key, current.nodes[key]); err != nil {
+			return false, err
+		}
 
-	relations, err := snapshotTowerRelations(current.nodes)
-	if err != nil {
-		return false, err
+		if err := snapshotTowerRelationsInto(current.relations, key, current.nodes[key]); err != nil {
+			return false, err
+		}
 	}
-
-	current.relations = relations
 	current.index = index
 
 	// Ownership may have moved between nodes that all still exist, so the cached
@@ -449,11 +454,25 @@ func buildTowerShadows(liveNodes map[nodeKey]reflect.Value) (map[nodeKey]reflect
 }
 
 func snapshotTowerRelations(nodes map[nodeKey]reflect.Value) (map[towerRelationKey]towerRelationState, error) {
-	relations := make(map[towerRelationKey]towerRelationState)
+	relations := make(map[towerRelationKey]towerRelationState, len(nodes))
 	for key, node := range nodes {
+		if err := snapshotTowerRelationsInto(relations, key, node); err != nil {
+			return nil, err
+		}
+	}
+
+	return relations, nil
+}
+
+func snapshotTowerRelationsInto(
+	relations map[towerRelationKey]towerRelationState,
+	key nodeKey,
+	node reflect.Value,
+) error {
+	{
 		specs, err := relationSpecs(key.typ)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		for _, spec := range specs {
@@ -470,11 +489,21 @@ func snapshotTowerRelations(nodes map[nodeKey]reflect.Value) (map[towerRelationK
 		}
 	}
 
-	return relations, nil
+	return nil
 }
 
 func wireTowerNodes(nodes map[nodeKey]reflect.Value) error {
 	for key, node := range nodes {
+		if err := wireTowerNode(nodes, key, node); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func wireTowerNode(nodes map[nodeKey]reflect.Value, key nodeKey, node reflect.Value) error {
+	{
 		specs, err := relationSpecs(key.typ)
 		if err != nil {
 			return err
