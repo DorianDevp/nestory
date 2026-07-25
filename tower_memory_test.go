@@ -46,7 +46,7 @@ func TestTowerMemoryProfile(t *testing.T) {
 
 	// Cumulative: each variant keeps one more part of the replica than the last,
 	// so the delta between two rows is what that part costs.
-	variants := []string{"graph", "shadow", "live", "relations", "replica"}
+	variants := []string{"graph", "shadow", "walk", "relations", "replica"}
 	samples := make([]memoryProfileSample, 0, len(variants))
 	for _, variant := range variants {
 		samples = append(samples, towerMemorySubprocess(t, variant))
@@ -89,10 +89,10 @@ func TestTowerMemoryProfile(t *testing.T) {
 func pruneTowerReplica(replica *towerReplica, variant string) {
 	switch variant {
 	case "shadow":
-		replica.live = nil
+		replica.walk = nil
 		replica.relations = nil
 		replica.branches = nil
-	case "live":
+	case "walk":
 		replica.relations = nil
 		replica.branches = nil
 	case "relations":
