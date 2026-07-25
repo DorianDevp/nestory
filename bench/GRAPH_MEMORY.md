@@ -419,16 +419,19 @@ own slice stale in the shadow. Regression test included.
 | with Tower replica | 243.3 MiB | **187.0 MiB** |
 | mixed-API, peak | 71.2 MiB | **0.013 MiB** |
 | flush after in-place mutation, peak | 210.4 MiB | **0.002 MiB** |
-| **insert-then-write, peak** | 589.3 MiB | **6.3 MiB** |
-| **insert-then-write, churn** | 617.5 MB | **6.6 MB** |
+| **insert-then-write, peak** | 589.3 MiB | **4.1 MiB** |
+| **insert-then-write, churn** | 617.5 MB | **4.3 MB** |
+| **delete-then-write, peak** | — | **4.1 MiB** |
+| **delete-then-write, churn** | — | **4.3 MB** |
 
 ### Where this stands, against the stated target
 
 The target was an increment of at most 50% of the live base, aiming at 5%. The
 measured worst-case increment is now **6.3 MiB against a 187.0 MiB base — 3.4%.
 The target is met, including the stretch goal.** Every write path in the profile
-now peaks below 7 MiB regardless of graph size; the only operations that still
-pay a full O(project) rebuild are deletes and lookup-key mutations, by design.
+now peaks below 5 MiB regardless of graph size — deletes included, which ride
+the same delta since the shadow can classify them; only lookup-key mutations
+and whatever the delta builder refuses still pay the full O(project) rebuild.
 
 A side effect worth knowing: a delta publish nils the retained committed model
 (`publishAndRewire` has always done this), so steady-state live heap after
