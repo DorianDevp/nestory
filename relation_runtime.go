@@ -1664,7 +1664,7 @@ func flushIncremental(runtimes []relationRuntime) (bool, error) {
 		touched = append(touched, touchedResource{
 			dbName: key.typ.Name(),
 			id:     key.id,
-			work:   replica.live[key].Interface(),
+			work:   replica.index.nodes[key].Interface(),
 		})
 	}
 

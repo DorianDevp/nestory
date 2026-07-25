@@ -36,7 +36,6 @@ type towerReplica struct {
 	// per table. Nothing reads it — the node pointers alone would keep it alive
 	// — but naming the owner is what makes the never-grow invariant visible.
 	blocks    []reflect.Value
-	live      map[nodeKey]reflect.Value
 	relations map[towerRelationKey]towerRelationState
 	// walk is the flat, type-grouped layout of the node set the flush gate
 	// iterates: no map lookups, relation baselines as raw pointer words.
@@ -349,29 +348,35 @@ func (tower *Tower) refresh(
 	index *committedRelationIndex,
 	epochs map[string]uint64,
 ) (bool, error) {
-	if current == nil || len(index.nodes) < len(current.live) {
+	if current == nil || len(index.nodes) < len(current.nodes) {
 		return false, nil
 	}
 
-	// Committed keys the replica has never seen are additions; they get fresh
-	// storage below, so existing shadow addresses never move. A live pointer
-	// that changed identity, or a key the replica has that the index lost, is a
-	// replacement or a removal — those still take the full rebuild.
+	// A live pointer that changed identity, or a walk key the index lost, is a
+	// replacement or a removal — those still take the full rebuild. The walk
+	// carries the recorded live words, so this needs no separate live map; the
+	// replica used to retain a defensive copy of index.nodes for exactly this,
+	// at 73 B per node.
+	for groupIndex := range current.walk {
+		group := &current.walk[groupIndex]
+		for entryIndex := range group.entries {
+			entry := &group.entries[entryIndex]
+			value, committed := index.nodes[entry.key]
+			if !committed || value.Pointer() != uintptr(entry.liveBase) {
+				return false, nil
+			}
+		}
+	}
+
+	// Committed keys the shadow has never seen are additions; they get fresh
+	// storage below, so existing shadow addresses never move.
 	var added []nodeKey
-	for key, value := range index.nodes {
-		live, ok := current.live[key]
-		if !ok {
-			added = append(added, key)
-			continue
+	if len(index.nodes) != len(current.nodes) {
+		for key := range index.nodes {
+			if _, known := current.nodes[key]; !known {
+				added = append(added, key)
+			}
 		}
-
-		if live.Pointer() != value.Pointer() {
-			return false, nil
-		}
-	}
-
-	if len(index.nodes)-len(added) != len(current.live) {
-		return false, nil
 	}
 
 	// New nodes go into one fresh block per table — never into an existing
@@ -382,7 +387,6 @@ func (tower *Tower) refresh(
 		current.blocks = append(current.blocks, blocks...)
 		for key, shadow := range grown {
 			current.nodes[key] = shadow
-			current.live[key] = index.nodes[key]
 		}
 	}
 
@@ -463,7 +467,6 @@ func towerForgetNodes(closure map[nodeKey]struct{}) {
 	}
 
 	for key := range closure {
-		delete(replica.live, key)
 		delete(replica.nodes, key)
 	}
 
@@ -544,12 +547,12 @@ func (replica *towerReplica) appendWalkEntry(index *committedRelationIndex, key 
 			continue
 		}
 
-		group.entries = append(group.entries, newTowerWalkEntry(key, replica.live[key], replica.nodes[key], group.plan))
+		group.entries = append(group.entries, newTowerWalkEntry(key, index.nodes[key], replica.nodes[key], group.plan))
 
 		return nil
 	}
 
-	built, err := buildTowerWalk(index, map[nodeKey]reflect.Value{key: replica.live[key]}, replica.nodes)
+	built, err := buildTowerWalk(index, map[nodeKey]reflect.Value{key: index.nodes[key]}, replica.nodes)
 	if err != nil {
 		return err
 	}
@@ -648,7 +651,6 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 	replica := &towerReplica{
 		nodes:     nodes,
 		blocks:    blocks,
-		live:      liveNodes,
 		relations: relations,
 		index:     index,
 		walk:      walk,
@@ -1013,7 +1015,7 @@ func (replica *towerReplica) branchNode(key nodeKey) (towerBranchNode, error) {
 		return towerBranchNode{}, fmt.Errorf("nestory: tower shadow node %s is missing", key)
 	}
 
-	live := replica.live[key]
+	live := replica.index.nodes[key]
 	if !live.IsValid() {
 		return towerBranchNode{}, ErrNotFound
 	}
