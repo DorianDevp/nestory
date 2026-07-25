@@ -443,6 +443,26 @@ Of the remaining 6.6 MB per insert, most is `relationApplyPending` building an
 per-table reindex/save sweep — both proportional to table size, not graph size,
 and neither specific to the delta path.
 
+### The flush gate's time cost
+
+`BenchmarkUnchangedFlush` prices the gate itself: one scalar mutated through a
+kept pointer, then `Flush` — the graph never changes shape, so the whole cost is
+the walk that proves it.
+
+| nodes | reflect walk over maps | flat walk list |
+|---:|---:|---:|
+| 10,000 | 2.43 ms | **0.27 ms** |
+| 100,000 | 47.8 ms | **6.97 ms** |
+
+The 6.9× came from profiling, not the first idea tried: memory segments for
+scalar runs measured **neutral-to-negative** on these fixtures (a one-int key
+field beats a 40-byte memequal) and were kept only where they replace several
+comparisons. The gate's actual costs were nodeKey map lookups (~17%) and
+element-wise reflect over relation slices (28%) — the flat list removes both,
+recording each relation field's live pointer words at refresh and comparing
+words. The baselines cost 17.5 MiB resident at 100,003 nodes: steady-state live
+heap is 154.8 MiB against 137.3 without them.
+
 ## Failure modes this architecture permits
 
 No critical threshold appears *within* the measured range in the sense of a cliff
