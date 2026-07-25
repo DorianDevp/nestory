@@ -367,6 +367,28 @@ That is not a storage-engine result: Mongo filters server side and ships only
 the matching rows, while the KV harness pulls every value across and gob-decodes
 it in the client. It measures the harness's encoding choice, not the engines.
 
+## Cold start — time to first query (lower = better)
+
+`BenchmarkColdStart` drops the in-memory registries and rehydrates from the
+files a previous run left behind: Register reads the store back, Open rebuilds
+indices, `resById` and the id counter, and a `Get` proves a row is served.
+
+| dataset | time to first query | B/op | allocs/op |
+|---|---:|---:|---:|
+| flat table, 100,000 rows | **41.6 ms** | 46.8 MB | 439,351 |
+| flat table, 1,000,000 rows | **425 ms** | 511 MB | 4,395,532 |
+| relation graph, 100,003 nodes | **702 ms** | 525 MB | 3,129,906 |
+
+Flat rehydration is linear at roughly 2.4 M rows/s. The relation graph pays
+**17× more per node** than a flat table — wiring pointers and building the
+relation model dominates the load, not reading bytes. Extrapolated, a
+million-node graph starts in about seven seconds.
+
+Startup is a one-time cost against a per-operation advantage: at 1 M flat rows,
+425 ms is repaid after ~39,000 point reads versus SQLite's 11 µs. The case it
+genuinely hurts is scale-to-zero deployment, where the process restarts per
+request and never amortizes.
+
 ## How to read this — the honest caveats
 
 1. **Reads are nestory's home turf, and it dominates.** Point reads and scans
