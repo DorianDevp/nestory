@@ -12,6 +12,92 @@ type relationHolderField struct {
 	field  int
 }
 
+// incomingCounts holds the (holder field → multiplicity) pairs pointing at one
+// node. A map per node costs about five times this shape: Go allocates a whole
+// group of slots on first insert, and most nodes are referenced from one or two
+// fields, so nearly all of that group is paid for and never used.
+//
+// lookup only materializes once a node's fan-in makes the linear scan worth
+// avoiding — the same trade nodeKeySet makes above eight keys. Without it a
+// lookup table with 60,000 referents would make index construction quadratic.
+type incomingCounts struct {
+	entries []incomingCount
+	lookup  map[relationHolderField]int // field → position in entries
+}
+
+type incomingCount struct {
+	field relationHolderField
+	count int
+}
+
+const incomingLookupThreshold = 8
+
+func (counts *incomingCounts) position(field relationHolderField) int {
+	if counts.lookup != nil {
+		if position, ok := counts.lookup[field]; ok {
+			return position
+		}
+
+		return -1
+	}
+
+	for position := range counts.entries {
+		if counts.entries[position].field == field {
+			return position
+		}
+	}
+
+	return -1
+}
+
+func (counts *incomingCounts) increment(field relationHolderField) {
+	if position := counts.position(field); position >= 0 {
+		counts.entries[position].count++
+
+		return
+	}
+
+	counts.entries = append(counts.entries, incomingCount{field: field, count: 1})
+	if counts.lookup != nil {
+		counts.lookup[field] = len(counts.entries) - 1
+
+		return
+	}
+
+	if len(counts.entries) > incomingLookupThreshold {
+		counts.lookup = make(map[relationHolderField]int, len(counts.entries))
+		for position, entry := range counts.entries {
+			counts.lookup[entry.field] = position
+		}
+	}
+}
+
+// decrement removes an exhausted entry by swapping the last one into its slot,
+// so the entries slice never leaves holes for the readers to skip.
+func (counts *incomingCounts) decrement(field relationHolderField) {
+	position := counts.position(field)
+	if position < 0 {
+		return
+	}
+
+	counts.entries[position].count--
+	if counts.entries[position].count > 0 {
+		return
+	}
+
+	last := len(counts.entries) - 1
+	moved := counts.entries[last]
+	counts.entries[position] = moved
+	counts.entries = counts.entries[:last]
+
+	if counts.lookup != nil {
+		delete(counts.lookup, field)
+		if position != last {
+			counts.lookup[moved.field] = position
+		}
+	}
+}
+
 type indexedRelationField struct {
 	spec    *relationSpec
 	targets []nodeKey
@@ -77,9 +163,8 @@ type committedRelationIndex struct {
 	targetFields map[reflect.Type]map[string]struct{}
 	backFields   map[reflect.Type]map[int]struct{}
 	fields       map[relationHolderField]indexedRelationField
-	incoming     map[nodeKey]map[relationHolderField]int
+	incoming     map[nodeKey]incomingCounts
 	owners       map[nodeKey]nodeKey
-	children     map[nodeKey]map[nodeKey]struct{}
 }
 
 type relationOwnerChange struct {
@@ -655,7 +740,8 @@ func (delta *relationIndexDelta) ownerChange(child nodeKey) (relationOwnerChange
 func (delta *relationIndexDelta) effectiveIncomingOwn(child nodeKey) (incomingOwn, int) {
 	var first incomingOwn
 	count := 0
-	for fieldKey, multiplicity := range delta.index.incoming[child] {
+	for _, entry := range delta.index.incoming[child].entries {
+		fieldKey, multiplicity := entry.field, entry.count
 		if _, replaced := delta.fields.find(fieldKey); replaced {
 			continue
 		}
@@ -663,7 +749,7 @@ func (delta *relationIndexDelta) effectiveIncomingOwn(child nodeKey) (incomingOw
 		field := delta.index.fields[fieldKey]
 		if field.spec.kind == ownRelation && multiplicity > 0 {
 			if count == 0 {
-				first = incomingOwn{owner: fieldKey.holder, spec: *field.spec}
+				first = incomingOwn{owner: fieldKey.holder, spec: field.spec}
 			}
 
 			count += multiplicity
@@ -679,7 +765,7 @@ func (delta *relationIndexDelta) effectiveIncomingOwn(child nodeKey) (incomingOw
 		for _, target := range field.targets {
 			if target == child {
 				if count == 0 {
-					first = incomingOwn{owner: fieldKey.holder, spec: *field.spec}
+					first = incomingOwn{owner: fieldKey.holder, spec: field.spec}
 				}
 
 				count++
@@ -696,7 +782,8 @@ func (delta *relationIndexDelta) effectiveOwnedBy(child nodeKey) (incomingOwn, b
 		return incomingOwn{}, false
 	}
 
-	for _, spec := range specs {
+	for index := range specs {
+		spec := &specs[index]
 		if spec.kind != ownedByRelation {
 			continue
 		}
@@ -820,14 +907,12 @@ func (delta *relationIndexDelta) publishAndRewire() {
 	for _, entry := range delta.ownerChanges {
 		child, change := entry.child, entry.change
 		if change.hadBefore {
-			index.removeChild(change.before, child)
 			removeCommittedChild(change.before, child)
 			delete(index.owners, child)
 		}
 
 		if change.hasAfter {
 			index.owners[child] = change.after
-			index.addChild(change.after, child)
 			addCommittedChild(change.after, child)
 		}
 	}
@@ -917,7 +1002,8 @@ func setIndexedRelationField(field reflect.Value, targets []nodeKey, nodes map[n
 
 func (index *committedRelationIndex) inverseHolders(target nodeKey, inverse relationSpec) []nodeKey {
 	seen := make(map[nodeKey]struct{})
-	for fieldKey, count := range index.incoming[target] {
+	for _, entry := range index.incoming[target].entries {
+		fieldKey, count := entry.field, entry.count
 		field := index.fields[fieldKey]
 		if count <= 0 || field.spec.owner != inverse.target || field.spec.fieldName != inverse.matchField {
 			continue
@@ -963,9 +1049,8 @@ func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struc
 		nodes: values, targets: targets, targetFields: model.targetFields,
 		backFields: make(map[reflect.Type]map[int]struct{}),
 		fields:     make(map[relationHolderField]indexedRelationField),
-		incoming:   make(map[nodeKey]map[relationHolderField]int),
+		incoming:   make(map[nodeKey]incomingCounts),
 		owners:     make(map[nodeKey]nodeKey, len(model.owners)),
-		children:   make(map[nodeKey]map[nodeKey]struct{}),
 	}
 
 	indexRelationFields(index, nodes)
@@ -995,7 +1080,6 @@ func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struc
 		}
 
 		index.owners[child] = owner
-		index.addChild(owner, child)
 	}
 
 	return index
@@ -1043,32 +1127,19 @@ func indexRelationFields(index *committedRelationIndex, nodes map[nodeKey]relati
 }
 
 func (index *committedRelationIndex) incrementIncoming(target nodeKey, field relationHolderField) {
-	if index.incoming[target] == nil {
-		index.incoming[target] = make(map[relationHolderField]int)
-	}
-
-	index.incoming[target][field]++
+	counts := index.incoming[target]
+	counts.increment(field)
+	index.incoming[target] = counts
 }
 
 func (index *committedRelationIndex) decrementIncoming(target nodeKey, field relationHolderField) {
-	fields := index.incoming[target]
-	fields[field]--
-	if fields[field] <= 0 {
-		delete(fields, field)
+	counts, ok := index.incoming[target]
+	if !ok {
+		return
 	}
+
+	counts.decrement(field)
 
 	// Keep an empty bucket: repeated repoints commonly return to this target.
-}
-
-func (index *committedRelationIndex) addChild(owner, child nodeKey) {
-	if index.children[owner] == nil {
-		index.children[owner] = make(map[nodeKey]struct{})
-	}
-
-	index.children[owner][child] = struct{}{}
-}
-
-func (index *committedRelationIndex) removeChild(owner, child nodeKey) {
-	delete(index.children[owner], child)
-	// Keep an empty bucket so reparenting back does not allocate it again.
+	index.incoming[target] = counts
 }

@@ -240,6 +240,62 @@ func (replica *towerReplica) synced() bool {
 	return true
 }
 
+// refresh republishes the live replica in place when the committed node set is
+// unchanged — same keys, same live pointers. Every shadow then keeps its
+// address, so blocks, the nodes map and the live map are all reused and a
+// commit that only changed field values allocates nothing per node.
+//
+// Anything that adds or removes a node falls back to rebuild. That is what
+// keeps blocks' never-grow invariant intact: a shadow address is handed to user
+// code inside an UpdateWithin callback and cached in branches, so a block that
+// reallocated would leave both pointing at a copy nobody publishes.
+//
+// The caller holds graphMu.Lock, which excludes every reader of the replica, so
+// mutating the shadows in place cannot race a diff in progress.
+func (tower *Tower) refresh(
+	current *towerReplica,
+	index *committedRelationIndex,
+	epochs map[string]uint64,
+) (bool, error) {
+	if current == nil || len(index.nodes) != len(current.live) {
+		return false, nil
+	}
+
+	for key, value := range index.nodes {
+		live, ok := current.live[key]
+		if !ok || live.Pointer() != value.Pointer() {
+			return false, nil
+		}
+	}
+
+	for key, value := range index.nodes {
+		shadow := current.nodes[key]
+		shadow.Elem().Set(value.Elem())
+		cloneSliceFields(shadow.Elem())
+	}
+
+	if err := wireTowerNodes(current.nodes); err != nil {
+		return false, err
+	}
+
+	relations, err := snapshotTowerRelations(current.nodes)
+	if err != nil {
+		return false, err
+	}
+
+	current.relations = relations
+
+	// Ownership may have moved between nodes that all still exist, so the cached
+	// branches are the one derived structure a refresh cannot keep.
+	current.branchMu.Lock()
+	current.branches = make(map[nodeKey][]towerBranchNode)
+	current.branchMu.Unlock()
+
+	current.epochs.Store(&epochs)
+
+	return true, nil
+}
+
 func (tower *Tower) rebuild() (*towerReplica, error) {
 	if err := ensureCommittedOwnership(); err != nil {
 		return nil, err
@@ -266,6 +322,12 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 	if index == nil {
 		committedOwnership.RUnlock()
 		return nil, fmt.Errorf("nestory: committed relation index is unavailable")
+	}
+
+	if refreshed, err := tower.refresh(tower.replica.Load(), index, epochs); refreshed || err != nil {
+		committedOwnership.RUnlock()
+
+		return tower.replica.Load(), err
 	}
 
 	liveNodes := make(map[nodeKey]reflect.Value, len(index.nodes))

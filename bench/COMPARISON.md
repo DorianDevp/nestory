@@ -286,10 +286,51 @@ cost is a **fixed ~347 B per node plus a byte-for-byte copy of every slice
 field** — `cloneSliceFields` gives each shadow node its own backing array, which
 is what makes the shadow safe to mutate inside a callback.
 
-The fixed part is mostly bookkeeping rather than record data: two
-`nodeKey`-keyed maps (`nodes` and `live`), the cached branch (96 B per node of
-`towerBranchNode`, a third of it the two boxed pointers the comparator needs),
-the relation baseline, and the shadow struct itself.
+The trigger is a single call. The first `UpdateWithin` on any relation-carrying
+root finds no replica and runs `rebuild()`, which copies the whole committed
+index rather than the branch it was asked about:
+
+```go
+liveNodes := make(map[nodeKey]reflect.Value, len(index.nodes))
+for key, value := range index.nodes {   // every node in the project
+    liveNodes[key] = value
+}
+```
+
+The profile splits that fixed 347 B by keeping one more part of the replica per
+variant (0-byte payload, so this is bookkeeping only):
+
+| component | B/node | what it is |
+|---|---:|---|
+| shadow storage | 88 | contiguous blocks + cloned slice fields — the only actual data |
+| `nodes` map | 73 | `nodeKey` → shadow |
+| `live` map | 73 | `nodeKey` → canonical pointer |
+| `relations` baseline | 8 | copy of the owned-pointer slice |
+| `branches` cache | 104 | `[]towerBranchNode` for each root written |
+| **total** | **347** | |
+
+Re-running with the 128-byte payload leaves `live`, `relations` and `branches`
+unchanged at 73, 7 and 104 B/node and moves only the shadow row, which is what
+the split predicts: everything except the shadow is per-node bookkeeping and
+does not scale with record size.
+
+The record itself is 56 B. So the replica is roughly **one quarter data and
+three quarters index**: two `nodeKey`-keyed maps at 48 B of useful payload each
+(a 24 B `nodeKey` and a 24 B `reflect.Value`) but ~73 B once Go's map overhead is
+included, plus a cached branch whose `towerBranchNode` is 104 B — 32 B of that
+being the two boxed pointers the compiled comparator reads.
+
+That ~1.5× map factor is not specific to the Tower. The indexed profile above
+measures a `map[int]*T` primary lookup at 23 B against 16 B of useful payload —
+1.44×, against the Tower maps' 1.52×. Per-node cost in nestory is therefore
+governed less by record size than by **how many maps a node appears in**: a
+primary key alone is ~23 B, a unique string index adds ~43 B, and enabling the
+Tower adds 146 B of maps plus the 104 B branch entry.
+
+Two of those are avoidable in principle rather than by nature. `live` is a
+defensive copy of `committedOwnership.index.nodes`, held only so the rebuild can
+release `committedOwnership.RLock()` early; the branch cache is retained for the
+replica's life even if that root is never written again.
 
 Read together with the timing table, the trade is: a scalar write on a
 100,000-child branch drops from 97 ms to 3.5 ms, and the project's live heap
