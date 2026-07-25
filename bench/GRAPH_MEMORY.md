@@ -376,17 +376,24 @@ Two things had to be right for the gate to ever open:
 |---|---:|---:|
 | graph alone | 202.8 MiB | **146.4 MiB** |
 | with Tower replica | 243.3 MiB | **187.0 MiB** |
-| mixed-API, peak | 71.2 MiB | **38.2 MiB** |
+| **mixed-API, peak** | 71.2 MiB | **0.013 MiB** |
+| **mixed-API, churn** | 74,647,456 B | **13,624 B** |
 | **flush after in-place mutation, peak** | 210.4 MiB | **0.001 MiB** |
 | **flush after in-place mutation, churn** | 220,769,016 B | **1,536 B** |
-| insert-then-write, peak | 589.3 MiB | **302.3 MiB** |
+| insert-then-write, peak | 589.3 MiB | **293.0 MiB** |
+
+**Step 13 — refresh only the nodes that moved.** An untouched node keeps its
+wiring and its relation baseline, because refresh reuses shadow addresses: a
+pointer into an untouched node is still the right pointer. Rebuilding both for
+the whole project allocated a `reflect.MakeSlice` baseline per owner and a map
+entry per node on every refresh.
 
 The mutation flush is the shape this was aimed at: 143,000x less churn, and a
 peak that no longer scales with the graph at all.
 
 ### Where this stands, against the stated target
 
-`insert-then-write` is unchanged at **302 MiB against a 187 MiB base — 161%** —
+`insert-then-write` stands at **293 MiB against a 187 MiB base — 157%** —
 because it creates a node, and a create still takes the full rebuild. The gate
 declines anything it cannot settle by comparison.
 
