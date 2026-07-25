@@ -109,6 +109,22 @@ func committerFor(dbName string) committer {
 	return baseRegistry[dbName].(committer)
 }
 
+// committersByType resolves a committer from the type itself. The name-keyed
+// path costs a reflect metadata parse plus a string map lookup, and View pays
+// it twice per node in an ownership branch — half the cost of reading one.
+var committersByType sync.Map
+
+func committerForType(typ reflect.Type) committer {
+	if cached, found := committersByType.Load(typ); found {
+		return cached.(committer)
+	}
+
+	resolved := committerFor(typ.Name())
+	committersByType.Store(typ, resolved)
+
+	return resolved
+}
+
 // transactionEngine sits above every DB, owns the live contracts and serialises commits.
 // It stays generic — reaches a type's resources only through baseRegistry.
 type transactionEngine struct {
