@@ -471,7 +471,7 @@ func measureRelationWrites(t *testing.T, graph relationGraph, total, units int) 
 	}
 }
 
-func buildRelationGraph(t *testing.T, units int) relationGraph {
+func buildRelationGraph(t testing.TB, units int) relationGraph {
 	t.Helper()
 
 	registerForTest[memTier](t)
