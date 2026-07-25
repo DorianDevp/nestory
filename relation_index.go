@@ -1071,9 +1071,13 @@ func buildCommittedRelationIndex(model *relationModel, deleted map[nodeKey]struc
 	index := &committedRelationIndex{
 		nodes: values, targets: targets, targetFields: model.targetFields,
 		backFields: make(map[reflect.Type]map[int]struct{}),
-		fields:     make(map[relationHolderField]indexedRelationField),
-		incoming:   make(map[nodeKey]incomingCounts),
-		owners:     make(map[nodeKey]nodeKey, len(model.owners)),
+		// incoming takes one entry per referenced node, so len(nodes) is a tight
+		// hint and skips about seventeen rehashes. fields is keyed by (holder,
+		// relation field) and owners by owned child, both far below len(refs) and
+		// len(nodes): a loose hint there buys churn back as retained slack.
+		fields:   make(map[relationHolderField]indexedRelationField),
+		incoming: make(map[nodeKey]incomingCounts, len(nodes)),
+		owners:   make(map[nodeKey]nodeKey, len(model.owners)),
 	}
 
 	indexRelationFields(index, nodes)
