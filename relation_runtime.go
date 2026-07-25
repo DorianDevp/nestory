@@ -273,11 +273,12 @@ func (owns *incomingOwns) add(edge incomingOwn) {
 
 var committedOwnership = struct {
 	sync.RWMutex
-	ready    atomic.Bool
-	outgoing map[nodeKey][]nodeKey
-	branches map[nodeKey][]nodeKey
-	graph    *relationModel
-	index    *committedRelationIndex
+	ready      atomic.Bool
+	outgoing   map[nodeKey][]nodeKey
+	branches   map[nodeKey][]nodeKey
+	graph      *relationModel
+	fieldCount int
+	index      *committedRelationIndex
 }{outgoing: make(map[nodeKey][]nodeKey), branches: make(map[nodeKey][]nodeKey)}
 
 // graphMu protects live relation pointers while a branch is copied or a commit
@@ -292,6 +293,7 @@ func resetCommittedOwnership() {
 	committedOwnership.outgoing = make(map[nodeKey][]nodeKey)
 	committedOwnership.branches = make(map[nodeKey][]nodeKey)
 	committedOwnership.graph = nil
+	committedOwnership.fieldCount = 0
 	committedOwnership.index = nil
 }
 
@@ -376,7 +378,8 @@ func storeCommittedOwnership(model *relationModel, deleted map[nodeKey]struct{})
 		committedOwnership.graph = nil
 	}
 
-	committedOwnership.index = buildCommittedRelationIndex(model, deleted)
+	committedOwnership.index = buildCommittedRelationIndex(model, deleted, committedOwnership.fieldCount)
+	committedOwnership.fieldCount = len(committedOwnership.index.fields)
 
 	committedOwnership.Unlock()
 	committedOwnership.ready.Store(true)
