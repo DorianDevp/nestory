@@ -613,3 +613,113 @@ func TestUnsafeCreateFlushUsesShadowDelta(t *testing.T) {
 		}
 	})
 }
+
+// TestUnsafeDeleteFlushUsesShadowDelta covers the delete route end to end: a
+// deleted document must vanish from the surviving project's own slice (which
+// the caller deliberately left dangling), from the tier's computed inverse
+// view, and from the committed index — all without publishing a new index,
+// which is the fingerprint of the delta path. A borrowed tier must still
+// refuse deletion through the full path's canonical error.
+func TestUnsafeDeleteFlushUsesShadowDelta(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		graph := buildRelationGraph(t, 2)
+
+		if err := graph.workspaces.UpdateWithin(graph.rootIDs[0], func(workspace *memWorkspace) error {
+			workspace.Name = "warm"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		indexBefore := committedRelationIndexSnapshot()
+
+		// The canonical row, not the heap object the fixture built: db.add copies
+		// the value into the chunk, so only the canonical slice is maintained.
+		project, err := Open[memProject]().Unsafe().Get(graph.anyProject.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		doomed := project.Documents[0]
+		tier := doomed.Tier
+
+		if err := graph.documents.Unsafe().Delete(doomed.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := graph.documents.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		if committedRelationIndexSnapshot() != indexBefore {
+			t.Fatal("delete flush published a new index instead of a delta")
+		}
+
+		for _, document := range project.Documents {
+			if document == doomed {
+				t.Fatal("surviving project still owns the deleted document")
+			}
+		}
+
+		for _, document := range tier.Documents {
+			if document == doomed {
+				t.Fatal("tier's inverse view still lists the deleted document")
+			}
+		}
+
+		if _, err := graph.documents.Unsafe().Get(doomed.Id); err == nil {
+			t.Fatal("deleted document is still served")
+		}
+
+		assertCommittedIndexConsistent(t)
+
+		// The shadow must have forgotten it too.
+		if err := graph.workspaces.UpdateWithin(graph.rootIDs[0], func(workspace *memWorkspace) error {
+			for _, shadowProject := range workspace.Projects {
+				for _, document := range shadowProject.Documents {
+					if document.Id == doomed.Id {
+						t.Fatal("shadow still holds the deleted document")
+					}
+				}
+			}
+
+			workspace.Name = "after-delete"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// A borrowed tier vetoes deletion; the fallback must surface the
+		// canonical error and leave the index consistent.
+		tierDB := Open[memTier]()
+		if err := tierDB.Unsafe().Delete(tier.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := tierDB.Unsafe().Flush(); !errors.Is(err, ErrDeleteRestricted) {
+			t.Fatalf("borrowed tier deletion error = %v, want ErrDeleteRestricted", err)
+		}
+
+		tierDB.resetDeleteQueue()
+		assertCommittedIndexConsistent(t)
+
+		// Cascade: deleting a workspace takes its projects, documents and label.
+		before := len(committedRelationIndexSnapshot().nodes)
+		if err := graph.workspaces.Unsafe().Delete(graph.rootIDs[1]); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := graph.workspaces.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		// A unit is 10 nodes, minus the document this test already deleted:
+		// anyProject belongs to the last workspace, which is the one cascading.
+		after := len(committedRelationIndexSnapshot().nodes)
+		if before-after != 9 {
+			t.Fatalf("cascade removed %d nodes, want 9", before-after)
+		}
+
+		assertCommittedIndexConsistent(t)
+	})
+}

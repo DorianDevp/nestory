@@ -513,9 +513,49 @@ func wireIndexedSlice(owner, field reflect.Value, spec relationSpec, index *rela
 	}
 
 	values := index.slices[relationFieldKey{owner: spec.owner, field: spec.fieldIndex}][key.Interface()]
-	wired := reflect.MakeSlice(field.Type(), len(values), len(values))
-	for i := range values {
-		wired.Index(i).Set(values[i])
+
+	// Membership comes from the index; order is user data and comes from the
+	// field as it stands. Rebuilding purely in store order silently discarded
+	// every reorder the caller had made — and left the published index, which
+	// does preserve order, disagreeing with the live graph it describes. After
+	// a cold load the field is empty, so rehydration still lands in store order.
+	byID := make(map[int]reflect.Value, len(values))
+	for position := range values {
+		if id, hasID := valueID(values[position]); hasID {
+			byID[id] = values[position]
+		}
+	}
+
+	wired := reflect.MakeSlice(field.Type(), 0, len(values))
+	taken := make(map[int]struct{}, len(values))
+	for position := range field.Len() {
+		id, hasID := valueID(field.Index(position))
+		if !hasID {
+			continue
+		}
+
+		canonical, member := byID[id]
+		if !member {
+			continue
+		}
+
+		if _, duplicate := taken[id]; duplicate {
+			continue
+		}
+
+		taken[id] = struct{}{}
+		wired = reflect.Append(wired, canonical)
+	}
+
+	for position := range values {
+		id, hasID := valueID(values[position])
+		if !hasID {
+			continue
+		}
+
+		if _, present := taken[id]; !present {
+			wired = reflect.Append(wired, values[position])
+		}
 	}
 
 	field.Set(wired)

@@ -358,6 +358,33 @@ func (tower *Tower) refresh(
 	return true, nil
 }
 
+// towerForgetNodes drops deleted nodes from the live replica so the following
+// refresh sees matching node sets. Shadow storage is not reclaimed — the block
+// slots stay allocated until the next full rebuild — because compacting a block
+// would move surviving shadows, and their addresses are what the whole design
+// promises never to move. The caller holds graphMu.Lock.
+func towerForgetNodes(closure map[nodeKey]struct{}) {
+	replica := projectTower.replica.Load()
+	if replica == nil || len(closure) == 0 {
+		return
+	}
+
+	for key := range closure {
+		delete(replica.live, key)
+		delete(replica.nodes, key)
+	}
+
+	for relation := range replica.relations {
+		if _, dies := closure[relation.node]; dies {
+			delete(replica.relations, relation)
+		}
+	}
+
+	replica.branchMu.Lock()
+	replica.branches = make(map[nodeKey][]towerBranchNode)
+	replica.branchMu.Unlock()
+}
+
 // refreshAfterCommit re-points a live replica at the index a commit just
 // published, so the next Flush has a baseline to compare against.
 //
@@ -433,6 +460,7 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 	if err := wireTowerNodes(nodes); err != nil {
 		return nil, err
 	}
+
 	relations, err := snapshotTowerRelations(nodes)
 	if err != nil {
 		return nil, err
@@ -1090,6 +1118,7 @@ func towerFields(typ reflect.Type) (cachedTowerFieldPlan, error) {
 			field.relational = true
 			field.many = spec.many
 		}
+
 		fields[index] = field
 	}
 
@@ -1100,6 +1129,7 @@ func towerFields(typ reflect.Type) (cachedTowerFieldPlan, error) {
 	if comparator, found := towerComparators.Load(typ); found && len(specs) == 0 {
 		entry.equal = comparator.(towerComparator)
 	}
+
 	towerFieldPlans.Store(typ, entry)
 	return entry, nil
 }

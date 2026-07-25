@@ -421,6 +421,36 @@ func measureRelationWrites(t *testing.T, graph relationGraph, total, units int) 
 		HeapAlloc: settledHeap(), PeakHeap: peak, ChurnOp: churn, RSS: processRSS(),
 	})
 
+	// A delete that only a comparison against the shadow can classify: the doomed
+	// document stays in its project's live slice, so the flush must discover it,
+	// drop it for the survivor and refresh the tier's inverse view. Documents get
+	// sequential ids at creation, and measureOperation replays index 0 for its
+	// warm-up, so the phase keeps its own counter instead of trusting the index.
+	deleted := 0
+	deletions := min(16, units*6-4)
+	peak, churn = measureOperation(t, deletions, func(int) {
+		deleted++
+		if err := graph.documents.Unsafe().Delete(deleted); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := graph.documents.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := workspaces.UpdateWithin(root, func(workspace *memWorkspace) error {
+			workspace.Name = "deleted-" + strconv.Itoa(deleted)
+
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	emitGraphSample(t, graphMemorySample{
+		Schema: "graph", Phase: "delete-then-write", Nodes: total, Roots: units,
+		HeapAlloc: settledHeap(), PeakHeap: peak, ChurnOp: churn, RSS: processRSS(),
+	})
+
 	// Rotating roots keeps the replica valid but grows the branch cache, which is
 	// materialized per root written and never evicted.
 	if len(graph.rootIDs) > 1 {

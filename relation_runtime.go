@@ -1606,11 +1606,7 @@ func flushRelations() error {
 //     builder refusal — falls through to the full rebuild, so every rejection
 //     lands in today's code path.
 func flushIncremental(runtimes []relationRuntime) (bool, error) {
-	for _, runtime := range runtimes {
-		if len(runtime.relationDeleteIDs()) > 0 {
-			return false, nil
-		}
-	}
+	deletes := explicitDeletes()
 
 	// Identity, not synced(): Unsafe.Flush bumps the table epoch before reaching
 	// here, so synced() is always false by now. What matters is that the
@@ -1624,6 +1620,23 @@ func flushIncremental(runtimes []relationRuntime) (bool, error) {
 	moved, keyChanged, err := replica.graphMovedNodes()
 	if err != nil || keyChanged {
 		return false, nil
+	}
+
+	if len(deletes) > 0 {
+		// A delete flush takes its own, stricter route: it must not coexist with
+		// creates or relation moves, or the closure would need the live model the
+		// whole point is not to build.
+		if len(moved) > 0 {
+			return false, nil
+		}
+
+		for _, runtime := range runtimes {
+			if len(runtime.relationPending()) > 0 {
+				return false, nil
+			}
+		}
+
+		return flushDeletesViaDelta(runtimes, replica, deletes)
 	}
 
 	creates := make(map[nodeKey]createdResource)
@@ -1708,6 +1721,261 @@ func flushIncremental(runtimes []relationRuntime) (bool, error) {
 	projectTower.refreshAfterCommit()
 
 	return true, nil
+}
+
+// flushDeletesViaDelta settles a pure-delete flush against committed state:
+// the cascade closure comes from the committed ownership forest, the veto scan
+// from the committed incoming counts, and survivor updates ride the same field
+// delta a transactional write uses. Anything the committed state cannot prove —
+// a doomed node behind a duplicate lookup key, a surviving borrow or required
+// owner, a delete of something never committed — falls through to the full
+// rebuild, which raises today's canonical errors.
+func flushDeletesViaDelta(
+	runtimes []relationRuntime,
+	replica *towerReplica,
+	explicit map[nodeKey]struct{},
+) (bool, error) {
+	index := replica.index
+
+	// Cascade over the committed forest.
+	closure := make(map[nodeKey]struct{}, len(explicit))
+	queue := make([]nodeKey, 0, len(explicit))
+	for key := range explicit {
+		if _, committed := index.nodes[key]; !committed {
+			return false, nil
+		}
+
+		closure[key] = struct{}{}
+		queue = append(queue, key)
+	}
+
+	for len(queue) > 0 {
+		owner := queue[0]
+		queue = queue[1:]
+		for _, child := range committedChildren(owner) {
+			if _, doomed := closure[child]; doomed {
+				continue
+			}
+
+			closure[child] = struct{}{}
+			queue = append(queue, child)
+		}
+	}
+
+	// Veto scan, and the survivor work list. Only own-many drops and option
+	// clears are expressible as a delta; everything else vetoes or falls back.
+	type survivorField struct {
+		holder nodeKey
+		spec   *relationSpec
+	}
+
+	var survivors []survivorField
+	seen := make(map[relationHolderField]struct{})
+	for doomed := range closure {
+		for _, entry := range index.incoming[doomed].entries {
+			if entry.count <= 0 {
+				continue
+			}
+
+			if _, dies := closure[entry.field.holder]; dies {
+				continue
+			}
+
+			field, indexed := index.fields[entry.field]
+			if !indexed || field.spec == nil {
+				return false, nil
+			}
+
+			kind, many := field.spec.kind, field.spec.many
+			if kind == borrowRelation || kind == ownedByRelation || (kind == ownRelation && !many) {
+				return false, nil
+			}
+
+			if _, duplicate := seen[entry.field]; duplicate {
+				continue
+			}
+
+			seen[entry.field] = struct{}{}
+			survivors = append(survivors, survivorField{holder: entry.field.holder, spec: field.spec})
+		}
+
+		// A doomed node behind a duplicate lookup key cannot be removed from the
+		// target index without recomputing which collision survives.
+		for lookupField := range index.targetFields[doomed.typ] {
+			value, present := relationKey(index.nodes[doomed], lookupField)
+			if !present {
+				continue
+			}
+
+			lookup := relationTargetKey{typ: doomed.typ, field: lookupField, value: value.Interface()}
+			if index.targets[lookup].duplicate {
+				return false, nil
+			}
+		}
+	}
+
+	// Mutate the surviving holders' live fields. From here the live graph is in
+	// its post-delete shape, so even a builder fallback below converges: the
+	// full rebuild derives the same end state from these same pointers.
+	touched := make([]touchedResource, 0, len(survivors))
+	for _, survivor := range survivors {
+		holder := index.nodes[survivor.holder]
+		field := holder.Elem().Field(survivor.spec.fieldIndex)
+		if survivor.spec.many {
+			dropDoomedPointers(field, survivor.spec.target, closure)
+		} else if id, present := valueID(field); present {
+			if _, dies := closure[nodeKey{typ: survivor.spec.target, id: id}]; dies {
+				clearPointer(field)
+			}
+		}
+
+		touched = append(touched, touchedResource{
+			dbName: survivor.holder.typ.Name(),
+			id:     survivor.holder.id,
+			work:   holder.Interface(),
+		})
+	}
+
+	if len(touched) > 0 {
+		delta, err := buildRelationIndexDelta(touched)
+		if err != nil || delta == nil {
+			return false, nil
+		}
+
+		delta.publishAndRewire()
+		for _, resource := range touched {
+			if runtime, ok := baseRegistry[resource.dbName].(relationRuntime); ok {
+				runtime.relationMarkDirty(resource.id)
+			}
+		}
+	}
+
+	removeDeletedFromCommittedIndex(index, closure)
+
+	byType := make(map[reflect.Type]map[int]struct{})
+	for key := range closure {
+		if byType[key.typ] == nil {
+			byType[key.typ] = make(map[int]struct{})
+		}
+
+		byType[key.typ][key.id] = struct{}{}
+	}
+
+	for _, runtime := range runtimes {
+		runtime.relationDelete(byType[runtime.relationType()])
+	}
+
+	if err := flushPersist(runtimes); err != nil {
+		return false, err
+	}
+
+	towerForgetNodes(closure)
+	projectTower.refreshAfterCommit()
+
+	return true, nil
+}
+
+// dropDoomedPointers compacts a live []*T in place, keeping every entry whose
+// target survives. In-place, so the survivor keeps its backing array.
+func dropDoomedPointers(field reflect.Value, target reflect.Type, closure map[nodeKey]struct{}) {
+	kept := 0
+	for position := range field.Len() {
+		element := field.Index(position)
+		if id, present := valueID(element); present {
+			if _, dies := closure[nodeKey{typ: target, id: id}]; dies {
+				continue
+			}
+		}
+
+		field.Index(kept).Set(element)
+		kept++
+	}
+
+	field.SetLen(kept)
+}
+
+// removeDeletedFromCommittedIndex erases the closure from every derived
+// structure: lookup targets, outgoing relation fields (decrementing surviving
+// targets' incoming counts), ownership edges, and finally the nodes themselves.
+// Surviving targets of a doomed borrow or option holder get their inverse views
+// recomputed, since those views are derived from the counts just decremented.
+func removeDeletedFromCommittedIndex(index *committedRelationIndex, closure map[nodeKey]struct{}) {
+	inverseRefresh := make(map[nodeKey]struct{})
+
+	committedOwnership.Lock()
+	for doomed := range closure {
+		specs, err := relationSpecs(doomed.typ)
+		if err == nil {
+			for specIndex := range specs {
+				spec := &specs[specIndex]
+				if spec.kind == inverseRelation {
+					continue
+				}
+
+				holderField := relationHolderField{holder: doomed, field: spec.fieldIndex}
+				field, indexed := index.fields[holderField]
+				if !indexed {
+					continue
+				}
+
+				for _, target := range field.targets {
+					if _, dies := closure[target]; dies {
+						continue
+					}
+
+					index.decrementIncoming(target, holderField)
+					if spec.kind == borrowRelation || spec.kind == optionRelation {
+						inverseRefresh[target] = struct{}{}
+					}
+				}
+
+				delete(index.fields, holderField)
+			}
+		}
+
+		for lookupField := range index.targetFields[doomed.typ] {
+			value, present := relationKey(index.nodes[doomed], lookupField)
+			if !present {
+				continue
+			}
+
+			delete(index.targets, relationTargetKey{typ: doomed.typ, field: lookupField, value: value.Interface()})
+		}
+
+		if owner, owned := index.owners[doomed]; owned {
+			removeCommittedChild(owner, doomed)
+			delete(index.owners, doomed)
+		}
+
+		delete(committedOwnership.outgoing, doomed)
+		delete(index.incoming, doomed)
+		delete(index.nodes, doomed)
+	}
+
+	committedOwnership.graph = nil
+	clear(committedOwnership.branches)
+	committedOwnership.Unlock()
+
+	for target := range inverseRefresh {
+		value, exists := index.nodes[target]
+		if !exists {
+			continue
+		}
+
+		specs, err := relationSpecs(target.typ)
+		if err != nil {
+			continue
+		}
+
+		for _, spec := range specs {
+			if spec.kind != inverseRelation {
+				continue
+			}
+
+			holders := index.inverseHolders(target, spec)
+			setIndexedRelationField(value.Elem().Field(spec.fieldIndex), holders, index.nodes)
+		}
+	}
 }
 
 // flushPersist is the tail every incremental outcome shares: field values still

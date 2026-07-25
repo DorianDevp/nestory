@@ -251,6 +251,20 @@ func TestDifferentialRandomizedWorkload(t *testing.T) {
 					})
 				})
 			}},
+			{"unsafe-delete-flush", func(step int) error {
+				// Deliberately leaves the live slice untouched: the flush has to
+				// discover the dangling entry and drop it for the survivor.
+				if len(owner.Children) < 3 {
+					return nil
+				}
+
+				last := owner.Children[len(owner.Children)-1]
+				if err := childDB.Unsafe().Delete(last.Id); err != nil {
+					return err
+				}
+
+				return childDB.Unsafe().Flush()
+			}},
 			{"leaf-write", func(step int) error {
 				return childDB.UpdateWithin(children[0].Id, func(child *relationBenchChild) error {
 					child.Value = step
@@ -276,6 +290,7 @@ func TestDifferentialRandomizedWorkload(t *testing.T) {
 				t.Fatalf("step %d (%s): %v", step, operation.name, err)
 			}
 
+			t.Logf("step %d: %s", step, operation.name)
 			assertCommittedIndexConsistent(t)
 			if t.Failed() {
 				t.Fatalf("diverged after step %d (%s)", step, operation.name)
