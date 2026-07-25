@@ -36,21 +36,15 @@ func (db *DB[T]) View(id int, fn func(*T) error) error {
 		return err
 	}
 
-	keys := committedOwnershipKeys(nodeKey{typ: reflect.TypeFor[T](), id: id})
 	root, found := db.resource(id)
 	if !found {
 		return ErrNotFound
 	}
 
-	for _, key := range keys {
-		committerFor(key.typ.Name()).readLockResource(key.id)
-	}
-
-	defer func() {
-		for i := len(keys) - 1; i >= 0; i-- {
-			committerFor(keys[i].typ.Name()).readUnlockResource(keys[i].id)
-		}
-	}()
+	// One acquisition for the whole branch. Locking every row instead cost 112
+	// atomics across as many cache lines, two thirds of a graph read.
+	branch := lockBranchForRead(reflect.TypeFor[T](), id)
+	defer branch.RUnlock()
 
 	return fn(root.item)
 }

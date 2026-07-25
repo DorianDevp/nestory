@@ -1,12 +1,14 @@
 package nestory
 
 import (
+	"bytes"
 	"cmp"
 	"fmt"
 	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // Tower coordinates one persistent shadow graph for the complete project.
@@ -34,13 +36,23 @@ type towerReplica struct {
 	// per table. Nothing reads it — the node pointers alone would keep it alive
 	// — but naming the owner is what makes the never-grow invariant visible.
 	blocks    []reflect.Value
-	live      map[nodeKey]reflect.Value
 	relations map[towerRelationKey]towerRelationState
+	// walk is the flat, type-grouped layout of the node set the flush gate
+	// iterates: no map lookups, relation baselines as raw pointer words.
+	walk []towerTypeWalk
+	// index is the committed index this replica's relation baseline was taken
+	// from. Identity against the published index is a stronger statement than
+	// synced(): it survives an epoch bump that has not changed the graph, which
+	// is exactly the case Flush needs to recognise.
+	index *committedRelationIndex
 
 	// branchMu guards branches, the only part of a published replica that
-	// still fills in lazily.
-	branchMu sync.Mutex
-	branches map[nodeKey][]towerBranchNode
+	// still fills in lazily. branchNodes counts the cached entries so the cache
+	// stays bounded — it used to grow by every root ever written, for the
+	// replica's whole life.
+	branchMu    sync.Mutex
+	branches    map[nodeKey][]towerBranchNode
+	branchNodes int
 }
 
 type towerChange struct {
@@ -64,12 +76,91 @@ type towerBranchNode struct {
 
 type towerFieldPlan struct {
 	index      int
+	offset     uintptr
+	size       uintptr
 	relational bool
 	many       bool
+	// slice marks a non-relational slice field. Its shadow clone owns a fresh
+	// backing array, so its header always differs bitwise and it must stay out
+	// of the memory segments below.
+	slice bool
+	// targetIDIndex is the field index of Id inside the relation target, so an
+	// identity comparison reads the int directly instead of paying valueID's
+	// Interface round trip per element — a fifth of the flush gate.
+	targetIDIndex int
+}
+
+func (field towerFieldPlan) segmentEligible() bool {
+	return !field.relational && !field.slice
+}
+
+// entityIDFieldIndex caches where Id sits inside a type, so identity checks can
+// read it as an int field instead of boxing the value into an interface.
+var entityIDIndexes sync.Map
+
+func entityIDFieldIndex(typ reflect.Type) int {
+	if cached, found := entityIDIndexes.Load(typ); found {
+		return cached.(int)
+	}
+
+	index := -1
+	if field, found := typ.FieldByName(entityIDField); found && len(field.Index) == 1 && field.Type.Kind() == reflect.Int {
+		index = field.Index[0]
+	}
+
+	entityIDIndexes.Store(typ, index)
+
+	return index
+}
+
+// fieldPointerID reads a relation pointer's target id through the cached field
+// index. It falls back to valueID for the rare shape the cache cannot serve.
+func fieldPointerID(value reflect.Value, idIndex int) (int, bool) {
+	if idIndex < 0 {
+		return valueID(value)
+	}
+
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		return 0, false
+	}
+
+	return int(value.Elem().Field(idIndex).Int()), true
+}
+
+// towerSegmentsEqual compares the scalar runs of two nodes byte for byte. Both
+// values are addressable structs — live rows sit in chunk blocks and shadows in
+// replica blocks — so their base pointers are stable for the duration.
+func towerSegmentsEqual(live, shadow reflect.Value, segments []towerSegment) bool {
+	if len(segments) == 0 {
+		return true
+	}
+
+	liveBase := live.Addr().UnsafePointer()
+	shadowBase := shadow.Addr().UnsafePointer()
+	for _, segment := range segments {
+		liveBytes := unsafe.Slice((*byte)(unsafe.Add(liveBase, segment.offset)), segment.size)
+		shadowBytes := unsafe.Slice((*byte)(unsafe.Add(shadowBase, segment.offset)), segment.size)
+		if !bytes.Equal(liveBytes, shadowBytes) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// towerSegment is one contiguous byte range of scalar fields. Bitwise equality
+// implies semantic equality for every field kind (equal headers mean shared
+// backing), so a segment hit settles the whole run in one comparison; the
+// reverse is not true, and a miss falls back to field-by-field. Padding inside
+// a run only ever produces that safe false positive.
+type towerSegment struct {
+	offset uintptr
+	size   uintptr
 }
 
 type cachedTowerFieldPlan struct {
-	fields []towerFieldPlan
+	fields   []towerFieldPlan
+	segments []towerSegment
 	// equal is non-nil exactly when the whole struct can be settled in one
 	// comparison: the type carries no relation and nothing inside it can be
 	// incomparable at runtime.
@@ -160,6 +251,7 @@ func (tower *Tower) retire(replica *towerReplica) {
 // run on across resets is harmless, and it means a table can hold on to its own
 // counter instead of looking it up by name on every write.
 func resetTower() {
+	resetBranchLocks()
 	projectTower = newTower()
 	towerFieldPlans = sync.Map{}
 	towerWriteLocks = sync.Map{}
@@ -240,6 +332,266 @@ func (replica *towerReplica) synced() bool {
 	return true
 }
 
+// refresh republishes the live replica in place when the committed node set is
+// unchanged — same keys, same live pointers. Every shadow then keeps its
+// address, so blocks, the nodes map and the live map are all reused and a
+// commit that only changed field values allocates nothing per node.
+//
+// Anything that adds or removes a node falls back to rebuild. That is what
+// keeps blocks' never-grow invariant intact: a shadow address is handed to user
+// code inside an UpdateWithin callback and cached in branches, so a block that
+// reallocated would leave both pointing at a copy nobody publishes.
+//
+// The caller holds graphMu.Lock, which excludes every reader of the replica, so
+// mutating the shadows in place cannot race a diff in progress.
+func (tower *Tower) refresh(
+	current *towerReplica,
+	index *committedRelationIndex,
+	epochs map[string]uint64,
+) (bool, error) {
+	if current == nil || len(index.nodes) < len(current.nodes) {
+		return false, nil
+	}
+
+	// A live pointer that changed identity, or a walk key the index lost, is a
+	// replacement or a removal — those still take the full rebuild. The walk
+	// carries the recorded live words, so this needs no separate live map; the
+	// replica used to retain a defensive copy of index.nodes for exactly this,
+	// at 73 B per node.
+	for groupIndex := range current.walk {
+		group := &current.walk[groupIndex]
+		for entryIndex := range group.entries {
+			entry := &group.entries[entryIndex]
+			value, committed := index.nodes[entry.key]
+			if !committed || value.Pointer() != uintptr(entry.liveBase) {
+				return false, nil
+			}
+		}
+	}
+
+	// Committed keys the shadow has never seen are additions; they get fresh
+	// storage below, so existing shadow addresses never move.
+	var added []nodeKey
+	if len(index.nodes) != len(current.nodes) {
+		for key := range index.nodes {
+			if _, known := current.nodes[key]; !known {
+				added = append(added, key)
+			}
+		}
+	}
+
+	// New nodes go into one fresh block per table — never into an existing
+	// block, whose never-grow guarantee is what keeps every published shadow
+	// address stable. Appending a block moves no element of any other block.
+	if len(added) > 0 {
+		grown, blocks := buildTowerShadows(addedTowerNodes(index, added))
+		current.blocks = append(current.blocks, blocks...)
+		for key, shadow := range grown {
+			current.nodes[key] = shadow
+		}
+	}
+
+	// Copy only the nodes that actually differ. Comparison is free and reads
+	// nothing off-heap; the copy is not, because cloneSliceFields gives every
+	// slice field its own backing array. Re-copying an unchanged node allocates
+	// one array per slice field to reproduce bytes that already match.
+	var currentType reflect.Type
+	var plan cachedTowerFieldPlan
+	var err error
+
+	moved := make([]nodeKey, 0, 8)
+	for key, value := range index.nodes {
+		if key.typ != currentType {
+			currentType = key.typ
+			plan, err = towerFields(currentType)
+			if err != nil {
+				return false, err
+			}
+		}
+
+		shadow := current.nodes[key]
+		if towerNodeUnchanged(value.Elem(), shadow.Elem(), plan) {
+			continue
+		}
+
+		shadow.Elem().Set(value.Elem())
+		cloneSliceFields(shadow.Elem())
+		moved = append(moved, key)
+	}
+
+	// An added node compares as unchanged — its shadow was copied from live a
+	// moment ago — but it still needs wiring into the shadow world and a
+	// relation baseline, so it joins the moved set here.
+	moved = append(moved, added...)
+
+	// A node nobody touched keeps its wiring and its relation baseline: refresh
+	// reuses the shadow addresses, so a pointer into an untouched node is still
+	// the right pointer. Rebuilding both for the whole project allocated a
+	// baseline slice per owner and a map entry per node, every time.
+	for _, key := range moved {
+		if err := wireTowerNode(current.nodes, key, current.nodes[key]); err != nil {
+			return false, err
+		}
+
+		if err := snapshotTowerRelationsInto(current.relations, key, current.nodes[key]); err != nil {
+			return false, err
+		}
+	}
+
+	if err := current.refreshWalk(index, moved, added); err != nil {
+		return false, err
+	}
+
+	current.index = index
+
+	// Ownership may have moved between nodes that all still exist, so the cached
+	// branches are the one derived structure a refresh cannot keep.
+	current.branchMu.Lock()
+	current.branches = make(map[nodeKey][]towerBranchNode)
+	current.branchNodes = 0
+	current.branchMu.Unlock()
+
+	current.epochs.Store(&epochs)
+
+	return true, nil
+}
+
+// towerForgetNodes drops deleted nodes from the live replica so the following
+// refresh sees matching node sets. Shadow storage is not reclaimed — the block
+// slots stay allocated until the next full rebuild — because compacting a block
+// would move surviving shadows, and their addresses are what the whole design
+// promises never to move. The caller holds graphMu.Lock.
+func towerForgetNodes(closure map[nodeKey]struct{}) {
+	replica := projectTower.replica.Load()
+	if replica == nil || len(closure) == 0 {
+		return
+	}
+
+	for key := range closure {
+		delete(replica.nodes, key)
+	}
+
+	for relation := range replica.relations {
+		if _, dies := closure[relation.node]; dies {
+			delete(replica.relations, relation)
+		}
+	}
+
+	for groupIndex := range replica.walk {
+		group := &replica.walk[groupIndex]
+		kept := group.entries[:0]
+		for _, entry := range group.entries {
+			if _, dies := closure[entry.key]; !dies {
+				kept = append(kept, entry)
+			}
+		}
+
+		group.entries = kept
+	}
+
+	replica.branchMu.Lock()
+	replica.branches = make(map[nodeKey][]towerBranchNode)
+	replica.branchNodes = 0
+	replica.branchMu.Unlock()
+}
+
+// refreshWalk brings the flat walk in line with a refresh: moved nodes get
+// their relation baselines re-recorded from the post-commit live pointers, and
+// added nodes get entries of their own. Everything else keeps its record — its
+// live words did not move, that is what "not moved" established.
+func (replica *towerReplica) refreshWalk(index *committedRelationIndex, moved, added []nodeKey) error {
+	if len(moved) == 0 && len(added) == 0 {
+		return nil
+	}
+
+	movedSet := make(map[nodeKey]struct{}, len(moved))
+	for _, key := range moved {
+		movedSet[key] = struct{}{}
+	}
+
+	addedSet := make(map[nodeKey]struct{}, len(added))
+	for _, key := range added {
+		addedSet[key] = struct{}{}
+		delete(movedSet, key)
+	}
+
+	for groupIndex := range replica.walk {
+		group := &replica.walk[groupIndex]
+		if len(movedSet) == 0 {
+			break
+		}
+
+		for entryIndex := range group.entries {
+			entry := &group.entries[entryIndex]
+			if _, changed := movedSet[entry.key]; !changed {
+				continue
+			}
+
+			entry.relations = recordWalkRelations(entry.liveBase, group.plan, entry.relations)
+			delete(movedSet, entry.key)
+		}
+	}
+
+	for key := range addedSet {
+		if err := replica.appendWalkEntry(index, key); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (replica *towerReplica) appendWalkEntry(index *committedRelationIndex, key nodeKey) error {
+	for groupIndex := range replica.walk {
+		group := &replica.walk[groupIndex]
+		if group.typ != key.typ {
+			continue
+		}
+
+		group.entries = append(group.entries, newTowerWalkEntry(key, index.nodes[key], replica.nodes[key], group.plan))
+
+		return nil
+	}
+
+	built, err := buildTowerWalk(index, map[nodeKey]reflect.Value{key: index.nodes[key]}, replica.nodes)
+	if err != nil {
+		return err
+	}
+
+	replica.walk = append(replica.walk, built...)
+
+	return nil
+}
+
+// refreshAfterCommit re-points a live replica at the index a commit just
+// published, so the next Flush has a baseline to compare against.
+//
+// It must run after the commit, never before a comparison: a replica built from
+// the current live graph is by construction equal to it, so comparing against
+// one would report "nothing moved" even when the graph had. Here live and
+// committed agree, which is what makes the baseline meaningful.
+//
+// It never builds a replica and never retires one. A commit that changed the
+// node set simply leaves the replica as it was: its epochs are already stale, so
+// synced() sends the next writer to a rebuild, and the flush gate compares
+// index identity, which no longer matches. Retiring here would additionally
+// throw away a replica that a write to an unrelated table had not invalidated.
+//
+// The caller holds graphMu.Lock.
+func (tower *Tower) refreshAfterCommit() {
+	current := tower.replica.Load()
+	if current == nil {
+		return
+	}
+
+	index := committedRelationIndexSnapshot()
+	if index == nil {
+		return
+	}
+
+	_, _ = tower.refresh(current, index, towerParticipantEpochs())
+}
+
 func (tower *Tower) rebuild() (*towerReplica, error) {
 	if err := ensureCommittedOwnership(); err != nil {
 		return nil, err
@@ -268,6 +620,12 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 		return nil, fmt.Errorf("nestory: committed relation index is unavailable")
 	}
 
+	if refreshed, err := tower.refresh(tower.replica.Load(), index, epochs); refreshed || err != nil {
+		committedOwnership.RUnlock()
+
+		return tower.replica.Load(), err
+	}
+
 	liveNodes := make(map[nodeKey]reflect.Value, len(index.nodes))
 	for key, value := range index.nodes {
 		liveNodes[key] = value
@@ -280,7 +638,13 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 	if err := wireTowerNodes(nodes); err != nil {
 		return nil, err
 	}
+
 	relations, err := snapshotTowerRelations(nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	walk, err := buildTowerWalk(index, liveNodes, nodes)
 	if err != nil {
 		return nil, err
 	}
@@ -288,8 +652,9 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 	replica := &towerReplica{
 		nodes:     nodes,
 		blocks:    blocks,
-		live:      liveNodes,
 		relations: relations,
+		index:     index,
+		walk:      walk,
 		branches:  make(map[nodeKey][]towerBranchNode),
 	}
 	replica.epochs.Store(&epochs)
@@ -306,6 +671,15 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 // Nodes go in ascending id, which is the order committedOwnershipKeys sorts a
 // branch into, so diffing walks the array front to back instead of chasing
 // pointers all over the heap.
+func addedTowerNodes(index *committedRelationIndex, added []nodeKey) map[nodeKey]reflect.Value {
+	nodes := make(map[nodeKey]reflect.Value, len(added))
+	for _, key := range added {
+		nodes[key] = index.nodes[key]
+	}
+
+	return nodes
+}
+
 func buildTowerShadows(liveNodes map[nodeKey]reflect.Value) (map[nodeKey]reflect.Value, []reflect.Value) {
 	byTable := make(map[reflect.Type][]nodeKey)
 	for key := range liveNodes {
@@ -331,63 +705,84 @@ func buildTowerShadows(liveNodes map[nodeKey]reflect.Value) (map[nodeKey]reflect
 }
 
 func snapshotTowerRelations(nodes map[nodeKey]reflect.Value) (map[towerRelationKey]towerRelationState, error) {
-	relations := make(map[towerRelationKey]towerRelationState)
+	relations := make(map[towerRelationKey]towerRelationState, len(nodes))
 	for key, node := range nodes {
-		specs, err := relationSpecs(key.typ)
-		if err != nil {
+		if err := snapshotTowerRelationsInto(relations, key, node); err != nil {
 			return nil, err
-		}
-
-		for _, spec := range specs {
-			field := node.Elem().Field(spec.fieldIndex)
-			state := towerRelationState{}
-			if !spec.many {
-				state.one, state.present = valueID(field)
-			} else {
-				baseline := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
-				reflect.Copy(baseline, field)
-				state.many = baseline.Interface()
-			}
-			relations[towerRelationKey{node: key, field: spec.fieldIndex}] = state
 		}
 	}
 
 	return relations, nil
 }
 
-func wireTowerNodes(nodes map[nodeKey]reflect.Value) error {
-	for key, node := range nodes {
-		specs, err := relationSpecs(key.typ)
-		if err != nil {
-			return err
+func snapshotTowerRelationsInto(
+	relations map[towerRelationKey]towerRelationState,
+	key nodeKey,
+	node reflect.Value,
+) error {
+	specs, err := relationSpecs(key.typ)
+	if err != nil {
+		return err
+	}
+
+	for _, spec := range specs {
+		field := node.Elem().Field(spec.fieldIndex)
+		state := towerRelationState{}
+		if !spec.many {
+			state.one, state.present = valueID(field)
+		} else {
+			baseline := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
+			reflect.Copy(baseline, field)
+			state.many = baseline.Interface()
 		}
 
-		for _, spec := range specs {
-			field := node.Elem().Field(spec.fieldIndex)
-			if !spec.many {
-				id, present := valueID(field)
-				if !present {
-					continue
-				}
+		relations[towerRelationKey{node: key, field: spec.fieldIndex}] = state
+	}
 
-				target := nodes[nodeKey{typ: spec.target, id: id}]
-				if target.IsValid() {
-					field.Set(target)
-				}
+	return nil
+}
 
+func wireTowerNodes(nodes map[nodeKey]reflect.Value) error {
+	for key, node := range nodes {
+		if err := wireTowerNode(nodes, key, node); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func wireTowerNode(nodes map[nodeKey]reflect.Value, key nodeKey, node reflect.Value) error {
+	specs, err := relationSpecs(key.typ)
+	if err != nil {
+		return err
+	}
+
+	for _, spec := range specs {
+		field := node.Elem().Field(spec.fieldIndex)
+		if !spec.many {
+			id, present := valueID(field)
+			if !present {
 				continue
 			}
 
-			for position := range field.Len() {
-				id, present := valueID(field.Index(position))
-				if !present {
-					continue
-				}
+			target := nodes[nodeKey{typ: spec.target, id: id}]
+			if target.IsValid() {
+				field.Set(target)
+			}
 
-				target := nodes[nodeKey{typ: spec.target, id: id}]
-				if target.IsValid() {
-					field.Index(position).Set(target)
-				}
+			continue
+		}
+
+		for position := range field.Len() {
+			id, present := valueID(field.Index(position))
+			if !present {
+				continue
+			}
+
+			target := nodes[nodeKey{typ: spec.target, id: id}]
+			if target.IsValid() {
+				field.Index(position).Set(target)
 			}
 		}
 	}
@@ -621,7 +1016,7 @@ func (replica *towerReplica) branchNode(key nodeKey) (towerBranchNode, error) {
 		return towerBranchNode{}, fmt.Errorf("nestory: tower shadow node %s is missing", key)
 	}
 
-	live := replica.live[key]
+	live := replica.index.nodes[key]
 	if !live.IsValid() {
 		return towerBranchNode{}, ErrNotFound
 	}
@@ -681,10 +1076,272 @@ func (replica *towerReplica) branchFor(root nodeKey) ([]towerBranchNode, error) 
 	}
 
 	replica.branchMu.Lock()
+	// Crude but self-healing: past the cap, drop everything and let the hot
+	// roots refill. An entry is 104 B, so the cap holds the cache near 6 MiB
+	// instead of letting a root-rotating workload grow it without limit.
+	if replica.branchNodes+len(branch) > towerBranchCacheLimit {
+		replica.branches = make(map[nodeKey][]towerBranchNode)
+		replica.branchNodes = 0
+	}
+
 	replica.branches[root] = branch
+	replica.branchNodes += len(branch)
 	replica.branchMu.Unlock()
 
 	return branch, nil
+}
+
+// towerBranchCacheLimit bounds the branch cache by cached nodes, not roots:
+// one huge branch and many small ones cost the same memory per node.
+const towerBranchCacheLimit = 64 * 1024
+
+// towerNodeUnchanged compares a live node against its shadow. Relation fields
+// compare by id, not bitwise: they hold shadow pointers on one side and live
+// pointers on the other, so a pointer comparison always differs — but skipping
+// them entirely once left a reordered own slice stale in the shadow, because a
+// membership change is carried by the copy, not by the rewiring. Identity equal
+// means the shadow already points at shadow copies of the right ids.
+func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) bool {
+	if !towerSegmentsEqual(live, shadow, plan.segments) {
+		return false
+	}
+
+	for _, field := range plan.fields {
+		if field.relational {
+			if !sameRelationIdentity(live.Field(field.index), shadow.Field(field.index), field.many, field.targetIDIndex) {
+				return false
+			}
+
+			continue
+		}
+
+		if field.slice && !relationFieldEqual(live.Field(field.index), shadow.Field(field.index)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// towerWalkRelation is the live-side baseline of one relation field: the exact
+// pointer words it held when the walk was last recorded. Word equality implies
+// the edge set is unchanged — ids are immutable here, a mutated Id is a key
+// field and forces the full rebuild — and a mismatch only ever over-reports,
+// which the delta then settles exactly.
+type towerWalkRelation struct {
+	offset   uintptr
+	many     bool
+	one      unsafe.Pointer
+	elements []unsafe.Pointer
+}
+
+type towerWalkEntry struct {
+	key        nodeKey
+	liveBase   unsafe.Pointer
+	shadowBase unsafe.Pointer
+	relations  []towerWalkRelation
+}
+
+// towerTypeWalk groups entries by type so the plan and key layout resolve once
+// per table instead of once per node.
+type towerTypeWalk struct {
+	typ       reflect.Type
+	plan      cachedTowerFieldPlan
+	keyFields []towerFieldPlan
+	entries   []towerWalkEntry
+}
+
+type towerSliceWords struct {
+	data     unsafe.Pointer
+	len, cap int
+}
+
+func liveManyWords(base unsafe.Pointer, offset uintptr) []unsafe.Pointer {
+	header := (*towerSliceWords)(unsafe.Add(base, offset))
+	if header.data == nil || header.len == 0 {
+		return nil
+	}
+
+	return unsafe.Slice((*unsafe.Pointer)(header.data), header.len)
+}
+
+// recordWalkRelations snapshots the live pointer words of every relation field.
+func recordWalkRelations(base unsafe.Pointer, plan cachedTowerFieldPlan, buf []towerWalkRelation) []towerWalkRelation {
+	buf = buf[:0]
+	for _, field := range plan.fields {
+		if !field.relational {
+			continue
+		}
+
+		record := towerWalkRelation{offset: field.offset, many: field.many}
+		if field.many {
+			record.elements = append([]unsafe.Pointer(nil), liveManyWords(base, field.offset)...)
+		} else {
+			record.one = *(*unsafe.Pointer)(unsafe.Add(base, field.offset))
+		}
+
+		buf = append(buf, record)
+	}
+
+	return buf
+}
+
+func newTowerWalkEntry(key nodeKey, live, shadow reflect.Value, plan cachedTowerFieldPlan) towerWalkEntry {
+	entry := towerWalkEntry{
+		key:        key,
+		liveBase:   live.UnsafePointer(),
+		shadowBase: shadow.UnsafePointer(),
+	}
+	entry.relations = recordWalkRelations(entry.liveBase, plan, nil)
+
+	return entry
+}
+
+// buildTowerWalk lays the replica's node set out as a flat, type-grouped list.
+// The flush gate used to pay two nodeKey map operations per node per flush —
+// about a sixth of its whole cost — just to find the pair this list simply
+// stores.
+func buildTowerWalk(
+	index *committedRelationIndex,
+	live map[nodeKey]reflect.Value,
+	shadows map[nodeKey]reflect.Value,
+) ([]towerTypeWalk, error) {
+	groups := make(map[reflect.Type]*towerTypeWalk)
+	for key, liveValue := range live {
+		group, found := groups[key.typ]
+		if !found {
+			plan, err := towerFields(key.typ)
+			if err != nil {
+				return nil, err
+			}
+
+			group = &towerTypeWalk{typ: key.typ, plan: plan}
+			names := index.targetFields[key.typ]
+			for _, field := range plan.fields {
+				if field.relational {
+					continue
+				}
+
+				if _, lookup := names[key.typ.Field(field.index).Name]; lookup {
+					group.keyFields = append(group.keyFields, field)
+				}
+			}
+
+			groups[key.typ] = group
+		}
+
+		group.entries = append(group.entries, newTowerWalkEntry(key, liveValue, shadows[key], group.plan))
+	}
+
+	walk := make([]towerTypeWalk, 0, len(groups))
+	for _, group := range groups {
+		walk = append(walk, *group)
+	}
+
+	return walk, nil
+}
+
+// graphMovedNodes reports which committed nodes no longer match the shadow in
+// any way the relation index can see: a relation field compared by id, or a
+// lookup-key field compared by value. keyChanged is set when a lookup-key field
+// moved — the committed target index maps that field's old value to the node,
+// so only the full rebuild can fix it; the delta path must refuse.
+//
+// Flush needs this because Unsafe cannot tell it what changed: the contract is
+// exclusive access until Flush completes, not re-acquiring every pointer, so a
+// caller may mutate through a pointer it kept since creation. The shadow *is*
+// the last committed state, so comparing derives the change set instead of
+// trusting a declaration. Scalar fields outside the lookup keys are ignored:
+// the index does not hold them, so they cannot stale it.
+func (replica *towerReplica) graphMovedNodes() (moved []nodeKey, keyChanged bool, err error) {
+	for groupIndex := range replica.walk {
+		group := &replica.walk[groupIndex]
+		for entryIndex := range group.entries {
+			entry := &group.entries[entryIndex]
+			changed := false
+
+			// Relation fields compare as raw pointer words against the recorded
+			// baseline: equality proves the edges unchanged, and a mismatch only
+			// over-reports — the delta settles what actually moved.
+			for _, record := range entry.relations {
+				if record.many {
+					current := liveManyWords(entry.liveBase, record.offset)
+					if len(current) != len(record.elements) {
+						changed = true
+						break
+					}
+
+					for position := range current {
+						if current[position] != record.elements[position] {
+							changed = true
+							break
+						}
+					}
+
+					if changed {
+						break
+					}
+
+					continue
+				}
+
+				if *(*unsafe.Pointer)(unsafe.Add(entry.liveBase, record.offset)) != record.one {
+					changed = true
+					break
+				}
+			}
+
+			// Key fields compare bitwise against the shadow first; only a byte
+			// mismatch pays an exact reflect comparison, because a false
+			// keyChanged would cost a full rebuild — a string key with equal
+			// content in a different backing must not trigger one.
+			for _, field := range group.keyFields {
+				liveBytes := unsafe.Slice((*byte)(unsafe.Add(entry.liveBase, field.offset)), field.size)
+				shadowBytes := unsafe.Slice((*byte)(unsafe.Add(entry.shadowBase, field.offset)), field.size)
+				if bytes.Equal(liveBytes, shadowBytes) {
+					continue
+				}
+
+				live := reflect.NewAt(group.typ, entry.liveBase).Elem()
+				shadow := reflect.NewAt(group.typ, entry.shadowBase).Elem()
+				if !relationFieldEqual(live.Field(field.index), shadow.Field(field.index)) {
+					changed = true
+					keyChanged = true
+					break
+				}
+			}
+
+			if changed {
+				moved = append(moved, entry.key)
+			}
+		}
+	}
+
+	return moved, keyChanged, nil
+}
+
+// sameRelationIdentity compares two relation fields by the ids they point at.
+func sameRelationIdentity(live, shadow reflect.Value, many bool, idIndex int) bool {
+	if !many {
+		liveID, livePresent := fieldPointerID(live, idIndex)
+		shadowID, shadowPresent := fieldPointerID(shadow, idIndex)
+
+		return livePresent == shadowPresent && (!livePresent || liveID == shadowID)
+	}
+
+	if live.Len() != shadow.Len() {
+		return false
+	}
+
+	for index := range live.Len() {
+		liveID, livePresent := fieldPointerID(live.Index(index), idIndex)
+		shadowID, shadowPresent := fieldPointerID(shadow.Index(index), idIndex)
+		if livePresent != shadowPresent || (livePresent && liveID != shadowID) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (replica *towerReplica) diffFields(node towerBranchNode, plan cachedTowerFieldPlan) []int {
@@ -696,19 +1353,26 @@ func (replica *towerReplica) diffFields(node towerBranchNode, plan cachedTowerFi
 	before := node.live.Elem()
 	after := node.shadow.Elem()
 
+	// One comparison per scalar run settles the common case; a miss only means
+	// the per-field loop below has to name which fields moved.
+	scalarsEqual := towerSegmentsEqual(before, after, plan.segments)
+
 	var changed []int
 	for _, field := range plan.fields {
-		left := before.Field(field.index)
-		right := after.Field(field.index)
 		var equal bool
-		if field.relational {
+		switch {
+		case field.relational:
 			equal = replica.relationEqual(
-				right,
+				after.Field(field.index),
 				field,
 				replica.relations[towerRelationKey{node: key, field: field.index}],
 			)
-		} else {
-			equal = relationFieldEqual(left, right)
+		case field.slice:
+			equal = relationFieldEqual(before.Field(field.index), after.Field(field.index))
+		case scalarsEqual:
+			continue
+		default:
+			equal = relationFieldEqual(before.Field(field.index), after.Field(field.index))
 		}
 
 		if !equal {
@@ -725,7 +1389,7 @@ func (replica *towerReplica) relationEqual(
 	baseline towerRelationState,
 ) bool {
 	if !field.many {
-		id, present := valueID(value)
+		id, present := fieldPointerID(value, field.targetIDIndex)
 		return present == baseline.present && (!present || id == baseline.one)
 	}
 
@@ -779,22 +1443,44 @@ func towerFields(typ reflect.Type) (cachedTowerFieldPlan, error) {
 	}
 
 	fields := make([]towerFieldPlan, typ.NumField())
+	var segments []towerSegment
 	for index := range typ.NumField() {
-		field := towerFieldPlan{index: index}
-		if spec, relational := specs[typ.Field(index).Name]; relational {
+		structField := typ.Field(index)
+		field := towerFieldPlan{
+			index:         index,
+			offset:        structField.Offset,
+			size:          structField.Type.Size(),
+			targetIDIndex: -1,
+		}
+		if spec, relational := specs[structField.Name]; relational {
 			field.relational = true
 			field.many = spec.many
+			field.targetIDIndex = entityIDFieldIndex(spec.target)
+		} else if structField.Type.Kind() == reflect.Slice {
+			field.slice = true
+		} else {
+			// Extend the current segment or open a new one. Spanning the padding
+			// between two scalar fields is deliberate: comparing it can only
+			// produce a safe false positive.
+			end := structField.Offset + structField.Type.Size()
+			if index > 0 && len(segments) > 0 && fields[index-1].segmentEligible() {
+				segments[len(segments)-1].size = end - segments[len(segments)-1].offset
+			} else {
+				segments = append(segments, towerSegment{offset: structField.Offset, size: end - structField.Offset})
+			}
 		}
+
 		fields[index] = field
 	}
 
 	// equal is only usable on the struct as a whole, so a type holding a
 	// relation is excluded: those fields compare by id against the baseline,
 	// not by the pointer the shadow happens to carry.
-	entry := cachedTowerFieldPlan{fields: fields}
+	entry := cachedTowerFieldPlan{fields: fields, segments: segments}
 	if comparator, found := towerComparators.Load(typ); found && len(specs) == 0 {
 		entry.equal = comparator.(towerComparator)
 	}
+
 	towerFieldPlans.Store(typ, entry)
 	return entry, nil
 }
@@ -862,6 +1548,9 @@ func commitTowerScalarChanges(resources []touchedResource) error {
 	}()
 
 	lockedResources := transactionResourceLocks(resources, nil, nil)
+	releaseBranches := lockTouchedBranches(lockedResources)
+	defer releaseBranches()
+
 	for _, resource := range lockedResources {
 		committerFor(resource.dbName).lockResource(resource.id)
 	}

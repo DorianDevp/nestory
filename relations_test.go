@@ -394,6 +394,7 @@ func resetRegistries() {
 	baseRegistry = make(map[string]any)
 	relationParticipantsMu.Lock()
 	relationParticipants = make(map[reflect.Type]struct{})
+	relationParticipantsPresent.Store(false)
 	relationParticipantsMu.Unlock()
 	engine = newEngine()
 	resetCommittedOwnership()

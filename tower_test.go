@@ -514,3 +514,212 @@ func TestTowerCallbackDoesNotBlockCanonicalView(t *testing.T) {
 		}
 	})
 }
+
+// TestTowerRefreshSeesReorderedChildren pins the refresh path down on a change
+// that lives only in a relation field. A detached update that reorders an own
+// slice leaves every scalar field of the owner untouched, so a refresh that
+// skips relation fields when deciding what moved would keep the shadow's old
+// slice — and the next callback would read stale children.
+func TestTowerRefreshSeesReorderedChildren(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		ownerDB, _, owner, _ := seedTowerBranch(t)
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			shadow.Name = "warm"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		branch, err := ownerDB.Get(owner.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		branch.Children[0], branch.Children[1] = branch.Children[1], branch.Children[0]
+		if err := ownerDB.Update(branch); err != nil {
+			t.Fatal(err)
+		}
+
+		first := owner.Children[0].Value
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			if got := shadow.Children[0].Value; got != first {
+				t.Fatalf("shadow.Children[0].Value = %d, want %d (stale shadow slice)", got, first)
+			}
+
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestUnsafeCreateFlushUsesShadowDelta proves the create flush takes the delta
+// route, not just that the result looks right: publishAndRewire nils the
+// committed model, while the full rebuild stores a fresh one, so the nil is a
+// fingerprint of the path taken. The shadow must then serve the new child from
+// its own world, wired and diffable.
+func TestUnsafeCreateFlushUsesShadowDelta(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		ownerDB, childDB, owner, _ := seedTowerBranch(t)
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			shadow.Name = "warm"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		child := &relationBenchChild{OwnerID: owner.Id, Value: 30}
+		childDB.Unsafe().Create(child)
+		owner.Children = append(owner.Children, child)
+		if err := childDB.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		if committedRelationModel() != nil {
+			t.Fatal("create flush rebuilt the full model instead of publishing a delta")
+		}
+
+		childKey := nodeKey{typ: reflect.TypeFor[relationBenchChild](), id: child.Id}
+		ownerKey := nodeKey{typ: reflect.TypeFor[relationBenchOwner](), id: owner.Id}
+		if got := committedRelationIndexSnapshot().owners[childKey]; got != ownerKey {
+			t.Fatalf("owners[%v] = %v, want %v", childKey, got, ownerKey)
+		}
+
+		if err := ownerDB.UpdateWithin(owner.Id, func(shadow *relationBenchOwner) error {
+			if len(shadow.Children) != 3 {
+				t.Fatalf("shadow sees %d children, want 3", len(shadow.Children))
+			}
+
+			last := shadow.Children[2]
+			if last == child {
+				t.Fatal("shadow hands out the live pointer instead of a shadow copy")
+			}
+
+			if last.Value != 30 {
+				t.Fatalf("shadow child Value = %d, want 30", last.Value)
+			}
+
+			shadow.Name = "after-create"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if owner.Name != "after-create" {
+			t.Fatalf("owner.Name = %q, want after-create", owner.Name)
+		}
+	})
+}
+
+// TestUnsafeDeleteFlushUsesShadowDelta covers the delete route end to end: a
+// deleted document must vanish from the surviving project's own slice (which
+// the caller deliberately left dangling), from the tier's computed inverse
+// view, and from the committed index — all without publishing a new index,
+// which is the fingerprint of the delta path. A borrowed tier must still
+// refuse deletion through the full path's canonical error.
+func TestUnsafeDeleteFlushUsesShadowDelta(t *testing.T) {
+	isolatedRelations(t, func(t *testing.T) {
+		graph := buildRelationGraph(t, 2)
+
+		if err := graph.workspaces.UpdateWithin(graph.rootIDs[0], func(workspace *memWorkspace) error {
+			workspace.Name = "warm"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		indexBefore := committedRelationIndexSnapshot()
+
+		// The canonical row, not the heap object the fixture built: db.add copies
+		// the value into the chunk, so only the canonical slice is maintained.
+		project, err := Open[memProject]().Unsafe().Get(graph.anyProject.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		doomed := project.Documents[0]
+		tier := doomed.Tier
+
+		if err := graph.documents.Unsafe().Delete(doomed.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := graph.documents.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		if committedRelationIndexSnapshot() != indexBefore {
+			t.Fatal("delete flush published a new index instead of a delta")
+		}
+
+		for _, document := range project.Documents {
+			if document == doomed {
+				t.Fatal("surviving project still owns the deleted document")
+			}
+		}
+
+		for _, document := range tier.Documents {
+			if document == doomed {
+				t.Fatal("tier's inverse view still lists the deleted document")
+			}
+		}
+
+		if _, err := graph.documents.Unsafe().Get(doomed.Id); err == nil {
+			t.Fatal("deleted document is still served")
+		}
+
+		assertCommittedIndexConsistent(t)
+
+		// The shadow must have forgotten it too.
+		if err := graph.workspaces.UpdateWithin(graph.rootIDs[0], func(workspace *memWorkspace) error {
+			for _, shadowProject := range workspace.Projects {
+				for _, document := range shadowProject.Documents {
+					if document.Id == doomed.Id {
+						t.Fatal("shadow still holds the deleted document")
+					}
+				}
+			}
+
+			workspace.Name = "after-delete"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// A borrowed tier vetoes deletion; the fallback must surface the
+		// canonical error and leave the index consistent.
+		tierDB := Open[memTier]()
+		if err := tierDB.Unsafe().Delete(tier.Id); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := tierDB.Unsafe().Flush(); !errors.Is(err, ErrDeleteRestricted) {
+			t.Fatalf("borrowed tier deletion error = %v, want ErrDeleteRestricted", err)
+		}
+
+		tierDB.resetDeleteQueue()
+		assertCommittedIndexConsistent(t)
+
+		// Cascade: deleting a workspace takes its projects, documents and label.
+		before := len(committedRelationIndexSnapshot().nodes)
+		if err := graph.workspaces.Unsafe().Delete(graph.rootIDs[1]); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := graph.workspaces.Unsafe().Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		// A unit is 10 nodes, minus the document this test already deleted:
+		// anyProject belongs to the last workspace, which is the one cascading.
+		after := len(committedRelationIndexSnapshot().nodes)
+		if before-after != 9 {
+			t.Fatalf("cascade removed %d nodes, want 9", before-after)
+		}
+
+		assertCommittedIndexConsistent(t)
+	})
+}

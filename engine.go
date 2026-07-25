@@ -109,6 +109,22 @@ func committerFor(dbName string) committer {
 	return baseRegistry[dbName].(committer)
 }
 
+// committersByType resolves a committer from the type itself. The name-keyed
+// path costs a reflect metadata parse plus a string map lookup, and View pays
+// it twice per node in an ownership branch — half the cost of reading one.
+var committersByType sync.Map
+
+func committerForType(typ reflect.Type) committer {
+	if cached, found := committersByType.Load(typ); found {
+		return cached.(committer)
+	}
+
+	resolved := committerFor(typ.Name())
+	committersByType.Store(typ, resolved)
+
+	return resolved
+}
+
 // transactionEngine sits above every DB, owns the live contracts and serialises commits.
 // It stays generic — reaches a type's resources only through baseRegistry.
 type transactionEngine struct {
@@ -384,6 +400,9 @@ func (en *transactionEngine) commit(tx *transactionState) error {
 	}
 
 	lockedResources := transactionResourceLocks(touchedResources, createdResources, stagedDeletes)
+	releaseBranches := lockTouchedBranches(lockedResources)
+	defer releaseBranches()
+
 	for _, resource := range lockedResources {
 		committerFor(resource.dbName).lockResource(resource.id)
 	}
@@ -707,6 +726,11 @@ func bindRelationModelToLiveNodes(model *relationModel, resources []touchedResou
 
 func (en *transactionEngine) commitSingleWrite(tx *transactionState, resource touchedResource) error {
 	committer := committerFor(resource.dbName)
+	releaseBranch := lockTouchedBranches([]transactionResourceLock{
+		{dbName: resource.dbName, id: resource.id},
+	})
+	defer releaseBranch()
+
 	committer.lockResource(resource.id)
 	defer committer.unlockResource(resource.id)
 
@@ -1109,7 +1133,7 @@ func prepareTransactionRelationState(
 		}
 
 		return transactionRelationState{
-			nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields),
+			nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields, committedSizeHints().targets),
 			targetFields: fields, rebuild: true,
 		}, nil
 	}
@@ -1131,7 +1155,7 @@ func prepareTransactionRelationState(
 			}
 
 			return transactionRelationState{
-				committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields),
+				committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, fields, committedSizeHints().targets),
 				targetFields: fields, rebuild: true,
 			}, nil
 		}
@@ -1139,7 +1163,7 @@ func prepareTransactionRelationState(
 
 	if relationTargetKeysChanged(overrides, committed.nodes, committed.targetFields) {
 		return transactionRelationState{
-			committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, committed.targetFields),
+			committed: committed, nodes: nodes, targets: buildRelationTargetIndexFromFields(nodes, committed.targetFields, len(committed.targets)),
 			targetFields: committed.targetFields, rebuild: true,
 		}, nil
 	}
