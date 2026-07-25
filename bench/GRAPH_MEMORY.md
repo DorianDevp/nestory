@@ -333,30 +333,75 @@ resident graph from 146.5 to 168.0 MiB, because both maps are keyed by something
 far less numerous than the hint. Only `incoming`, which really does take one
 entry per node, keeps its hint.
 
+**Steps 9-10 — size every rebuilt map from the previous rebuild.** Each
+collection the flush rebuilds lands within a few entries of the size it had last
+time, so `committedSizes` records those counts at publication and the next
+rebuild sizes from them. A hintless map of this size pays about fifteen rehashes,
+each allocating a larger table and abandoning the old one.
+
+The hints travel as parameters rather than being read from `committedOwnership`:
+`buildRelationTargetIndexFromFields` runs under `committedOwnership.Lock` on one
+path, and Go's `RWMutex` is not reentrant. The first version fetched them inside
+that function and deadlocked the whole suite.
+
+| at 100,003 nodes | baseline | now |
+|---|---:|---:|
+| graph alone | 202.8 MiB | **146.5 MiB** |
+| with Tower replica | 243.3 MiB | **187.1 MiB** |
+| flush churn | 543 MB | **241 MB** |
+| mixed-API, peak | 71.2 MiB | **40.3 MiB** |
+| insert-then-write, peak | 589.3 MiB | **302.0 MiB** |
+| peak as a share of the base | 242% | **161%** |
+
 ### Where this stopped, against the stated target
 
 The target is an increment of at most 50% of the live base. The measured
-increment is **188%**, so it is not met, and the remaining gap is a factor of
-3.8.
+increment is **161%**, so it is not met.
 
-Every remaining allocation site is a consequence of one decision:
-`flushRelations` builds a complete `relationModel` and a complete
-`committedRelationIndex` on every call. After eight steps no single site
-dominates — `recordResolvedRelation`, `indexRelationFields`,
-`incomingCounts.increment`, `indexRelationNodeTargets` and `addGraphNode` are all
-between 8% and 19% — which is what running out of representation-level wins looks
-like.
+The profile now says why, and it is a different answer than three steps ago.
+`buildCommittedRelationIndex` and `buildRelationModelFromTargets` are the top two
+sites and their cost is **flat**, not cumulative: with every map sized correctly,
+each is a single allocation of exactly the table it needs. The remaining 241 MB
+per flush is not waste around the structures — it is the structures. Ten steps of
+representation work have reached the floor of the current design.
 
-The path forward is identified and needs no API change. The transaction engine
-already has a fully incremental route: `buildRelationCreateIndexDelta` produces a
-`relationIndexDelta` and `publishAndRewire` publishes it, which is why a
-transactional scalar write costs a flat 8.7 kB at every graph size.
-`Unsafe().Flush()` never enters it. The obstacle is that the delta needs to know
-which nodes changed, and `Unsafe` hands out raw pointers through `Unsafe().Get()`
-and `Unsafe().All()` without recording anything. Those two call sites are the
-complete mutation surface, so recording the keys they hand out — and falling back
-to the full rebuild after `All()` — would let `Flush` reuse the engine's existing,
-already-tested delta path rather than a new validator.
+Below that floor sits one decision: `flushRelations` rebuilds a complete
+`relationModel` and a complete `committedRelationIndex` on every call.
+
+### Why the obvious shortcut is unsound
+
+The transaction engine already has the incremental route —
+`buildRelationCreateIndexDelta` plus `publishAndRewire`, which is why a
+transactional scalar write costs a flat 8.7 kB at every graph size. Routing
+`Unsafe().Flush()` into it needs the set of nodes that changed, and the tempting
+implementation is to record the keys handed out by `Unsafe().Get()` and
+`Unsafe().All()`.
+
+That is not sound, and this profile's own fixture proves it:
+
+```go
+graph.documents.Unsafe().Create(document)
+graph.anyProject.Documents = append(graph.anyProject.Documents, document)
+```
+
+`anyProject` is a pointer kept since the graph was built. An existing node's
+relation slice is mutated with no `Unsafe().Get()` anywhere, which is exactly
+what the contract permits — *the caller must provide exclusive access until
+Flush completes*, not *the caller must re-acquire each pointer*. Any tracking
+scheme misses this, and a delta built from an incomplete change set publishes a
+stale index.
+
+So there are two ways down, and they differ in kind:
+
+1. **Rescan without rebuilding.** Keep the O(graph) walk the contract requires,
+   but compare each node's relation fields against the committed index and
+   allocate only for the ones that differ. Sound under the current contract,
+   entirely internal, and a substantial piece of work: it is a new consumer of
+   the validation logic rather than a change of representation.
+2. **Make `Unsafe` declare its writes**, the way `Tracked().UpdateWithin` already
+   does for the Tower. This makes tracking sound and lets `Flush` reuse the
+   engine's existing, tested delta path — but it changes the `Unsafe` contract,
+   which is user-facing.
 
 ## Failure modes this architecture permits
 
