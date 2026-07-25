@@ -36,6 +36,11 @@ type towerReplica struct {
 	blocks    []reflect.Value
 	live      map[nodeKey]reflect.Value
 	relations map[towerRelationKey]towerRelationState
+	// index is the committed index this replica's relation baseline was taken
+	// from. Identity against the published index is a stronger statement than
+	// synced(): it survives an epoch bump that has not changed the graph, which
+	// is exactly the case Flush needs to recognise.
+	index *committedRelationIndex
 
 	// branchMu guards branches, the only part of a published replica that
 	// still fills in lazily.
@@ -268,8 +273,28 @@ func (tower *Tower) refresh(
 		}
 	}
 
+	// Copy only the nodes that actually differ. Comparison is free and reads
+	// nothing off-heap; the copy is not, because cloneSliceFields gives every
+	// slice field its own backing array. Re-copying an unchanged node allocates
+	// one array per slice field to reproduce bytes that already match.
+	var currentType reflect.Type
+	var plan cachedTowerFieldPlan
+	var err error
+
 	for key, value := range index.nodes {
+		if key.typ != currentType {
+			currentType = key.typ
+			plan, err = towerFields(currentType)
+			if err != nil {
+				return false, err
+			}
+		}
+
 		shadow := current.nodes[key]
+		if towerNodeUnchanged(value.Elem(), shadow.Elem(), plan) {
+			continue
+		}
+
 		shadow.Elem().Set(value.Elem())
 		cloneSliceFields(shadow.Elem())
 	}
@@ -284,6 +309,7 @@ func (tower *Tower) refresh(
 	}
 
 	current.relations = relations
+	current.index = index
 
 	// Ownership may have moved between nodes that all still exist, so the cached
 	// branches are the one derived structure a refresh cannot keep.
@@ -352,6 +378,7 @@ func (tower *Tower) rebuild() (*towerReplica, error) {
 		blocks:    blocks,
 		live:      liveNodes,
 		relations: relations,
+		index:     index,
 		branches:  make(map[nodeKey][]towerBranchNode),
 	}
 	replica.epochs.Store(&epochs)
@@ -747,6 +774,65 @@ func (replica *towerReplica) branchFor(root nodeKey) ([]towerBranchNode, error) 
 	replica.branchMu.Unlock()
 
 	return branch, nil
+}
+
+// towerNodeUnchanged compares a live node against its shadow, ignoring relation
+// fields: those hold shadow pointers on one side and live pointers on the other,
+// so they always differ bitwise and wireTowerNodes rebuilds them regardless.
+func towerNodeUnchanged(live, shadow reflect.Value, plan cachedTowerFieldPlan) bool {
+	for _, field := range plan.fields {
+		if field.relational {
+			continue
+		}
+
+		if !relationFieldEqual(live.Field(field.index), shadow.Field(field.index)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// relationsDiverged reports whether any live node's relation fields still match
+// the state this replica captured at the last commit.
+//
+// Flush needs to know which nodes changed, and Unsafe cannot tell it: the
+// contract is that the caller holds exclusive access until Flush completes, not
+// that it re-acquires every pointer, so a caller may mutate through a pointer it
+// kept since creation. Recording what Unsafe.Get hands out would miss exactly
+// that. The shadow does not need to be told — it *is* the last committed state,
+// so comparing against it derives the answer instead of trusting a declaration.
+//
+// It allocates nothing: the walk is map iteration plus the same comparisons the
+// branch diff already uses.
+func (replica *towerReplica) relationsDiverged() (bool, error) {
+	var currentType reflect.Type
+	var plan cachedTowerFieldPlan
+	var err error
+
+	for key, live := range replica.live {
+		if key.typ != currentType {
+			currentType = key.typ
+			plan, err = towerFields(currentType)
+			if err != nil {
+				return false, err
+			}
+		}
+
+		value := live.Elem()
+		for _, field := range plan.fields {
+			if !field.relational {
+				continue
+			}
+
+			baseline := replica.relations[towerRelationKey{node: key, field: field.index}]
+			if !replica.relationEqual(value.Field(field.index), field, baseline) {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }
 
 func (replica *towerReplica) diffFields(node towerBranchNode, plan cachedTowerFieldPlan) []int {
