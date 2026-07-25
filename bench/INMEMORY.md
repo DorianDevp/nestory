@@ -14,12 +14,12 @@ durability, while nestory keeps its WAL, so every ratio in this file is tilted
 > re-run in the same session even though it has no separate memory mode — it
 > only has one.
 >
-> **The tmpfs caveat.** `/tmp` on this machine is tmpfs, and every benchmark
-> tempdir lives there — so nestory's "durable" WAL fsync lands in RAM, not on a
-> disk platter. This makes the in-memory comparison *more* level (everyone
-> ultimately writes to RAM), but it means nestory's write numbers here should
-> not be quoted as disk-durable throughput. The same caveat applies to every
-> durable number in `COMPARISON.md`.
+> **The tmpfs caveat — since measured, and it is not a footnote.** `/tmp` here
+> is tmpfs, so nestory's "durable" fsync lands in RAM. `REVIEW.md` re-ran the
+> writes on a real NVMe: a point write costs **6.46 ms, not 2.80 µs**, and
+> nestory falls from first to **fourth of five** durable engines. Read every
+> write number below as *engine overhead with the device removed*. The read and
+> scan numbers are unaffected.
 
 ## Environment
 
@@ -119,13 +119,12 @@ way.
 
 ## How to read this — the honest caveats
 
-1. **nestory is the only durable entrant.** Every competitor here was stripped
-   of persistence; nestory kept its WAL and fsync. It wins three of four
-   workloads anyway, and loses the fourth by 16% to an engine that dropped
-   durability to get there.
-2. **tmpfs blunts the durability edge.** The fsync lands in RAM on this
-   machine, so nestory's write cost here is a lower bound on what a real disk
-   would show — as is every durable number in `COMPARISON.md`.
+1. **nestory is the only durable entrant** — but on tmpfs that costs it almost
+   nothing, which is why it appears to win three of four workloads. On a real
+   device (`REVIEW.md`) its unbatched durable write is 2,300× slower and four
+   engines beat it. Batched writes, reads and scans keep their standing.
+2. **The write tables measure Go-side overhead, not durability.** Quote them as
+   that, or quote `REVIEW.md` instead.
 3. **gob is a harness choice.** Badger, BuntDB and Redis store gob blobs; a
    leaner codec would cut their read and scan costs, though not the per-read
    allocation shape.
@@ -144,7 +143,12 @@ about the disk.** SQLite's read cost is SQL execution, the KV stores' cost is
 value encoding, Redis's cost is the network hop. nestory's model — live
 pointers, no serialization boundary, contiguous storage — is faster in RAM than
 engines built for RAM: 7.5× go-memdb on reads, 1.9× on batch insert, 1.2× on
-scans, and 357 k durable writes/s against engines doing non-durable ones.
+scans.
+
+The write claim that used to sit here — "357 k durable writes/s" — was an
+artifact of tmpfs and is withdrawn; see `REVIEW.md` for what the same benchmark
+does on a real disk, and for the ownership-graph comparison that this flat
+record was never going to show.
 
 ## Reproduce
 

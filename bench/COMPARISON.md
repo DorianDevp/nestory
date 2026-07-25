@@ -165,8 +165,11 @@ protocol, not Go-side garbage. Reading the two columns together is the point —
 neither alone tells you what an engine does.
 
 Nestory appends and fsyncs one compact WAL frame before publishing the in-memory
-update. On this filesystem it beats every durable comparator in the point-write
-workload. go-memdb remains a non-durable reference floor.
+update. **On this filesystem** it beats every durable comparator — and that
+qualifier is doing all the work: `/tmp` is tmpfs, so the fsync never reaches a
+device. Re-measured on a real NVMe (`REVIEW.md`), this table's ordering
+inverts and nestory places fourth of five. What this column actually ranks is
+Go-side write overhead. go-memdb remains a non-durable reference floor.
 
 ## Durable structural graph mutation — µs/op (lower = better)
 
