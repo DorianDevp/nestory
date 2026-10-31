@@ -27,7 +27,7 @@ func (db *DB[T]) chunkDir() string { return chunkDirFor(db.name) }
 // inflate run in parallel; assembly is sequential to keep file index == chunk index.
 func loadStore[T Entity]() (*chunkStore[T], error) {
 	creator := &dbCreator{}
-	store := newChunkStore[T]()
+	store := &chunkStore[T]{}
 
 	rowType := creator.createSchemaStruct(*new(T)).Type()
 	sliceType := reflect.SliceOf(rowType)
@@ -94,13 +94,51 @@ func loadStore[T Entity]() (*chunkStore[T], error) {
 		return nil, terr
 	}
 
-	walRows = append(walRows, transactionRows...)
-
-	if err := applyRecoveredRows(store, creator, sliceType, walRows); err != nil {
+	if err := applyRecoveredRows(store, creator, sliceType, mergeLegacyWAL(transactionRows, walRows)); err != nil {
 		return nil, err
 	}
 
+	// The highest id ever handed out, deleted rows included, so that a new
+	// row never takes the id of one that is gone: something may still point
+	// at that id, and would silently start pointing at the newcomer.
+	store.highWater = readHighWater(dir)
+	for _, rows := range [][]recoveredRow{walRows, transactionRows} {
+		for _, row := range rows {
+			store.highWater = max(store.highWater, row.id)
+		}
+	}
+
 	return store, nil
+}
+
+// mergeLegacyWAL orders what the two logs recovered. New commits only ever go
+// to the shared log, so a table's own wal.log only holds rows from before that
+// change, whose order against the shared log was never recorded.
+//
+// The shared log is taken first and the table's own after it: a table-only
+// commit was typically an edit of something a cross-table transaction had
+// created, and replaying the creation last reverted the edit and brought back
+// what had been deleted. A delete in the shared log still wins over any older
+// row of the table's own. Materialized values that cross-table transactions
+// kept up to date can come out stale by this order; the application
+// recomputes those, and Checkpoint then retires the legacy logs for good.
+func mergeLegacyWAL(transactionRows, walRows []recoveredRow) []recoveredRow {
+	if len(walRows) == 0 {
+		return transactionRows
+	}
+	final := map[int]bool{} // id -> deleted, as the shared log leaves it
+	for _, row := range transactionRows {
+		final[row.id] = row.deleted
+	}
+	out := make([]recoveredRow, 0, len(transactionRows)+len(walRows))
+	out = append(out, transactionRows...)
+	for _, row := range walRows {
+		if deleted, seen := final[row.id]; seen && deleted && !row.deleted {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func applyRecoveredRows[T Entity](store *chunkStore[T], creator *dbCreator, sliceType reflect.Type, rows []recoveredRow) error {
@@ -218,6 +256,12 @@ func decodeSlice(path string, sliceType reflect.Type) (reflect.Value, error) {
 // are skipped, the win over a whole-file rewrite. Assumes no commit is running
 // concurrently (admin-only, like Flush).
 func (db *DB[T]) save() error {
+	// Written with every save, because a save can empty the log that was
+	// the only other record of the ids a deleted row used to hold.
+	if err := writeHighWater(db.chunkDir(), max(db.counter, db.store.highWater)); err != nil {
+		return err
+	}
+
 	idxs := db.store.dirtyIndices()
 	if len(idxs) == 0 {
 		return nil
@@ -302,4 +346,44 @@ func (db *DB[T]) saveChunk(dir string, ci int, sliceType reflect.Type) error {
 	}
 
 	return nil
+}
+
+const highWaterName = "highwater"
+
+// readHighWater reads the highest id a table ever handed out, or 0.
+func readHighWater(dir string) int {
+	raw, err := os.ReadFile(filepath.Join(dir, highWaterName))
+	if err != nil {
+		return 0
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || value < 0 {
+		return 0
+	}
+	return value
+}
+
+// writeHighWater keeps it, atomically: write aside, sync, rename over.
+func writeHighWater(dir string, value int) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	final := filepath.Join(dir, highWaterName)
+	tmp := final + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.WriteString(strconv.Itoa(value) + "\n"); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, final)
 }

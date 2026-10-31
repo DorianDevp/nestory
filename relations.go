@@ -180,6 +180,7 @@ func relationSpecs(t reflect.Type) ([]relationSpec, error) {
 	}
 
 	relationSpecsCache.Store(t, cachedRelationSpecs{specs: out})
+
 	return out, nil
 }
 
@@ -347,6 +348,7 @@ func (b *relationSchemaBuilder) visitRequiredType(t reflect.Type, kind relationK
 	}
 
 	state[t] = 2
+
 	return nil
 }
 

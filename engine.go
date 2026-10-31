@@ -901,11 +901,11 @@ func logTransactionChanges(byDBName map[string][]pendingWrite) error {
 		dbNames = append(dbNames, dbName)
 	}
 
+	// Every commit goes to the one shared log, a single table's included.
+	// Two logs replayed one after the other lose the order between them: a
+	// row created in a cross-table transaction and later edited on its own
+	// came back at every start as it was created.
 	sort.Strings(dbNames)
-	if len(dbNames) == 1 {
-		return committerFor(dbNames[0]).logWrites(byDBName[dbNames[0]])
-	}
-
 	frame := transactionWALFrame{}
 	for _, dbName := range dbNames {
 		rows, err := committerFor(dbName).encodeWrites(byDBName[dbName])

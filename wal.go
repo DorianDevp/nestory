@@ -448,14 +448,49 @@ func encodeScalarAggregate(out []byte, count int, field func(int) reflect.Value)
 	return offset
 }
 
+// decodeScalarRow reads a row field by field, which is what lets a struct
+// gain a field without making the rows already on disk unreadable: a row
+// written before the field existed simply ends early, and the fields it never
+// carried stay zero. Running out in the middle of a field is still corruption,
+// and so are bytes left over once every field has been read.
+//
+// The rule this rests on is that new fields go at the end of the struct.
+// Inserting one in the middle shifts everything after it and the old rows
+// decode into the wrong fields.
 func decodeScalarRow(data []byte, row reflect.Value) error {
-	offset, err := decodeScalarValue(data, row)
-	if err != nil {
-		return err
+	if row.Kind() != reflect.Struct {
+		offset, err := decodeScalarValue(data, row)
+		if err != nil {
+			return err
+		}
+
+		if offset != len(data) {
+			return fmt.Errorf("nestory: malformed scalar WAL row")
+		}
+
+		return nil
+	}
+
+	offset := 0
+	for index := range row.NumField() {
+		if offset == len(data) {
+			return nil // written before this field existed
+		}
+
+		read, err := decodeScalarValue(data[offset:], row.Field(index))
+		if err != nil {
+			// Which field ran out is the whole diagnosis when a struct has
+			// been changed in a way the rows on disk cannot follow.
+			return fmt.Errorf("nestory: malformed scalar WAL row: %s.%s, %d of %d bytes read",
+				row.Type().Name(), row.Type().Field(index).Name, offset, len(data))
+		}
+
+		offset += read
 	}
 
 	if offset != len(data) {
-		return fmt.Errorf("nestory: malformed scalar WAL row")
+		return fmt.Errorf("nestory: malformed scalar WAL row: %s read %d of %d bytes",
+			row.Type().Name(), offset, len(data))
 	}
 
 	return nil

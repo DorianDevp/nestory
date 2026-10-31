@@ -121,6 +121,7 @@ func Open[T Entity]() *DB[T] {
 	initBase.resById = make(map[int]*resourceSlot[T])
 	initBase.snapshots = make(map[*T]detachedRoot[T])
 	initBase.schemaFields = initBase.createSchemaFields()
+
 	specs, err := relationSpecs(reflect.TypeFor[T]())
 	if err != nil {
 		panic(err)
@@ -162,8 +163,9 @@ func (db *DB[T]) syncResById() {
 	})
 }
 
-// seedCounter sets the auto-id counter to the largest persisted id, so inserts
-// after a reload continue past it instead of colliding from 1. One O(n) scan.
+// seedCounter sets the auto-id counter past every id ever handed out — the
+// live rows and, through the high-water mark, the deleted ones — so a reload
+// never gives a new row the id of one that is gone. One O(n) scan.
 func (db *DB[T]) seedCounter() {
 	var maxId int
 	db.store.Range(func(p *T) {
@@ -172,7 +174,7 @@ func (db *DB[T]) seedCounter() {
 		}
 	})
 
-	db.counter = maxId
+	db.counter = max(maxId, db.store.highWater)
 }
 
 func setID[T any](entity *T, id int) {

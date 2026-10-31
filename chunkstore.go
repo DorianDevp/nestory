@@ -45,6 +45,10 @@ func (arr *chunkBlock[T]) Len() int {
 }
 
 type chunkStore[T any] struct {
+	// highWater is the highest id this table ever handed out, as far as the
+	// snapshot, the logs and the high-water file together remember.
+	highWater int
+
 	chunks []*chunkBlock[resourceSlot[T]] // each block is heap-allocated, never moves
 	tomb   []*chunkBlock[bool]            // tombstone flags, same shape as chunks
 	n      int                            // total slots appended (incl. tombstoned)
@@ -110,7 +114,9 @@ func (s *chunkStore[T]) chunkLive(ci int, fn func(*T)) {
 	}
 }
 
-func (s *chunkStore[T]) chunkSlots(ci int) int { return s.chunks[ci].n }
+func (s *chunkStore[T]) chunkSlots(ci int) int { 
+	return s.chunks[ci].n 
+}
 
 // loadChunk appends a freshly read block, keeping file ↔ chunk index alignment.
 // The block is clean, it already matches disk.
@@ -130,10 +136,6 @@ func (s *chunkStore[T]) loadChunk(vals []T) {
 	s.tomb = append(s.tomb, tb)
 	s.dirty = append(s.dirty, false)
 	s.n += len(vals)
-}
-
-func newChunkStore[T any]() *chunkStore[T] {
-	return &chunkStore[T]{}
 }
 
 // Append stores v and returns a stable pointer to its resourceSlot slot, safe to

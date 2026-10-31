@@ -6,18 +6,6 @@ import (
 	"sync"
 )
 
-// isScalarKey reports whether a foreign-key column type is a string or any int.
-func isScalarKey(k reflect.Kind) bool {
-	switch k {
-	case reflect.String,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return true
-	}
-
-	return false
-}
-
 // dbCreator is the untyped sibling of DB, used while loading before T is bound.
 type dbCreator struct{}
 
@@ -36,15 +24,30 @@ var (
 	schemaCache       sync.Map
 )
 
+
+// isScalarKey reports whether a foreign-key column type is a string or any int.
+func isScalarKey(k reflect.Kind) bool {
+	switch k {
+	case reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+
+	return false
+}
+
 func specsByField(t reflect.Type) (map[string]relationSpec, error) {
 	if cached, ok := specsByFieldCache.Load(t); ok {
 		result := cached.(cachedSpecsByField)
+			
 		return result.specs, result.err
 	}
 
 	specs, err := relationSpecs(t)
 	if err != nil {
-		specsByFieldCache.Store(t, cachedSpecsByField{err: err})
+		specsByFieldCache.Store(t, cachedSpecsByField{ err: err })
+
 		return nil, err
 	}
 
@@ -53,7 +56,8 @@ func specsByField(t reflect.Type) (map[string]relationSpec, error) {
 		out[r.fieldName] = r
 	}
 
-	specsByFieldCache.Store(t, cachedSpecsByField{specs: out})
+	specsByFieldCache.Store(t, cachedSpecsByField{ specs: out })
+
 	return out, nil
 }
 
@@ -61,7 +65,9 @@ func persistedRelation(r relationSpec) bool {
 	return !r.many || r.kind == borrowRelation || r.kind == optionRelation
 }
 
-func relationColumnName(r relationSpec) string { return r.fieldName + r.matchField }
+func relationColumnName(r relationSpec) string { 
+	return r.fieldName + r.matchField 
+}
 
 func relationColumnType(r relationSpec) reflect.Type {
 	f, ok := r.target.FieldByName(r.matchField)
@@ -206,8 +212,10 @@ func schemaFor(t reflect.Type) cachedSchema {
 		panic(err)
 	}
 
-	result := cachedSchema{fields: make([][2]string, 0, t.NumField())}
+	result := cachedSchema{ fields: make([][2]string, 0, t.NumField()) }
+
 	columns := make([]reflect.StructField, 0, t.NumField())
+
 	for i := range t.NumField() {
 		f := t.Field(i)
 		if r, ok := specs[f.Name]; ok {
