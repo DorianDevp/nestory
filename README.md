@@ -85,7 +85,6 @@ Nestory currently requires Go 1.24.
 - [Unsafe live pointers](docs/unsafe.md)
 - [How it works](docs/how-it-works.md)
 - [Contributing](docs/contributing.md)
-- [Benchmarks and methodology](bench/BENCHMARK_REPORT.md)
 
 ## Status
 

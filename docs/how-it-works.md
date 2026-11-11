@@ -168,9 +168,6 @@ relation maintenance.
   `ViewRangeAfter` starts after an exclusive cursor for incremental consumers.
 - `Unsafe.Get` exposes the live pointer without locks or copies.
 
-The benchmark report measures these paths separately because they provide
-different guarantees. See [bench/BENCHMARK_REPORT.md](../bench/BENCHMARK_REPORT.md).
-
 ## Current limitations
 
 Nestory is alpha software. Current constraints include:

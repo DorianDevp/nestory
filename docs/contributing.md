@@ -35,11 +35,9 @@ For a focused package while iterating:
 
 ```sh
 go test ./... -run TestName
-go test ./... -bench BenchmarkName -benchmem
 ```
 
-Do not commit generated benchmark output, temporary data directories, or local
-sandbox projects.
+Do not commit temporary data directories or local sandbox projects.
 
 ## Test expectations
 
@@ -57,37 +55,6 @@ sandbox projects.
 
 Tests must use `t.TempDir()` or `b.TempDir()` for storage and restore global
 state in cleanup.
-
-## Benchmarks
-
-Do not optimize from one end-to-end number. Isolate the suspected cost, measure
-allocations, and include scaling points that distinguish a constant-factor
-improvement from a complexity change.
-
-Benchmarks live in the `bench` module, one file per category, with every engine
-in every table. They are driven by `bench/run.sh`, which runs each
-`(category, engine, scale, shape)` in its own process:
-
-```sh
-cd bench
-./run.sh                                    # every category, scales 1 to 1,000,000
-./run.sh point                              # one category
-NESTORY_SCALES="1000 100000" ./run.sh graph # chosen scales
-```
-
-The process-per-player rule is not tidiness. Nestory registers entity types
-process-globally, so a second configuration cannot exist beside the first. Two
-engines sharing a process would also let the first one's heap, GC state and warm
-caches move the second one's numbers.
-
-The cross-engine harness and caveats are documented in
-[bench/BENCHMARK_REPORT.md](../bench/BENCHMARK_REPORT.md). When updating published numbers,
-record the machine, Go version, command, durability settings, and record shape.
-Compare APIs with equivalent safety and durability guarantees.
-
-One caveat is worth repeating because it invalidated a headline number once
-already: if `/tmp` is tmpfs, every fsync in a durability benchmark lands in RAM.
-Point `TMPDIR` at a real filesystem before quoting any durable write figure.
 
 ## Code style
 
@@ -112,7 +79,7 @@ perf: bypass graph lock for flat creates
 ```
 
 Do not add `Co-authored-by` trailers. Avoid mixing unrelated formatting,
-refactors, behavior changes, and benchmark updates in one commit.
+refactors, and behavior changes in one commit.
 
 ## Documentation
 
@@ -120,8 +87,7 @@ README is the project landing page. Put detailed behavior in `/docs`:
 
 - user flow in `getting-started.md` or `transactions.md`;
 - relation semantics in `relations.md`;
-- internal guarantees in `how-it-works.md`;
-- measured performance in `bench/BENCHMARK_REPORT.md`.
+- internal guarantees in `how-it-works.md`.
 
 When an API or invariant changes, update its guide in the same commit as the
 implementation.

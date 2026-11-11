@@ -10,9 +10,7 @@ Start with the guide that matches the question you are trying to answer:
 | [Indexes and batches](indexes-and-batches.md) | Unique and composite indexes, `ViewRange`, `ViewMany`, and bulk delete |
 | [Unsafe API](unsafe.md) | Live pointers, exclusive access, validation, and `Flush` |
 | [How it works](how-it-works.md) | Memory layout, WAL and snapshots, commit publication, locking, recovery, and limitations |
-| [Contributing](contributing.md) | Local checks, test expectations, benchmarks, and commit style |
+| [Contributing](contributing.md) | Local checks, test expectations, and commit style |
 
-Performance numbers and their caveats live in
-[the benchmark report](../bench/BENCHMARK_REPORT.md). The source code remains the
-authority while the project is in alpha; if behavior and documentation differ,
-please open an issue or send a focused fix.
+The source code remains the authority while the project is in alpha; if
+behavior and documentation differ, please open an issue or send a focused fix.
